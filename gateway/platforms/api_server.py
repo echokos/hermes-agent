@@ -21,9 +21,11 @@ Requires:
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
 import os
+import socket as _socket
 import sqlite3
 import time
 import uuid
@@ -49,6 +51,41 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+
+
+def _is_network_accessible(host: str) -> bool:
+    """Return True if *host* would expose the server beyond loopback.
+
+    Loopback addresses (127.0.0.1, ::1, IPv4-mapped ::ffff:127.0.0.1)
+    are local-only.  Unspecified addresses (0.0.0.0, ::) bind all
+    interfaces.  Hostnames are resolved; DNS failure fails closed.
+    """
+    try:
+        addr = ipaddress.ip_address(host)
+        if addr.is_loopback:
+            return False
+        # ::ffff:127.0.0.1 — Python reports is_loopback=False for mapped
+        # addresses, so check the underlying IPv4 explicitly.
+        if getattr(addr, "ipv4_mapped", None) and addr.ipv4_mapped.is_loopback:
+            return False
+        return True
+    except ValueError:
+        # when host variable is a hostname, we should try to resolve below
+        pass
+
+    try:
+        resolved = _socket.getaddrinfo(
+            host, None, _socket.AF_UNSPEC, _socket.SOCK_STREAM,
+        )
+        # if the hostname resolves into at least one non-loopback address,
+        # then we consider it to be network accesible
+        for _family, _type, _proto, _canonname, sockaddr in resolved:
+            addr = ipaddress.ip_address(sockaddr[0])
+            if not addr.is_loopback:
+                return True
+        return False
+    except (_socket.gaierror, OSError):
+        return True
 
 
 def check_api_server_requirements() -> bool:
@@ -1637,7 +1674,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
             # Refuse to start network-accessible without authentication
-            if self._host not in ("127.0.0.1", "::1", "localhost") and not self._api_key:
+            if _is_network_accessible(self._host) and not self._api_key:
                 logger.error(
                     "[%s] Refusing to start: binding to %s requires API_SERVER_KEY. "
                     "Set API_SERVER_KEY or use the default 127.0.0.1.",
@@ -1646,7 +1683,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 return False
 
             # Port conflict detection — fail fast if port is already in use
-            import socket as _socket
             try:
                 with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
                     _s.settimeout(1)
