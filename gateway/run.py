@@ -10608,7 +10608,7 @@ class GatewayRunner:
                 pending = None
 
             if pending_event or pending:
-                logger.debug("Processing pending message: '%s...'", pending[:40])
+                logger.debug("Processing pending message: '%s...'", (pending or "")[:40])
 
                 # Clear the adapter's interrupt event so the next _run_agent call
                 # doesn't immediately re-trigger the interrupt before the new agent
