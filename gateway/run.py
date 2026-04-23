@@ -3325,6 +3325,13 @@ class GatewayRunner:
                 return None
             return YuanbaoAdapter(config)
 
+        elif platform == Platform.VOICE:
+            from gateway.platforms.voice import VoiceAdapter, check_voice_requirements
+            if not check_voice_requirements():
+                logger.warning("Voice: websockets package not installed. Run: pip install websockets")
+                return None
+            return VoiceAdapter(config)
+
         return None
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
