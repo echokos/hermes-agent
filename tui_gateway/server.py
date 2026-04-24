@@ -667,6 +667,20 @@ def _apply_model_switch(sid: str, session: dict, raw_input: str) -> dict:
         current_base_url = str(runtime.get("base_url", "") or "")
         current_api_key = str(runtime.get("api_key", "") or "")
 
+    # Load user-defined providers from config so switch_model can resolve
+    # named custom endpoints (e.g. "ollama-launch") and use the config's
+    # model list as a validation fallback for models the /v1/models probe
+    # doesn't advertise (e.g. Ollama cloud models).  Parity with cli.py's
+    # _handle_model_switch which passes the same two fields.
+    cfg = _load_cfg()
+    user_provs = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else None
+    custom_provs = None
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
+        custom_provs = get_compatible_custom_providers(cfg)
+    except Exception:
+        pass
+
     result = switch_model(
         raw_input=model_input,
         current_provider=current_provider,
@@ -675,6 +689,8 @@ def _apply_model_switch(sid: str, session: dict, raw_input: str) -> dict:
         current_api_key=current_api_key,
         is_global=persist_global,
         explicit_provider=explicit_provider,
+        user_providers=user_provs,
+        custom_providers=custom_provs,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")

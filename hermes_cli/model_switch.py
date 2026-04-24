@@ -770,6 +770,7 @@ def switch_model(
     api_mode = ""
 
     if provider_changed or explicit_provider:
+        # Switching providers — resolve fresh credentials for the target.
         try:
             runtime = resolve_runtime_provider(requested=target_provider)
             api_key = runtime.get("api_key", "")
@@ -787,13 +788,41 @@ def switch_model(
                 ),
             )
     else:
+        # Same provider, different model.  Re-resolve to pick up credential
+        # rotation and provider-specific base_url adjustments (e.g. OpenCode
+        # strips /v1 for Anthropic models, restores it for chat_completions).
+        # However, re-resolution fails for custom/local endpoints: the
+        # runtime resolver maps named providers (e.g. "ollama-launch") to the
+        # generic "custom" label, which cannot round-trip and falls through to
+        # OpenRouter.  Detect this and keep the caller's existing credentials.
+        _keep_existing = False
         try:
             runtime = resolve_runtime_provider(requested=current_provider)
-            api_key = runtime.get("api_key", "")
-            base_url = runtime.get("base_url", "")
-            api_mode = runtime.get("api_mode", "")
+            _resolved_base = (runtime.get("base_url") or "").rstrip("/")
+            _current_base = (current_base_url or "").rstrip("/")
+            # Guard: for custom/local providers, if re-resolution produced a
+            # different base_url it means the resolver couldn't find the
+            # original endpoint and fell through (e.g. "custom" → OpenRouter).
+            # Known providers (opencode, openrouter, etc.) may legitimately
+            # return a different base_url, so only guard "custom"/"local".
+            if (
+                current_provider in ("custom", "local")
+                and _current_base
+                and _resolved_base != _current_base
+            ):
+                _keep_existing = True
+            else:
+                api_key = runtime.get("api_key", "") or api_key
+                base_url = runtime.get("base_url", "") or base_url
+                api_mode = runtime.get("api_mode", "")
         except Exception:
-            pass
+            _keep_existing = True
+
+        if _keep_existing:
+            # Resolution failed or fell through — keep the caller's
+            # known-good credentials and detect api_mode from the URL.
+            from hermes_cli.runtime_provider import _detect_api_mode_for_url
+            api_mode = _detect_api_mode_for_url(base_url) or "chat_completions"
 
     # --- Direct alias override: use exact base_url from the alias if set ---
     if resolved_alias:
@@ -823,6 +852,39 @@ def switch_model(
             "recognized": False,
             "message": f"Could not validate `{new_model}`: {e}",
         }
+
+    # Fallback: if the /v1/models probe rejected the model but the config's
+    # provider entry lists it, accept anyway.  This covers models that the
+    # endpoint serves but doesn't advertise (e.g. Ollama cloud models like
+    # "kimi-k2.5:cloud" work via cloud routing but don't appear in the local
+    # /v1/models response).
+    if not validation.get("accepted") and target_provider in ("custom", "local"):
+        _config_models: set = set()
+        if user_providers and isinstance(user_providers, dict):
+            for _ep_cfg in user_providers.values():
+                if isinstance(_ep_cfg, dict):
+                    _dm = _ep_cfg.get("default_model", "")
+                    if _dm:
+                        _config_models.add(_dm)
+                    _ml = _ep_cfg.get("models", [])
+                    if isinstance(_ml, (list, dict)):
+                        _config_models.update(m for m in _ml if m)
+        if custom_providers and isinstance(custom_providers, list):
+            for _cp in custom_providers:
+                if isinstance(_cp, dict):
+                    _dm = _cp.get("model", "")
+                    if _dm:
+                        _config_models.add(_dm)
+                    _ml = _cp.get("models", [])
+                    if isinstance(_ml, (list, dict)):
+                        _config_models.update(m for m in _ml if m)
+        if new_model in _config_models:
+            validation = {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            }
 
     if not validation.get("accepted"):
         msg = validation.get("message", "Invalid model")
