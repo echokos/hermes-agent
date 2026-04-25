@@ -149,6 +149,12 @@ class VoiceAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, is_typing: bool = True) -> None:
         pass
 
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        call_id = chat_id.replace("voice:", "")
+        agent = self._active_calls.get(call_id, "unknown")
+        return {"name": f"Voice call {call_id}", "type": "dm", "chat_id": chat_id, "agent": agent}
+
+
     async def _send_to_vox(self, msg: dict) -> None:
         if self._ws and not self._ws.closed:
             await self._ws.send(json.dumps(msg))
