@@ -12372,7 +12372,13 @@ class AIAgent:
                     codex_ack_continuations = 0
 
                     if truncated_response_prefix:
-                        final_response = truncated_response_prefix + final_response
+                        # Ensure a newline between truncated prefix and continuation
+                        # to prevent lines from being glued together (e.g.
+                        # "i promise*hits self*").
+                        if truncated_response_prefix and not truncated_response_prefix.endswith('\n'):
+                            final_response = truncated_response_prefix + '\n' + final_response
+                        else:
+                            final_response = truncated_response_prefix + final_response
                         truncated_response_prefix = ""
                         length_continue_retries = 0
                     
