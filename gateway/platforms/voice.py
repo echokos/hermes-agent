@@ -156,8 +156,12 @@ class VoiceAdapter(BasePlatformAdapter):
 
 
     async def _send_to_vox(self, msg: dict) -> None:
-        if self._ws and not self._ws.closed:
+        if not self._ws:
+            return
+        try:
             await self._ws.send(json.dumps(msg))
+        except Exception:
+            logger.warning("Failed to send to Vox (connection lost)")
 
 
 def check_voice_requirements() -> bool:
