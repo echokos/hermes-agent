@@ -325,23 +325,31 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
     voice_id = el_config.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
     model_id = el_config.get("model_id", DEFAULT_ELEVENLABS_MODEL_ID)
 
-    # Build VoiceSettings from config if any settings are provided
+    # Build VoiceSettings from config if any settings are provided.
+    # Only pass explicitly-set values — None fields override ElevenLabs defaults
+    # when sent, so we must omit them entirely.
     stability = el_config.get("stability")
     similarity_boost = el_config.get("similarity_boost")
     speed = el_config.get("speed", tts_config.get("speed"))
     style = el_config.get("style")
     use_speaker_boost = el_config.get("use_speaker_boost")
 
+    voice_kwargs = {}
+    if stability is not None:
+        voice_kwargs["stability"] = stability
+    if similarity_boost is not None:
+        voice_kwargs["similarity_boost"] = similarity_boost
+    if speed is not None:
+        voice_kwargs["speed"] = speed
+    if style is not None:
+        voice_kwargs["style"] = style
+    if use_speaker_boost is not None:
+        voice_kwargs["use_speaker_boost"] = use_speaker_boost
+
     voice_settings = None
-    if any(v is not None for v in [stability, similarity_boost, speed, style, use_speaker_boost]):
+    if voice_kwargs:
         from elevenlabs.types import VoiceSettings
-        voice_settings = VoiceSettings(
-            stability=stability,
-            similarity_boost=similarity_boost,
-            speed=speed,
-            style=style,
-            use_speaker_boost=use_speaker_boost,
-        )
+        voice_settings = VoiceSettings(**voice_kwargs)
 
     # Determine output format based on file extension
     if output_path.endswith(".ogg"):
