@@ -325,6 +325,32 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
     voice_id = el_config.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
     model_id = el_config.get("model_id", DEFAULT_ELEVENLABS_MODEL_ID)
 
+    # Build VoiceSettings from config if any settings are provided.
+    # Only pass explicitly-set values — None fields override ElevenLabs defaults
+    # when sent, so we must omit them entirely.
+    stability = el_config.get("stability")
+    similarity_boost = el_config.get("similarity_boost")
+    speed = el_config.get("speed", tts_config.get("speed"))
+    style = el_config.get("style")
+    use_speaker_boost = el_config.get("use_speaker_boost")
+
+    voice_kwargs = {}
+    if stability is not None:
+        voice_kwargs["stability"] = stability
+    if similarity_boost is not None:
+        voice_kwargs["similarity_boost"] = similarity_boost
+    if speed is not None:
+        voice_kwargs["speed"] = speed
+    if style is not None:
+        voice_kwargs["style"] = style
+    if use_speaker_boost is not None:
+        voice_kwargs["use_speaker_boost"] = use_speaker_boost
+
+    voice_settings = None
+    if voice_kwargs:
+        from elevenlabs.types import VoiceSettings
+        voice_settings = VoiceSettings(**voice_kwargs)
+
     # Determine output format based on file extension
     if output_path.endswith(".ogg"):
         output_format = "opus_48000_64"
@@ -333,12 +359,17 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
 
     ElevenLabs = _import_elevenlabs()
     client = ElevenLabs(api_key=api_key)
-    audio_generator = client.text_to_speech.convert(
+
+    convert_kwargs = dict(
         text=text,
         voice_id=voice_id,
         model_id=model_id,
         output_format=output_format,
     )
+    if voice_settings is not None:
+        convert_kwargs["voice_settings"] = voice_settings
+
+    audio_generator = client.text_to_speech.convert(**convert_kwargs)
 
     # audio_generator yields chunks -- write them all
     with open(output_path, "wb") as f:
