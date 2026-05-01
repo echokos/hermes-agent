@@ -325,6 +325,24 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
     voice_id = el_config.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
     model_id = el_config.get("model_id", DEFAULT_ELEVENLABS_MODEL_ID)
 
+    # Build VoiceSettings from config if any settings are provided
+    stability = el_config.get("stability")
+    similarity_boost = el_config.get("similarity_boost")
+    speed = el_config.get("speed", tts_config.get("speed"))
+    style = el_config.get("style")
+    use_speaker_boost = el_config.get("use_speaker_boost")
+
+    voice_settings = None
+    if any(v is not None for v in [stability, similarity_boost, speed, style, use_speaker_boost]):
+        from elevenlabs.types import VoiceSettings
+        voice_settings = VoiceSettings(
+            stability=stability,
+            similarity_boost=similarity_boost,
+            speed=speed,
+            style=style,
+            use_speaker_boost=use_speaker_boost,
+        )
+
     # Determine output format based on file extension
     if output_path.endswith(".ogg"):
         output_format = "opus_48000_64"
@@ -333,12 +351,17 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
 
     ElevenLabs = _import_elevenlabs()
     client = ElevenLabs(api_key=api_key)
-    audio_generator = client.text_to_speech.convert(
+
+    convert_kwargs = dict(
         text=text,
         voice_id=voice_id,
         model_id=model_id,
         output_format=output_format,
     )
+    if voice_settings is not None:
+        convert_kwargs["voice_settings"] = voice_settings
+
+    audio_generator = client.text_to_speech.convert(**convert_kwargs)
 
     # audio_generator yields chunks -- write them all
     with open(output_path, "wb") as f:
