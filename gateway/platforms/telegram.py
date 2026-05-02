@@ -2592,6 +2592,17 @@ class TelegramAdapter(BasePlatformAdapter):
             text,
         )
 
+        # 6b) Telegram MarkdownV2 collapses \n before _italic_ markers when
+        #     the italic block starts on its own line (action descriptions like
+        #     *leans back*). Force a paragraph break (\n\n) before any _italic_
+        #     placeholder that follows a single \n to prevent line blending.
+        #     Only matches \n (not \n\n, which is already a paragraph break).
+        text = re.sub(
+            r'(?<!\n)\n(\x00PH\d+\x00)',
+            r'\n\n\1',
+            text,
+        )
+
         # 7) Convert strikethrough: ~~text~~ → ~text~ (MarkdownV2)
         text = re.sub(
             r'~~(.+?)~~',
