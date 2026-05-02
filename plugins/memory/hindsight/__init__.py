@@ -1447,6 +1447,16 @@ class HindsightMemoryProvider(MemoryProvider):
         batching must start from zero so an in-flight retain doesn't flush
         under the wrong ``_document_id``.
 
+        Before clearing, flush any buffered turns under the *old*
+        ``_document_id``. Users who set ``retain_every_n_turns > 1`` would
+        otherwise silently lose whatever's in ``_session_turns`` at the
+        moment of switch — the same data-loss class as the shutdown race,
+        just at a different lifecycle event.
+
+        Also wait for any in-flight prefetch from the old session and drop
+        its cached result; otherwise the new session's first ``prefetch()``
+        could read stale recall text from before the switch.
+
         ``parent_session_id`` is recorded for lineage tags on future retains.
         ``reset`` is accepted but not needed for Hindsight's state model —
         buffer clearing is correct for every session switch, not only /reset.
@@ -1454,6 +1464,71 @@ class HindsightMemoryProvider(MemoryProvider):
         new_id = str(new_session_id or "").strip()
         if not new_id:
             return
+
+        # 1. Flush any buffered turns under the OLD identifiers. Snapshot
+        # everything before mutating self._* so metadata + tags + doc_id
+        # all reference the old session consistently.
+        if self._session_turns:
+            old_turns = list(self._session_turns)
+            old_session_id = self._session_id
+            old_document_id = self._document_id
+            old_parent_session_id = self._parent_session_id
+            old_turn_index = self._turn_index
+            old_metadata = self._build_metadata(
+                message_count=len(old_turns) * 2,
+                turn_index=old_turn_index,
+            )
+            old_lineage_tags: list[str] = []
+            if old_session_id:
+                old_lineage_tags.append(f"session:{old_session_id}")
+            if old_parent_session_id:
+                old_lineage_tags.append(f"parent:{old_parent_session_id}")
+            old_content = "[" + ",".join(old_turns) + "]"
+
+            def _flush():
+                try:
+                    item = self._build_retain_kwargs(
+                        old_content,
+                        context=self._retain_context,
+                        metadata=old_metadata,
+                        tags=old_lineage_tags or None,
+                    )
+                    item.pop("bank_id", None)
+                    item.pop("retain_async", None)
+                    logger.debug(
+                        "Hindsight flush-on-switch: bank=%s, doc=%s, num_turns=%d",
+                        self._bank_id, old_document_id, len(old_turns),
+                    )
+                    self._run_hindsight_operation(
+                        lambda client: client.aretain_batch(
+                            bank_id=self._bank_id,
+                            items=[item],
+                            document_id=old_document_id,
+                            retain_async=self._retain_async,
+                        )
+                    )
+                except Exception as e:
+                    logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
+
+            # Route the flush through the same writer queue sync_turn
+            # uses. That serializes it behind any still-queued retains
+            # from the old session (FIFO by document_id), avoids racing
+            # two threads on aretain_batch against the same document, and
+            # keeps shutdown's drain semantics intact. Skip enqueue if
+            # shutdown has already fired — the writer is draining/gone.
+            if not self._shutting_down.is_set():
+                self._ensure_writer()
+                self._register_atexit()
+                self._retain_queue.put(_flush)
+
+        # 2. Drain any in-flight prefetch from the old session and drop
+        # its cached result so the new session doesn't see stale recall.
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=3.0)
+        with self._prefetch_lock:
+            self._prefetch_result = ""
+
+        # 3. Now rotate to the new session.
         if parent_session_id:
             self._parent_session_id = str(parent_session_id).strip()
         self._session_id = new_id

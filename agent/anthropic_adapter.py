@@ -420,6 +420,33 @@ def _is_kimi_family_endpoint(base_url: str | None, model: str | None = None) -> 
     return False
 
 
+def _is_deepseek_anthropic_endpoint(base_url: str | None) -> bool:
+    """Return True for DeepSeek's Anthropic-compatible endpoint.
+
+    DeepSeek's ``/anthropic`` route speaks the Anthropic Messages protocol
+    but, when thinking mode is enabled, requires the ``thinking`` blocks
+    from prior assistant turns to round-trip on subsequent requests — the
+    generic third-party path strips them and triggers HTTP 400::
+
+        The content[].thinking in the thinking mode must be passed back
+        to the API.
+
+    Per DeepSeek's published compatibility matrix the blocks are unsigned
+    (no Anthropic-proprietary signature, no ``redacted_thinking`` support),
+    so this endpoint is handled with the same strip-signed / keep-unsigned
+    policy used for Kimi's ``/coding`` endpoint.  The match is pinned to
+    the ``/anthropic`` path so the OpenAI-compatible ``api.deepseek.com``
+    base URL (which never reaches this adapter) is not misclassified.
+    See hermes-agent#16748.
+    """
+    if not base_url_host_matches(base_url or "", "api.deepseek.com"):
+        return False
+    normalized = _normalize_base_url_text(base_url)
+    if not normalized:
+        return False
+    return "/anthropic" in normalized.rstrip("/").lower()
+
+
 def _requires_bearer_auth(base_url: str | None) -> bool:
     """Return True for Anthropic-compatible providers that require Bearer auth.
 
@@ -434,7 +461,11 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     return normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
 
 
-def _common_betas_for_base_url(base_url: str | None) -> list[str]:
+def _common_betas_for_base_url(
+    base_url: str | None,
+    *,
+    drop_context_1m_beta: bool = False,
+) -> list[str]:
     """Return the beta headers that are safe for the configured endpoint.
 
     MiniMax's Anthropic-compatible endpoints (Bearer-auth) reject requests
@@ -445,14 +476,30 @@ def _common_betas_for_base_url(base_url: str | None) -> list[str]:
     The ``context-1m-2025-08-07`` beta is also stripped for Bearer-auth
     endpoints — MiniMax hosts its own models, not Claude, so the header is
     irrelevant at best and risks request rejection at worst.
+
+    ``drop_context_1m_beta=True`` additionally strips the 1M-context beta on
+    otherwise-unrelated endpoints. The OAuth retry path flips this flag after
+    a subscription rejects the beta with
+    "The long context beta is not yet available for this subscription" so
+    subsequent requests in the same session don't repeat the probe. See the
+    reactive recovery loop in ``run_agent.py`` and issue-comment history on
+    PR #17680 for the full rationale.
     """
     if _requires_bearer_auth(base_url):
         _stripped = {_TOOL_STREAMING_BETA, _CONTEXT_1M_BETA}
         return [b for b in _COMMON_BETAS if b not in _stripped]
+    if drop_context_1m_beta:
+        return [b for b in _COMMON_BETAS if b != _CONTEXT_1M_BETA]
     return _COMMON_BETAS
 
 
-def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = None):
+def build_anthropic_client(
+    api_key: str,
+    base_url: str = None,
+    timeout: float = None,
+    *,
+    drop_context_1m_beta: bool = False,
+):
     """Create an Anthropic client, auto-detecting setup-tokens vs API keys.
 
     If *timeout* is provided it overrides the default 900s read timeout.  The
@@ -460,6 +507,12 @@ def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = 
     per-model ``request_timeout_seconds`` config so Anthropic-native and
     Anthropic-compatible providers respect the same knob as OpenAI-wire
     providers.
+
+    ``drop_context_1m_beta=True`` strips ``context-1m-2025-08-07`` from the
+    client-level ``anthropic-beta`` header. Used by the reactive OAuth retry
+    path in ``run_agent.py`` when a subscription rejects the beta; leave at
+    its default on fresh clients so 1M-capable subscriptions keep the
+    capability.
 
     Returns an anthropic.Anthropic instance.
     """
@@ -490,7 +543,10 @@ def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = 
             kwargs["default_query"] = {"api-version": "2025-04-15"}
         else:
             kwargs["base_url"] = normalized_base_url
-    common_betas = _common_betas_for_base_url(normalized_base_url)
+    common_betas = _common_betas_for_base_url(
+        normalized_base_url,
+        drop_context_1m_beta=drop_context_1m_beta,
+    )
 
     if _is_kimi_coding_endpoint(base_url):
         # Kimi's /coding endpoint requires User-Agent: claude-code/0.1.0
@@ -1185,10 +1241,24 @@ def convert_tools_to_anthropic(tools: List[Dict]) -> List[Dict]:
     if not tools:
         return []
     result = []
+    seen_names: set = set()
     for t in tools:
         fn = t.get("function", {})
+        name = fn.get("name", "")
+        # Defensive dedup: Anthropic rejects requests with duplicate tool
+        # names.  Upstream injection paths already dedup, but this guard
+        # converts a hard API failure into a warning.  See: #18478
+        if name and name in seen_names:
+            logger.warning(
+                "convert_tools_to_anthropic: duplicate tool name '%s' "
+                "— dropping second occurrence",
+                name,
+            )
+            continue
+        if name:
+            seen_names.add(name)
         result.append({
-            "name": fn.get("name", ""),
+            "name": name,
             "description": fn.get("description", ""),
             "input_schema": _normalize_tool_input_schema(
                 fn.get("parameters", {"type": "object", "properties": {}})
@@ -1569,7 +1639,16 @@ def convert_messages_to_anthropic(
     #    cache markers can interfere with signature validation.
     _THINKING_TYPES = frozenset(("thinking", "redacted_thinking"))
     _is_third_party = _is_third_party_anthropic_endpoint(base_url)
-    _is_kimi = _is_kimi_family_endpoint(base_url, model)
+    # Kimi /coding and DeepSeek /anthropic share a contract: both speak the
+    # Anthropic Messages protocol upstream but require that thinking blocks
+    # synthesised from reasoning_content round-trip on subsequent turns when
+    # thinking is enabled.  Signed Anthropic blocks still have to be stripped
+    # (neither endpoint can validate Anthropic's signatures); unsigned blocks
+    # are preserved.  See hermes-agent#13848 (Kimi) and #16748 (DeepSeek).
+    _preserve_unsigned_thinking = (
+        _is_kimi_family_endpoint(base_url, model)
+        or _is_deepseek_anthropic_endpoint(base_url)
+    )
 
     last_assistant_idx = None
     for i in range(len(result) - 1, -1, -1):
@@ -1581,22 +1660,22 @@ def convert_messages_to_anthropic(
         if m.get("role") != "assistant" or not isinstance(m.get("content"), list):
             continue
 
-        if _is_kimi:
-            # Kimi's /coding endpoint enables thinking server-side and
-            # requires unsigned thinking blocks on replayed assistant
-            # tool-call messages.  Strip signed Anthropic blocks (Kimi
-            # can't validate signatures) but preserve the unsigned ones
-            # we synthesised from reasoning_content above.
+        if _preserve_unsigned_thinking:
+            # Kimi's /coding and DeepSeek's /anthropic endpoints both enable
+            # thinking server-side and require unsigned thinking blocks on
+            # replayed assistant tool-call messages.  Strip signed Anthropic
+            # blocks (neither upstream can validate Anthropic signatures) but
+            # preserve the unsigned ones we synthesised from reasoning_content.
             new_content = []
             for b in m["content"]:
                 if not isinstance(b, dict) or b.get("type") not in _THINKING_TYPES:
                     new_content.append(b)
                     continue
                 if b.get("signature") or b.get("data"):
-                    # Anthropic-signed block — Kimi can't validate, strip
+                    # Anthropic-signed block — upstream can't validate, strip
                     continue
                 # Unsigned thinking (synthesised from reasoning_content) —
-                # keep it: Kimi needs it for message-history validation.
+                # keep it: the upstream needs it for message-history validation.
                 new_content.append(b)
             m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
         elif _is_third_party or idx != last_assistant_idx:
@@ -1653,6 +1732,7 @@ def build_anthropic_kwargs(
     context_length: Optional[int] = None,
     base_url: str | None = None,
     fast_mode: bool = False,
+    drop_context_1m_beta: bool = False,
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create().
 
@@ -1841,7 +1921,10 @@ def build_anthropic_kwargs(
         kwargs.setdefault("extra_body", {})["speed"] = "fast"
         # Build extra_headers with ALL applicable betas (the per-request
         # extra_headers override the client-level anthropic-beta header).
-        betas = list(_common_betas_for_base_url(base_url))
+        betas = list(_common_betas_for_base_url(
+            base_url,
+            drop_context_1m_beta=drop_context_1m_beta,
+        ))
         if is_oauth:
             betas.extend(_OAUTH_ONLY_BETAS)
         betas.append(_FAST_MODE_BETA)

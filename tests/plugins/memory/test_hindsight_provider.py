@@ -928,6 +928,151 @@ class TestShutdownRace:
 
 
 # ---------------------------------------------------------------------------
+# on_session_switch — flush + prefetch reset behavior
+# ---------------------------------------------------------------------------
+
+
+class TestSessionSwitchBufferFlush:
+    def test_buffered_turns_flushed_before_clear(self, provider_with_config):
+        """retain_every_n_turns > 1 must not silently drop partial buffers
+        on session switch. Whatever's in _session_turns at switch time
+        should land in the OLD document under the OLD session id."""
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        old_doc = p._document_id
+
+        # Two turns buffered, no retain yet (boundary is at turn 3). The
+        # writer hasn't been started either — sync_turn's early return
+        # skips _ensure_writer when no retain is due.
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.sync_turn("turn2-user", "turn2-asst")
+        assert p._sync_thread is None
+        p._client.aretain_batch.assert_not_called()
+
+        # Switch — flush should fire under OLD document_id via the writer queue.
+        p.on_session_switch("new-sid", parent_session_id="test-session", reset=True)
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_called_once()
+        kw = p._client.aretain_batch.call_args.kwargs
+        assert kw["document_id"] == old_doc
+        item = kw["items"][0]
+        # Both buffered turns must be present in the flushed payload.
+        content = json.loads(item["content"])
+        flat = json.dumps(content)
+        assert "turn1-user" in flat
+        assert "turn2-user" in flat
+        # Old session id must appear in lineage tags / metadata.
+        assert "session:test-session" in item["tags"]
+        assert item["metadata"]["session_id"] == "test-session"
+
+        # And the new session must start with a clean slate.
+        assert p._session_id == "new-sid"
+        assert p._session_turns == []
+        assert p._turn_counter == 0
+        assert p._document_id != old_doc
+        assert p._document_id.startswith("new-sid-")
+
+    def test_no_flush_when_buffer_empty(self, provider):
+        """Switch with no buffered turns must not fire a spurious retain."""
+        provider.on_session_switch("new-sid")
+        # Nothing enqueued — join is immediate.
+        provider._retain_queue.join()
+        provider._client.aretain_batch.assert_not_called()
+        assert provider._session_id == "new-sid"
+
+    def test_prefetch_result_cleared_on_switch(self, provider):
+        """Stale recall text from the old session must not leak into the
+        next session's first prefetch read."""
+        provider._prefetch_result = "old-session recall: User likes Rust"
+        provider.on_session_switch("new-sid")
+        assert provider._prefetch_result == ""
+        # And subsequent prefetch() should now report empty, not the leftover.
+        assert provider.prefetch("anything") == ""
+
+    def test_in_flight_prefetch_thread_drained_on_switch(self, provider, monkeypatch):
+        """on_session_switch must wait for an in-flight prefetch from the
+        old session to settle before clearing _prefetch_result, otherwise
+        the thread can race and re-populate the field after the clear."""
+        import threading
+        import time as _time
+
+        gate = threading.Event()
+        finished = threading.Event()
+
+        def _slow_prefetch():
+            gate.wait(timeout=5.0)
+            with provider._prefetch_lock:
+                provider._prefetch_result = "old-session recall"
+            finished.set()
+
+        provider._prefetch_thread = threading.Thread(target=_slow_prefetch, daemon=True)
+        provider._prefetch_thread.start()
+
+        # Release the prefetch worker so it writes _prefetch_result, then
+        # call on_session_switch — it must join the thread before clearing.
+        gate.set()
+        provider.on_session_switch("new-sid")
+
+        assert finished.is_set(), "switch returned before prefetch thread settled"
+        assert provider._prefetch_result == ""
+
+    def test_flush_serializes_behind_pending_retains_via_writer_queue(
+        self, provider_with_config
+    ):
+        """The flush closure must ride the same _retain_queue sync_turn
+        uses, so it lands FIFO behind any still-queued old-session
+        retains rather than racing them on a separate thread.
+
+        Regression guard: an earlier draft spawned a raw threading.Thread
+        for flush, overwriting _sync_thread and racing the writer against
+        the same document_id.
+        """
+        import threading as _threading
+
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+
+        # Block the first writer job until we've enqueued the flush
+        # behind it. This proves ordering — the flush MUST wait.
+        gate = _threading.Event()
+        call_order: list[str] = []
+
+        def _aretain_batch_tracking(**kw):
+            idx = kw["items"][0]["metadata"].get("turn_index", "")
+            call_order.append(str(idx))
+            if idx == "2":
+                # First retain blocks until we've enqueued the flush.
+                gate.wait(timeout=5.0)
+
+        p._client.aretain_batch = AsyncMock(side_effect=_aretain_batch_tracking)
+
+        # Turn 1+2 → boundary hit → retain enqueued (will block).
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.sync_turn("turn2-user", "turn2-asst")
+
+        # One more buffered turn so flush has something to land.
+        p.sync_turn("turn3-user", "turn3-asst")
+
+        # Switch while the first retain is still blocked on `gate`.
+        p.on_session_switch("new-sid", parent_session_id="test-session")
+
+        # Release the first retain. Flush must have been enqueued
+        # BEHIND it, and run second.
+        gate.set()
+        p._retain_queue.join()
+
+        # The flush carries all buffered turns; sync_turn's retain #2
+        # carried the batch at boundary time. Two distinct calls.
+        assert p._client.aretain_batch.call_count == 2
+        # First call landed while buffer was [t1, t2]; flush landed
+        # after we added t3. So the second call must be strictly after.
+        assert call_order[0] == "2"
+        # Flush retain has turn_index matching the buffered count at
+        # switch time (3 turns accumulated, _turn_index was set to 3
+        # by the last sync_turn).
+        assert call_order[1] == "3"
+
+
+# ---------------------------------------------------------------------------
 # System prompt tests
 # ---------------------------------------------------------------------------
 
