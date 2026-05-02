@@ -4115,6 +4115,13 @@ class GatewayRunner:
                 return None
             return YuanbaoAdapter(config)
 
+        elif platform == Platform.VOICE:
+            from gateway.platforms.voice import VoiceAdapter, check_voice_requirements
+            if not check_voice_requirements():
+                logger.warning("Voice: websockets package not installed. Run: pip install websockets")
+                return None
+            return VoiceAdapter(config)
+
         return None
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
@@ -4132,7 +4139,7 @@ class GatewayRunner:
         # connection, so HA events are always authorized.
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
-        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
+        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.VOICE):
             return True
 
         user_id = source.user_id

@@ -570,7 +570,7 @@ class GatewayStreamConsumer:
         """Return only the part of final_text the user has not already seen."""
         prefix = self._fallback_prefix or self._visible_prefix()
         if prefix and final_text.startswith(prefix):
-            return final_text[len(prefix):].lstrip()
+            return final_text[len(prefix):].lstrip(' \t')
         return final_text
 
     @staticmethod
@@ -717,7 +717,7 @@ class GatewayStreamConsumer:
         visible = self._fallback_prefix or self._visible_prefix()
         tail = self._accumulated
         if visible and tail.startswith(visible):
-            tail = tail[len(visible):].lstrip()
+            tail = tail[len(visible):].lstrip(' \t')
         tail = self._clean_for_display(tail)
         if not tail.strip():
             return
