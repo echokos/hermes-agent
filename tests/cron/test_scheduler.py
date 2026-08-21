@@ -554,6 +554,17 @@ class TestRunJobSessionPersistence:
             "memory toolset should be disabled in cron to match skip_memory=True"
         )
 
+    def test_unbounded_job_does_not_pass_an_exact_tool_allowlist(self, tmp_path):
+        job = {
+            "id": "unbounded-tools-job",
+            "name": "unbounded tools",
+            "prompt": "hello",
+        }
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            run_job(job)
+
+        assert mock_agent_cls.call_args.kwargs["allowed_tool_names"] is None
+
     def test_runtime_budget_tools_are_exposed_eagerly(self, tmp_path):
         job = {
             "id": "bounded-tools-job",

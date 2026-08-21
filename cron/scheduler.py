@@ -5743,8 +5743,12 @@ def _run_job_after_admission(
             eager_tool_names=frozenset(
                 (job.get("runtime_tool_budget") or {}).get("allowed_tools") or ()
             ),
-            allowed_tool_names=frozenset(
-                (job.get("runtime_tool_budget") or {}).get("allowed_tools") or ()
+            # ``None`` preserves the normal cron tool surface. An empty set is
+            # an exact allowlist that filters every tool schema.
+            allowed_tool_names=(
+                frozenset(job["runtime_tool_budget"]["allowed_tools"])
+                if job.get("runtime_tool_budget") is not None
+                else None
             ),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
