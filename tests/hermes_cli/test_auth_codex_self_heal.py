@@ -92,3 +92,50 @@ def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monk
     assert tokens["refresh_token"] == "fresh-refresh"
 
 
+def test_force_refresh_global_fallback_writes_back_to_root(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profiles" / "work"
+    root_home = tmp_path / "root"
+    profile_home.mkdir(parents=True)
+    root_home.mkdir()
+    profile_path = profile_home / "auth.json"
+    root_path = root_home / "auth.json"
+    profile_path.write_text(json.dumps({"version": 1, "providers": {}}))
+    root_path.write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "root-access",
+                    "refresh_token": "root-refresh",
+                }
+            }
+        },
+    }))
+    monkeypatch.setattr(auth, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+
+    def fake_refresh(access_token, refresh_token, **kwargs):
+        assert access_token == "root-access"
+        assert refresh_token == "root-refresh"
+        root_holder = auth._auth_lock_holder_for(root_path)
+        assert getattr(root_holder, "depth", 0) > 0
+        return {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "last_refresh": "2026-09-01T00:00:00Z",
+        }
+
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", fake_refresh)
+
+    resolved = resolve_codex_runtime_credentials(force_refresh=True)
+
+    assert resolved["api_key"] == "rotated-access"
+    root = json.loads(root_path.read_text())
+    assert root["providers"]["openai-codex"]["tokens"] == {
+        "access_token": "rotated-access",
+        "refresh_token": "rotated-refresh",
+    }
+    profile = json.loads(profile_path.read_text())
+    assert "openai-codex" not in profile.get("providers", {})
+

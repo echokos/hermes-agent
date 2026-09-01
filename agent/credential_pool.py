@@ -1325,9 +1325,16 @@ class CredentialPool:
                 if self.provider == "openai-codex"
                 else self._sync_xai_oauth_entry_from_pool_store
             )
-            with _auth_store_lock(
-                timeout_seconds=self._single_use_refresh_lock_timeout()
-            ):
+            lock_timeout = self._single_use_refresh_lock_timeout()
+            lock_context = (
+                auth_mod._provider_state_transaction(
+                    "openai-codex",
+                    timeout_seconds=lock_timeout,
+                )
+                if self.provider == "openai-codex"
+                else _auth_store_lock(timeout_seconds=lock_timeout)
+            )
+            with lock_context:
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
                     if synced is not entry:
