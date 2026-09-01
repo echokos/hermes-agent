@@ -234,6 +234,59 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
     assert lock_held["during_post"] is True
 
 
+def test_codex_pool_refresh_locks_global_fallback_across_post(
+    profile_and_root, monkeypatch
+):
+    """A profile inheriting root Codex auth locks root during refresh."""
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "root-access",
+                        "refresh_token": "root-refresh",
+                    }
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
+
+    lock_held = {"root": False}
+
+    def fake_refresh(access_token, refresh_token, **kwargs):
+        root_holder = A._auth_lock_holder_for(root_path)
+        lock_held["root"] = getattr(root_holder, "depth", 0) > 0
+        return {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "last_refresh": "2020-01-02T00:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake_refresh)
+    entry = _entry(
+        "openai-codex",
+        id="codex-root-fallback",
+        access_token="root-access",
+        refresh_token="root-refresh",
+    )
+    pool = CredentialPool("openai-codex", [entry])
+
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert lock_held["root"] is True
+    root_tokens = _read_store(root_path)["providers"]["openai-codex"]["tokens"]
+    assert root_tokens["access_token"] == "rotated-access"
+    assert root_tokens["refresh_token"] == "rotated-refresh"
+    profile = _read_store(profile_path)
+    assert "openai-codex" not in profile.get("providers", {})
+
+
 def test_write_through_fires_on_every_refresh_not_just_first(
     profile_and_root, monkeypatch
 ):
@@ -316,4 +369,3 @@ def test_write_through_fires_on_every_refresh_not_just_first(
         "The old code self-disabled write-through here (#74339)"
     )
     assert root_tokens["refresh_token"] == "rf2"
-
