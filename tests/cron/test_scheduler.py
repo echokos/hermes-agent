@@ -554,6 +554,59 @@ class TestRunJobSessionPersistence:
             "memory toolset should be disabled in cron to match skip_memory=True"
         )
 
+    @pytest.mark.parametrize("runtime_tool_budget", [None, {}])
+    def test_unbounded_job_resolves_real_cron_tool_surface(
+        self, tmp_path, runtime_tool_budget
+    ):
+        """Missing and empty ``{}`` budgets must stay unbounded end to end.
+
+        A mock-only ``allowed_tool_names is None`` check can stay green while
+        agent_init or tool-definition caching still produces an empty surface.
+        Construct the real agent with the kwargs ``run_job`` would pass, against
+        the isolated ``HERMES_HOME``, and assert native tools actually resolve.
+        """
+        from run_agent import AIAgent
+
+        job = {
+            "id": "unbounded-tools-job",
+            "name": "unbounded tools",
+            "prompt": "hello",
+        }
+        if runtime_tool_budget is not None:
+            job["runtime_tool_budget"] = runtime_tool_budget
+
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["allowed_tool_names"] is None
+
+        agent = AIAgent(
+            model=kwargs.get("model") or "test/model",
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            provider="openrouter",
+            api_mode="chat_completions",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            skip_background_review=True,
+            platform="cron",
+            enabled_toolsets=kwargs["enabled_toolsets"],
+            disabled_toolsets=kwargs["disabled_toolsets"],
+            eager_tool_names=kwargs["eager_tool_names"],
+            allowed_tool_names=kwargs["allowed_tool_names"],
+        )
+        try:
+            assert agent._allowed_tool_names is None
+            names = agent.valid_tool_names
+            assert "terminal" in names
+            assert "read_file" in names
+            assert "write_file" in names
+            assert len(names) > 3
+        finally:
+            agent.close()
+
     def test_runtime_budget_tools_are_exposed_eagerly(self, tmp_path):
         job = {
             "id": "bounded-tools-job",
