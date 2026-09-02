@@ -5717,6 +5717,7 @@ def _run_job_after_admission(
                 job_id, _mcp_exc,
             )
 
+        runtime_tool_budget = job.get("runtime_tool_budget")
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -5741,13 +5742,16 @@ def _run_job_after_admission(
             # Exact host-permitted schemas must remain visible. Otherwise a
             # bounded run spends its execution budget rediscovering them.
             eager_tool_names=frozenset(
-                (job.get("runtime_tool_budget") or {}).get("allowed_tools") or ()
+                (runtime_tool_budget or {}).get("allowed_tools") or ()
             ),
-            # ``None`` preserves the normal cron tool surface. An empty set is
-            # an exact allowlist that filters every tool schema.
+            # ``None`` preserves the normal cron tool surface. Missing budgets
+            # and empty ``{}`` are both unbounded — same falsy check as
+            # ``activate_runtime_tool_budget()``. A present budget uses its
+            # allowlist; an empty ``allowed_tools`` list is an exact empty
+            # surface, not a crash. An empty frozenset filters every schema.
             allowed_tool_names=(
-                frozenset(job["runtime_tool_budget"]["allowed_tools"])
-                if job.get("runtime_tool_budget") is not None
+                frozenset(runtime_tool_budget.get("allowed_tools") or ())
+                if runtime_tool_budget
                 else None
             ),
             quiet_mode=True,
