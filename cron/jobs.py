@@ -2683,6 +2683,7 @@ def _mark_job_run_locked(
                     allowed_workflow_statuses = {
                         "blocked",
                         "completed",
+                        "failed",
                         "execution_error",
                         "unknown",
                     }

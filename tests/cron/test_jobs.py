@@ -497,6 +497,21 @@ class TestMarkJobRun:
         assert updated["last_status"] == "ok"
         assert updated["last_workflow_status"] == "blocked"
 
+    def test_workflow_failure_outcome_tracked_separately(self, tmp_cron_dir):
+        job = create_job(prompt="Prepare report", schedule="every 1h")
+
+        mark_job_run(
+            job["id"],
+            success=False,
+            error="Workflow reported failed outcome.",
+            workflow_status="failed",
+        )
+
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "error"
+        assert updated["last_error"] == "Workflow reported failed outcome."
+        assert updated["last_workflow_status"] == "failed"
+
     def test_delivery_error_cleared_on_success(self, tmp_cron_dir):
         """Successful delivery clears the previous delivery error."""
         job = create_job(prompt="Report", schedule="every 1h")

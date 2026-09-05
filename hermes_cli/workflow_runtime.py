@@ -42,6 +42,8 @@ def build_runbook_agent_prompt(
         "[WORKFLOW_STATUS:completed]",
         "If the workflow cannot safely continue without human input, end with exactly:",
         "[WORKFLOW_STATUS:blocked]",
+        "If the workflow fails or cannot complete, end with exactly:",
+        "[WORKFLOW_STATUS:failed]",
     ]
     if selected_step is not None:
         lines.extend(
