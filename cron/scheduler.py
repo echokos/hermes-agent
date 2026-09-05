@@ -520,7 +520,7 @@ from cron.executions import (
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 _WORKFLOW_STATUS_LINE = re.compile(
-    r"^\[WORKFLOW_STATUS:(blocked|completed)\]$",
+    r"^\[WORKFLOW_STATUS:(blocked|completed|failed)\]$",
     re.IGNORECASE,
 )
 
@@ -6551,7 +6551,7 @@ def _finish_workflow_registry_run(
         from hermes_cli import workflow_registry as workflow_registry
 
         step_status = "succeeded"
-        if not success or workflow_status == "execution_error":
+        if not success or workflow_status in {"execution_error", "failed"}:
             step_status = "failed"
         elif workflow_status == "blocked":
             step_status = "waiting_for_approval"
@@ -6874,6 +6874,9 @@ def _run_one_job_body(
             workflow_status, final_response = _extract_workflow_status(
                 final_response
             )
+            if workflow_status == "failed":
+                success = False
+                error = "Workflow reported failed outcome."
         side_effect_ownership_lost = False
         try:
             with _side_effect_fence() as owns_output:
@@ -7049,7 +7052,11 @@ def _run_one_job_body(
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        if job.get("track_workflow_status") and not success:
+        if (
+            job.get("track_workflow_status")
+            and not success
+            and workflow_status != "failed"
+        ):
             workflow_status = "execution_error"
 
         interrupted = _consume_interrupted_flag(job["id"], execution_token)

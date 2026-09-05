@@ -91,6 +91,7 @@ def test_build_runbook_agent_prompt_contains_protocol() -> None:
     assert "Execute step `collect`: Collect context" in prompt
     assert "[WORKFLOW_STATUS:completed]" in prompt
     assert "[WORKFLOW_STATUS:blocked]" in prompt
+    assert "[WORKFLOW_STATUS:failed]" in prompt
     assert "## Procedure" in prompt
 
 

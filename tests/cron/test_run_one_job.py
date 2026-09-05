@@ -107,6 +107,89 @@ def test_workflow_status_marker_is_stripped_and_stored(monkeypatch):
     assert marked == [("workflow-job", True, "blocked")]
 
 
+def test_failed_workflow_marker_settles_all_ledgers_as_failed(monkeypatch):
+    from hermes_cli import workflow_registry as reg
+
+    with reg.connect_closing() as conn:
+        reg.create_definition(
+            conn,
+            id="wf-cron-marker-failure",
+            slug="cron-marker-failure",
+            name="Cron Marker Failure",
+            owner_profile="default",
+            status="active",
+            runtime_kind="hermes",
+        )
+        reg.replace_steps(
+            conn,
+            "wf-cron-marker-failure",
+            [{"step_key": "collect", "position": 0, "name": "Collect"}],
+        )
+
+    delivered = []
+    marked = []
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda job, **kwargs: (
+            True,
+            "out",
+            "Sanitized failure body.\n[WORKFLOW_STATUS:failed]",
+            None,
+        ),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: "/tmp/out")
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda job, content, **kwargs: delivered.append(content),
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, delivery_error=None, workflow_status=None: marked.append(
+            (jid, ok, err, workflow_status)
+        ),
+    )
+
+    assert s.run_one_job(
+        {
+            "id": "workflow-marker-failure-job",
+            "name": "marker failure job",
+            "workflow_id": "wf-cron-marker-failure",
+            "workflow_step_key": "collect",
+            "track_workflow_status": True,
+        }
+    )
+
+    assert len(delivered) == 1
+    assert "[WORKFLOW_STATUS:failed]" not in delivered[0]
+    assert marked == [
+        (
+            "workflow-marker-failure-job",
+            False,
+            "Workflow reported failed outcome.",
+            "failed",
+        )
+    ]
+    with reg.connect_closing() as conn:
+        run = reg.list_runs(conn, "wf-cron-marker-failure")[0]
+        step = conn.execute("SELECT * FROM workflow_step_runs").fetchone()
+    assert run.status == "failed"
+    assert run.error == "Workflow reported failed outcome."
+    assert step["status"] == "failed"
+    assert step["summary"] == "Sanitized failure body."
+
+
+def test_workflow_failure_marker_embedded_in_prose_is_not_control_data():
+    response = "The literal [WORKFLOW_STATUS:failed] appears in documentation."
+
+    status, body = s._extract_workflow_status(response)
+
+    assert status == "unknown"
+    assert body == response
+
+
 def test_run_one_job_records_workflow_registry_run(monkeypatch):
     from hermes_cli import workflow_registry as reg
 
