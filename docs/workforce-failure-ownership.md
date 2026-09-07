@@ -19,7 +19,7 @@ Add this object to Grace job `bfb34552cae2` (X bookmarks) and job
 ```json
 {
   "failure_ownership": {
-    "technical_owner": "grace",
+    "technical_owner": "root",
     "director": "aurora",
     "severity": "warning",
     "enabled_at": "2026-09-07T19:00:00+00:00",
@@ -33,10 +33,11 @@ Add this object to Grace job `bfb34552cae2` (X bookmarks) and job
 The timestamp above is an example, not a value to copy. A failed opted-in run is
 persisted and its direct failure delivery is suppressed. Successful useful
 outputs retain the job's existing delivery. Two distinct later execution IDs
-provide recovery evidence but do not replace Grace's acknowledgment or Aurora's
-source-owned review acceptance.
+provide recovery evidence but do not replace Root's acknowledgment or Aurora's
+source-owned review acceptance. Grace remains the collector source and business
+owner; Root owns repair of the shared integration.
 
-For Chloe job `44f44143a9bd`, use Root as the technical owner of scheduler/tool
+For Chloe job `44f44143a9bd`, use Alina as the technical owner of local scheduler/tool
 persistence and Aurora as director. Chloe is the factual-record actor because
 the tool derives its actor from the executing profile; it cannot be overridden
 in tool input.
@@ -44,7 +45,7 @@ in tool input.
 ```json
 {
   "failure_ownership": {
-    "technical_owner": "root",
+    "technical_owner": "alina",
     "director": "aurora",
     "severity": "warning",
     "enabled_at": "2026-09-07T19:00:00+00:00",
@@ -88,4 +89,3 @@ restores legacy failure-delivery behavior for later runs. Do not delete monitor
 state, intake records, execution rows, or active Kanban incidents during
 rollback; they are audit evidence and existing handoffs keep their original
 owner and director until accepted or explicitly closed.
-
