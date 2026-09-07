@@ -1456,6 +1456,128 @@ def test_verified_owned_failure_three_call_review_reaches_acceptance(
         assert kb.get_coordination_request(conn, request.id).status == "completed"
 
 
+def test_verified_owned_failure_completion_keeps_bound_tail_and_never_retries(
+    kanban_home, organization,
+):
+    from datetime import datetime, timezone
+
+    from hermes_cli.workforce_handoffs import acknowledge_handoff, create_handoff
+
+    now = int(time.time())
+    iso = lambda value: datetime.fromtimestamp(value, timezone.utc).isoformat()
+    with kb.connect_closing() as conn:
+        created = create_handoff(
+            conn,
+            source_agent="director",
+            target_agent="builder",
+            expected_outcome="Repair the failing scheduled workflow",
+            acceptance_test="Two distinct later executions succeed",
+            evidence_references=["workflow:test"],
+            acknowledgment_deadline=iso(now + 60),
+            checkpoint_at=iso(now + 240),
+            organization=organization,
+            context={
+                "kind": "owned_operational_failure",
+                "technical_owner": "builder",
+                "director": "director",
+                "workflow_id": "scheduled-repair",
+                "event_id": "failure-1",
+            },
+            requires_source_acceptance=True,
+        )
+        task_id = created["task_id"]
+        request = kb.create_owned_failure_coordination_request(
+            conn, root_task_id=task_id, organization=organization, now=now,
+        )
+        acknowledge_handoff(
+            conn, task_id, actor="builder", organization=organization, now=now + 1,
+        )
+        owner = kb.claim_task(conn, task_id, claimer="builder:test")
+        assert owner is not None
+        for ordinal in range(1, 18):
+            assert kb.charge_coordination_model_call(
+                conn, request.id, purpose="work", task_id=task_id, now=now + 2,
+            ) == ordinal
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                task_id,
+                "workforce_handoff_recovery_required",
+                {
+                    "failure_event_id": "failure-1",
+                    "failure_order": 10,
+                    "required_successes": 2,
+                },
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "workforce_handoff_recovery_verified",
+                {
+                    "failure_event_id": "failure-1",
+                    "failure_order": 10,
+                    "success_event_ids": ["success-1", "success-2"],
+                    "success_orders": [11, 12],
+                    "required_successes": 2,
+                },
+            )
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="Repair complete; recovery evidence attached",
+            expected_run_id=owner.current_run_id,
+        )
+        reviewer, _ = kb.claim_task_for_dispatch(
+            conn, task_id, review=True, organization=organization, now=now + 300,
+        )
+        assert reviewer is not None
+        assert reviewer.assignee == "director"
+        assert kb.charge_coordination_model_call(
+            conn,
+            request.id,
+            purpose="terminal_review",
+            task_id=task_id,
+            now=now + 301,
+        ) == 18
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="Source accepted the verified repair",
+            expected_run_id=reviewer.current_run_id,
+        )
+        assert kb.get_task(conn, task_id).status == "done"
+        assert kb.get_coordination_request(conn, request.id).status == "completed"
+
+        # The same still-running reviewer turn may render its post-tool answer
+        # from the reserved tail, but no later process can reopen the work.
+        assert kb.charge_coordination_model_call(
+            conn,
+            request.id,
+            purpose="terminal_review",
+            task_id=task_id,
+            now=now + 302,
+        ) == 19
+        assert kb.charge_coordination_model_call(
+            conn,
+            request.id,
+            purpose="terminal_review",
+            task_id=task_id,
+            now=now + 303,
+        ) == 20
+        with pytest.raises(kb.CoordinationBudgetExceeded, match="aggregate"):
+            kb.charge_coordination_model_call(
+                conn,
+                request.id,
+                purpose="terminal_review",
+                task_id=task_id,
+                now=now + 304,
+            )
+        kb._record_worker_exit(424242, 256)
+        assert kb.detect_crashed_workers(conn) == []
+        assert kb.get_task(conn, task_id).status == "done"
+        assert kb.get_coordination_request(conn, request.id).status == "completed"
+
+
 def test_trusted_origin_factory_allows_zero_transient_retries(
     kanban_home, organization,
 ):
