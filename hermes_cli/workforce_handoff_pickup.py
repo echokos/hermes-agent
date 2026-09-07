@@ -7,8 +7,9 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
-from typing import Any
+from typing import Any, BinaryIO
 
 from hermes_cli._subprocess_compat import IS_WINDOWS, kill_process_tree
 from hermes_cli.kanban_db import _resolve_hermes_argv
@@ -45,17 +46,57 @@ def _bounded_identifier(value: str, *, prefix: str) -> str:
     return candidate
 
 
-def _pickup_log_path(database_path: Path, task_id: str) -> Path:
+def _open_pickup_log(database_path: Path, task_id: str) -> tuple[Path, BinaryIO]:
+    """Atomically create one owner-only, no-follow log for the one-shot pickup."""
+    if IS_WINDOWS:
+        raise OSError("workforce handoff pickup requires POSIX descriptor permissions")
     log_dir = database_path.resolve().parent / "workforce-handoff-pickups"
     log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        log_dir.chmod(0o700)
-    except OSError:
-        pass
     path = log_dir / f"{task_id}.log"
-    if path.exists() and not path.is_file():
-        raise ValueError("pickup log path is not a regular file")
-    return path
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_DIRECTORY | os.O_NOFOLLOW
+        directory_fd = os.open(log_dir, directory_flags)
+        try:
+            directory_stat = os.fstat(directory_fd)
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                raise ValueError("pickup log directory is not a real directory")
+            os.fchmod(directory_fd, 0o700)
+            fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+    else:
+        directory_stat = os.lstat(log_dir)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise ValueError("pickup log directory is not a real directory")
+        os.chmod(log_dir, 0o700)
+        fd = os.open(path, flags, 0o600)
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError("pickup log path is not a regular file")
+        os.fchmod(fd, 0o600)
+        return path, os.fdopen(fd, "ab", buffering=0)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+async def _wait_for_process(proc: subprocess.Popen, timeout: float) -> int:
+    """Bound the worker thread itself, not only the coroutine awaiting it."""
+    return await asyncio.to_thread(proc.wait, timeout=timeout)
+
+
+async def _terminate_and_reap(proc: subprocess.Popen) -> int | None:
+    """Kill the dedicated group and make a bounded best effort to reap it."""
+    kill_process_tree(proc)
+    try:
+        return await _wait_for_process(proc, 1)
+    except subprocess.TimeoutExpired:
+        return getattr(proc, "returncode", None)
 
 
 def _pickup_env(
@@ -176,7 +217,6 @@ async def run_workforce_handoff_pickup(
     db_path = Path(database_path).expanduser()
     if not db_path.is_absolute() or not db_path.is_file():
         raise ValueError("database_path must be an existing absolute file")
-    log_path = _pickup_log_path(db_path, task_id)
     env = _pickup_env(
         database_path=db_path,
         task_id=task_id,
@@ -187,11 +227,8 @@ async def run_workforce_handoff_pickup(
     command = _pickup_command(
         target_agent=target_agent, request_root_id=request_root_id, task_id=task_id
     )
-    with open(log_path, "ab", buffering=0) as log_file:
-        try:
-            os.chmod(log_path, 0o600)
-        except OSError:
-            pass
+    log_path, log_file = _open_pickup_log(db_path, task_id)
+    with log_file:
         try:
             proc = subprocess.Popen(  # noqa: S603 -- fixed CLI argv and validated ids
                 command,
@@ -211,16 +248,9 @@ async def run_workforce_handoff_pickup(
                 reason=f"spawn failed: {type(exc).__name__}",
             )
         try:
-            returncode = await asyncio.wait_for(
-                asyncio.to_thread(proc.wait), timeout=PICKUP_TIMEOUT_SECONDS
-            )
-        except TimeoutError:
-            kill_process_tree(proc)
-            returncode = None
-            try:
-                returncode = await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=1)
-            except Exception:
-                pass
+            returncode = await _wait_for_process(proc, PICKUP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            returncode = await _terminate_and_reap(proc)
             acknowledged = _fresh_acknowledgment(
                 database_path=db_path,
                 task_id=task_id,
@@ -238,6 +268,10 @@ async def run_workforce_handoff_pickup(
                     if acknowledged else "pickup timed out"
                 ),
             )
+        except asyncio.CancelledError:
+            # Do not leave the tool-scoped child alive when its caller exits.
+            await _terminate_and_reap(proc)
+            raise
 
     acknowledged = _fresh_acknowledgment(
         database_path=db_path,

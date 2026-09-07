@@ -10,6 +10,9 @@ import sys
 import threading
 import time
 
+import pytest
+
+from hermes_cli._subprocess_compat import IS_WINDOWS
 from hermes_cli.workforce_handoff_pickup import _pickup_command, _pickup_env
 
 
@@ -101,6 +104,32 @@ def test_pickup_env_scrubs_worker_identity_and_sets_exact_scope(monkeypatch, tmp
     assert env["HERMES_WORKFORCE_HANDOFF_PICKUP_TARGET"] == "alina"
 
 
+@pytest.mark.skipif(IS_WINDOWS, reason="pickup log descriptor hardening is POSIX-only")
+def test_pickup_log_is_exclusive_owner_only_and_never_reopens(monkeypatch, tmp_path):
+    from hermes_cli.workforce_handoff_pickup import _open_pickup_log
+
+    database_path = tmp_path / "kanban.db"
+    database_path.touch()
+    log_path, log_file = _open_pickup_log(database_path, "t_pickup_123")
+    with log_file:
+        log_file.write(b"bounded diagnostic\n")
+
+    assert log_path.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(FileExistsError):
+        _open_pickup_log(database_path, "t_pickup_123")
+
+
+def test_pickup_log_fails_closed_without_posix_descriptor_permissions(monkeypatch, tmp_path):
+    from hermes_cli.workforce_handoff_pickup import _open_pickup_log
+
+    database_path = tmp_path / "kanban.db"
+    database_path.touch()
+    monkeypatch.setattr("hermes_cli.workforce_handoff_pickup.IS_WINDOWS", True)
+
+    with pytest.raises(OSError, match="requires POSIX descriptor permissions"):
+        _open_pickup_log(database_path, "t_pickup_123")
+
+
 def test_fresh_acknowledgment_survives_immediate_task_state_advance(monkeypatch, tmp_path):
     from hermes_cli import kanban_db
     from hermes_cli.workforce_handoff_pickup import _fresh_acknowledgment
@@ -129,6 +158,7 @@ def test_fresh_acknowledgment_survives_immediate_task_state_advance(monkeypatch,
     ) is True
 
 
+@pytest.mark.skipif(IS_WINDOWS, reason="pickup process hardening is POSIX-only")
 def test_pickup_reports_committed_ack_when_child_finalization_exits_nonzero(
     monkeypatch, tmp_path
 ):
@@ -141,7 +171,8 @@ def test_pickup_reports_committed_ack_when_child_finalization_exits_nonzero(
     class FinalizationFailure:
         returncode = 23
 
-        def wait(self):
+        def wait(self, timeout=None):
+            assert timeout == 120
             with kanban_db.connect_closing(db_path) as conn:
                 acknowledge_handoff(
                     conn,
@@ -170,6 +201,57 @@ def test_pickup_reports_committed_ack_when_child_finalization_exits_nonzero(
     assert result.reason == "pickup exited with 23 after durable acknowledgment"
 
 
+@pytest.mark.skipif(IS_WINDOWS, reason="pickup process hardening is POSIX-only")
+def test_pickup_cancellation_kills_and_reaps_the_dedicated_process(
+    monkeypatch, tmp_path
+):
+    from hermes_cli.workforce_handoff_pickup import run_workforce_handoff_pickup
+
+    db_path, created, pickup, _organization, _now = _claimed_pickup(monkeypatch, tmp_path)
+    entered_wait = threading.Event()
+    release_wait = threading.Event()
+    killed: list[object] = []
+
+    class BlockingProcess:
+        returncode = None
+
+        def wait(self, timeout=None):
+            if timeout == 120:
+                entered_wait.set()
+                release_wait.wait()
+                return 0
+            assert timeout == 1
+            self.returncode = -15
+            return self.returncode
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_handoff_pickup.subprocess.Popen",
+        lambda *_args, **_kwargs: BlockingProcess(),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.workforce_handoff_pickup.kill_process_tree",
+        lambda proc: killed.append(proc),
+    )
+
+    async def cancel_pickup() -> None:
+        task = asyncio.create_task(run_workforce_handoff_pickup(
+            task_id=created["task_id"],
+            request_root_id=pickup["request_root_id"],
+            target_agent="alina",
+            source_agent="aurora",
+            database_path=db_path,
+        ))
+        assert await asyncio.to_thread(entered_wait.wait, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release_wait.set()
+
+    asyncio.run(cancel_pickup())
+    assert len(killed) == 1
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="pickup process hardening is POSIX-only")
 def test_pickup_runs_actual_cli_and_real_registry_with_loopback_provider(monkeypatch, tmp_path):
     """The pickup process must cross CLI, provider, registry, and durable DB."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
