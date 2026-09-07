@@ -1,7 +1,8 @@
 """Turn-end guard for kanban workers.
 
-Kanban workers must end with ``kanban_complete`` or ``kanban_block``. Models
-(especially GLM / Qwen families) sometimes narrate the next step
+Kanban workers must end with ``kanban_complete``, ``kanban_block``, or a
+successful ``kanban_request_review`` transition. Models (especially GLM / Qwen
+families) sometimes narrate the next step
 ("Let me write the report now") and stop with ``finish_reason=stop`` and no
 tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
 ``protocol_violation``.
@@ -13,11 +14,15 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Mapping
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_TERMINAL_KANBAN_TOOLS = frozenset(
+    {"kanban_complete", "kanban_block", "kanban_request_review"}
+)
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -35,34 +40,50 @@ def kanban_stop_nudge_enabled() -> bool:
     return bool(task)
 
 
-def _tool_call_name(tc: Any) -> str:
-    if isinstance(tc, dict):
-        fn = tc.get("function")
-        if isinstance(fn, dict):
-            return str(fn.get("name") or "")
-        return str(tc.get("name") or "")
-    fn = getattr(tc, "function", None)
-    if fn is not None:
-        return str(getattr(fn, "name", "") or "")
-    return str(getattr(tc, "name", "") or "")
+def _tool_result_payload(content: Any) -> Optional[Mapping[str, Any]]:
+    if isinstance(content, Mapping):
+        return content
+    if not isinstance(content, str):
+        return None
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _successful_terminal_result(msg: Mapping[str, Any]) -> bool:
+    name = str(msg.get("name") or msg.get("tool_name") or "")
+    if name not in _TERMINAL_KANBAN_TOOLS:
+        return False
+
+    payload = _tool_result_payload(msg.get("content"))
+    if payload is None or payload.get("ok") is not True:
+        return False
+
+    expected_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    result_task = str(payload.get("task_id") or "").strip()
+    if expected_task and result_task != expected_task:
+        return False
+
+    if name == "kanban_complete":
+        return True
+
+    status = str(payload.get("status") or "").strip().lower()
+    if name == "kanban_request_review":
+        return status == "review"
+    return status in {"blocked", "todo", "triage"}
 
 
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
-    """True if this conversation already invoked a terminal kanban tool."""
+    """True after the host reports a successful terminal board transition."""
     if not messages:
         return False
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        role = msg.get("role")
-        if role == "assistant":
-            for tc in msg.get("tool_calls") or []:
-                if _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS:
-                    return True
-        elif role == "tool":
-            name = str(msg.get("name") or "")
-            if name in _TERMINAL_KANBAN_TOOLS:
-                return True
+        if msg.get("role") == "tool" and _successful_terminal_result(msg):
+            return True
     return False
 
 
@@ -76,7 +97,7 @@ def build_kanban_stop_nudge(
     """Return a synthetic follow-up when a kanban worker exits without a terminal tool.
 
     Returns ``None`` when the guard should not fire (not a kanban worker,
-    already completed/blocked, or nudge budget exhausted).
+    already completed/blocked/sent to review, or nudge budget exhausted).
     """
     if not kanban_stop_nudge_enabled():
         return None
@@ -91,11 +112,12 @@ def build_kanban_stop_nudge(
         "terminal state for the board.\n\n"
         f"Task `{tid}` is still `running`. Ending now without a board tool "
         "causes a protocol violation (clean exit with no "
-        "`kanban_complete` / `kanban_block`).\n\n"
+        "`kanban_complete` / `kanban_block` / `kanban_request_review`).\n\n"
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "is done, `kanban_request_review(summary=...)` if source acceptance is "
+        "required, OR `kanban_block(reason=...)` if you are blocked.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )

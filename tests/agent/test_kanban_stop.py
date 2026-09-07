@@ -68,10 +68,107 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
                 }
             ],
         },
-        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": "done"},
+        {
+            "role": "tool",
+            "name": "kanban_complete",
+            "tool_call_id": "1",
+            "content": '{"ok": true, "task_id": "t_abc", "run_id": 7}',
+        },
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_no_nudge_after_successful_kanban_request_review(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "tool",
+            "name": "kanban_request_review",
+            "tool_call_id": "1",
+            "content": {"ok": True, "task_id": "t_abc", "status": "review"},
+        }
+    ]
+
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "1",
+                        "type": "function",
+                        "function": {
+                            "name": "kanban_request_review",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            }
+        ],
+        [
+            {
+                "role": "tool",
+                "name": "kanban_request_review",
+                "content": '{"error": "transition rejected"}',
+            }
+        ],
+        [
+            {
+                "role": "tool",
+                "name": "kanban_request_review",
+                "content": {
+                    "ok": False,
+                    "task_id": "t_abc",
+                    "status": "review",
+                },
+            }
+        ],
+        [
+            {
+                "role": "tool",
+                "name": "kanban_request_review",
+                "content": {
+                    "ok": True,
+                    "task_id": "t_other",
+                    "status": "review",
+                },
+            }
+        ],
+        [
+            {
+                "role": "tool",
+                "name": "kanban_request_review",
+                "content": {
+                    "ok": True,
+                    "task_id": "t_abc",
+                    "status": "running",
+                },
+            }
+        ],
+    ],
+    ids=[
+        "invocation-only",
+        "error-result",
+        "ok-false",
+        "wrong-task",
+        "wrong-status",
+    ],
+)
+def test_failed_or_unobserved_terminal_call_still_nudges(
+    clear_kanban_env, messages,
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
 
 
 
@@ -84,7 +181,6 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
 # without a terminal call, the dispatcher's bounded retry (streak of 3)
 # handles it.  See also tests/hermes_cli/test_kanban_core_functionality.py
 # for the dispatcher-side streak tests.
-
 
 
 

@@ -312,6 +312,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_post("/api/sessions", adapter._handle_create_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
@@ -356,6 +357,271 @@ def auth_adapter():
 
 
 class TestAgentExecution:
+
+    @pytest.mark.asyncio
+    async def test_default_native_session_never_executes_virtual_model_alias(self, adapter, tmp_path):
+        """An omitted model must use the global route, not profile name as raw model."""
+        from hermes_state import SessionDB
+
+        adapter._model_name = "aurora"
+        adapter._session_db = SessionDB(db_path=tmp_path / "state.db")
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post("/api/sessions", json={
+                "id": "default-model", "source": "browser", "title": "Default model",
+            })
+            assert create.status == 201
+            assert (await create.json())["session"]["model"] is None
+            assert adapter._session_db.get_session("default-model")["model"] is None
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run:
+                chat = await cli.post("/api/sessions/default-model/chat", json={"message": "hi"})
+                assert chat.status == 200
+                stream = await cli.post("/api/sessions/default-model/chat/stream", json={"message": "again"})
+                assert stream.status == 200
+                assert "event: run.completed" in await stream.text()
+
+        assert [call.kwargs["session_model"] for call in mock_run.call_args_list] == [None, None]
+        assert [call.kwargs["route"] for call in mock_run.call_args_list] == [None, None]
+
+    @pytest.mark.asyncio
+    async def test_default_native_session_honors_per_turn_virtual_model_provider(self, adapter, tmp_path):
+        """A public model name plus provider is an explicit raw selection, not global fallback."""
+        from hermes_state import SessionDB
+
+        adapter._model_name = "aurora"
+        adapter._session_db = SessionDB(db_path=tmp_path / "state.db")
+        app = _create_app(adapter)
+        expected_route = {"model": "aurora", "provider": "custom-provider"}
+
+        async def _mock_run_agent(**kwargs):
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post("/api/sessions", json={"id": "per-turn-raw"})
+            assert create.status == 201
+            assert adapter._session_db.get_session("per-turn-raw")["model"] is None
+            body = {"message": "hi", "model": "aurora", "provider": "custom-provider"}
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run:
+                chat = await cli.post("/api/sessions/per-turn-raw/chat", json=body)
+                stream = await cli.post("/api/sessions/per-turn-raw/chat/stream", json=body)
+                assert chat.status == stream.status == 200
+                assert "event: run.completed" in await stream.text()
+
+        for call in mock_run.call_args_list:
+            assert call.kwargs["route"] == expected_route
+            assert call.kwargs["session_model"] is None
+            assert call.kwargs["requested_runtime"] == {
+                "raw_model": "aurora", "model": "aurora", "provider": "custom-provider",
+            }
+
+    @pytest.mark.asyncio
+    async def test_session_route_rejects_conflicting_per_turn_virtual_provider(self, adapter, tmp_path):
+        """A persisted route remains authoritative over a conflicting raw request."""
+        from hermes_state import SessionDB
+
+        adapter._model_name = "aurora"
+        adapter._model_routes = {
+            "stored": {"model": "provider/stored", "provider": "route-provider"},
+        }
+        adapter._session_db = SessionDB(db_path=tmp_path / "state.db")
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post("/api/sessions", json={"id": "stored-route", "model": "stored"})
+            assert create.status == 201
+            body = {"message": "hi", "model": "aurora", "provider": "other-provider"}
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                chat = await cli.post("/api/sessions/stored-route/chat", json=body)
+                stream = await cli.post("/api/sessions/stored-route/chat/stream", json=body)
+                assert chat.status == stream.status == 400
+                assert mock_run.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_legacy_virtual_session_alias_uses_global_selection_in_both_chat_modes(self, adapter, tmp_path):
+        """Rows written before the NULL-default fix must not invoke a profile as a model."""
+        from hermes_state import SessionDB
+
+        adapter._model_name = "aurora"
+        adapter._session_db = SessionDB(db_path=tmp_path / "state.db")
+        adapter._session_db.create_session("legacy-virtual", "api_server", model="aurora")
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run:
+                chat = await cli.post("/api/sessions/legacy-virtual/chat", json={"message": "hi"})
+                stream = await cli.post(
+                    "/api/sessions/legacy-virtual/chat/stream", json={"message": "again"}
+                )
+                assert chat.status == stream.status == 200
+                assert "event: run.completed" in await stream.text()
+
+        assert [call.kwargs["session_model"] for call in mock_run.call_args_list] == [None, None]
+        assert [call.kwargs["route"] for call in mock_run.call_args_list] == [None, None]
+
+    @pytest.mark.asyncio
+    async def test_public_model_name_route_is_preserved_for_native_sessions(self, adapter, tmp_path):
+        """A configured route may intentionally use the advertised profile alias."""
+        from hermes_state import SessionDB
+
+        route = {"model": "provider/aurora", "provider": "openrouter"}
+        adapter._model_name = "aurora"
+        adapter._model_routes = {"aurora": route}
+        adapter._session_db = SessionDB(db_path=tmp_path / "state.db")
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post("/api/sessions", json={"id": "public-route"})
+            assert create.status == 201
+            assert adapter._session_db.get_session("public-route")["model"] == "aurora"
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run:
+                chat = await cli.post("/api/sessions/public-route/chat", json={"message": "hi"})
+                stream = await cli.post(
+                    "/api/sessions/public-route/chat/stream", json={"message": "again"}
+                )
+                assert chat.status == stream.status == 200
+                assert "event: run.completed" in await stream.text()
+
+        assert [call.kwargs["session_model"] for call in mock_run.call_args_list] == [None, None]
+        assert [call.kwargs["route"] for call in mock_run.call_args_list] == [route, route]
+
+    @pytest.mark.asyncio
+    async def test_explicit_virtual_model_with_provider_keeps_raw_selection(self, adapter, tmp_path):
+        """An explicit provider distinguishes a raw virtual-named model from the default."""
+        from hermes_state import SessionDB
+
+        adapter._model_name = "aurora"
+        adapter._session_db = SessionDB(db_path=tmp_path / "state.db")
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post("/api/sessions", json={
+                "id": "raw-virtual", "model": "aurora", "provider": "custom-provider",
+            })
+            assert create.status == 201
+            assert adapter._session_db.get_session("raw-virtual")["model"] == "aurora"
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run:
+                chat = await cli.post("/api/sessions/raw-virtual/chat", json={"message": "hi"})
+                stream = await cli.post(
+                    "/api/sessions/raw-virtual/chat/stream", json={"message": "again"}
+                )
+                assert chat.status == stream.status == 200
+                assert "event: run.completed" in await stream.text()
+
+        raw_route = {"model": "aurora", "provider": "custom-provider"}
+        assert [call.kwargs["session_model"] for call in mock_run.call_args_list] == [None, None]
+        assert [call.kwargs["route"] for call in mock_run.call_args_list] == [raw_route, raw_route]
+
+    @pytest.mark.asyncio
+    async def test_confirmed_browser_model_lock_remains_authoritative_in_both_chat_modes(self, adapter, tmp_path):
+        """The virtual-alias cleanup must not bypass a confirmed Browser lock."""
+        from hermes_state import SessionDB
+
+        route = {"model": "provider/locked", "provider": "route-provider"}
+        adapter._model_name = "aurora"
+        adapter._model_routes = {"locked": route}
+        adapter._session_db = SessionDB(db_path=tmp_path / "state.db")
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post("/api/sessions", json={
+                "id": "browser-lock",
+                "model": "locked",
+                "provider": "locked-provider",
+                "require_model_lock": True,
+            })
+            assert create.status == 201
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run:
+                chat = await cli.post("/api/sessions/browser-lock/chat", json={"message": "hi"})
+                stream = await cli.post(
+                    "/api/sessions/browser-lock/chat/stream", json={"message": "again"}
+                )
+                assert chat.status == stream.status == 200
+                assert "event: run.completed" in await stream.text()
+
+        for call in mock_run.call_args_list:
+            assert call.kwargs["route"] == route
+            assert call.kwargs["session_model"] is None
+            assert call.kwargs["confirmed_runtime_lock"] is True
+            assert call.kwargs["requested_model"] == "locked"
+            assert call.kwargs["requested_provider"] == "locked-provider"
+
+    @pytest.mark.asyncio
+    async def test_native_session_keeps_explicit_model_and_route_alias(self, adapter, tmp_path):
+        """Explicit raw models and configured aliases retain their pre-existing paths."""
+        from hermes_state import SessionDB
+
+        adapter._model_name = "aurora"
+        adapter._model_routes = {
+            "fast": {"model": "provider/fast", "provider": "openrouter"},
+        }
+        adapter._session_db = SessionDB(db_path=tmp_path / "state.db")
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            raw_create = await cli.post("/api/sessions", json={
+                "id": "raw-model", "model": "provider/explicit",
+            })
+            route_create = await cli.post("/api/sessions", json={
+                "id": "route-model", "model": "fast",
+            })
+            assert raw_create.status == route_create.status == 201
+            assert adapter._session_db.get_session("raw-model")["model"] == "provider/explicit"
+            assert adapter._session_db.get_session("route-model")["model"] == "fast"
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run:
+                raw_chat = await cli.post("/api/sessions/raw-model/chat", json={"message": "hi"})
+                route_chat = await cli.post("/api/sessions/route-model/chat", json={"message": "hi"})
+                assert raw_chat.status == route_chat.status == 200
+
+        raw_call, route_call = mock_run.call_args_list
+        assert raw_call.kwargs["session_model"] == "provider/explicit"
+        assert raw_call.kwargs["route"] is None
+        assert route_call.kwargs["session_model"] is None
+        assert route_call.kwargs["route"] == {
+            "model": "provider/fast", "provider": "openrouter",
+        }
+
     @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
         mock_agent = MagicMock()
