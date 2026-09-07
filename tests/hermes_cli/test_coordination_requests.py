@@ -985,6 +985,185 @@ def test_retry_and_elapsed_limits_survive_reopen(kanban_home, organization):
             )
 
 
+@pytest.mark.parametrize(
+    ("assignee", "expected_leaf_launches"),
+    [("builder", 2), ("director", 0), ("qa", 0)],
+)
+def test_crashed_worker_any_role_gets_one_root_retry_then_blocks(
+    kanban_home, organization, monkeypatch, assignee, expected_leaf_launches,
+):
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("signaled", 15))
+    monkeypatch.setattr(kb.time, "time", lambda: 101)
+
+    with kb.connect_closing() as conn:
+        root_id, request = _accept_request(
+            conn, organization, max_transient_retries=1,
+        )
+        task_id = kb.create_task(
+            conn,
+            title="retry one crashed worker",
+            assignee=assignee,
+            coordination_source_task_id=root_id,
+        )
+
+        first, _ = kb.claim_task_for_dispatch(
+            conn, task_id, organization=organization, now=101,
+        )
+        assert first is not None
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, started_at = 0 WHERE id = ?",
+            (41001, task_id),
+        )
+        conn.commit()
+        assert kb.detect_crashed_workers(conn) == [task_id]
+        assert kb.get_task(conn, task_id).status == "ready"
+        after_first = kb.get_coordination_request(conn, request.id)
+        assert after_first is not None
+        assert after_first.status == "active"
+        assert after_first.transient_retries_used == 1
+
+        second, _ = kb.claim_task_for_dispatch(
+            conn, task_id, organization=organization, now=102,
+        )
+        assert second is not None
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, started_at = 0 WHERE id = ?",
+            (41002, task_id),
+        )
+        conn.commit()
+        assert kb.detect_crashed_workers(conn) == [task_id]
+
+        assert kb.get_task(conn, task_id).status == "blocked"
+        exhausted = kb.get_coordination_request(conn, request.id)
+        assert exhausted is not None
+        assert exhausted.status == "return_pending"
+        assert exhausted.transient_retries_used == 1
+        assert exhausted.leaf_launches_used == expected_leaf_launches
+        kinds = [event.kind for event in kb.list_events(conn, root_id)]
+        assert kinds.count("coordination_retry_reserved") == 1
+        assert kinds.count("coordination_retry_exhausted") == 1
+        assert kinds.count("coordination_guardrail_reached") == 1
+
+
+def test_coordinated_quota_exit_without_retry_blocks_for_final_return(
+    kanban_home, organization, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("rate_limited", 75))
+
+    with kb.connect_closing() as conn:
+        root_id, request = _accept_request(
+            conn, organization, max_transient_retries=0,
+        )
+        task_id = kb.create_task(
+            conn,
+            title="quota-bound worker",
+            assignee="builder",
+            coordination_source_task_id=root_id,
+        )
+        claimed, _ = kb.claim_task_for_dispatch(
+            conn, task_id, organization=organization, now=101,
+        )
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, started_at = 0 WHERE id = ?",
+            (42001, task_id),
+        )
+        conn.commit()
+
+        assert kb.detect_crashed_workers(conn) == []
+        assert task_id in kb.detect_crashed_workers._last_rate_limited
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 0
+        stopped = kb.get_coordination_request(conn, request.id)
+        assert stopped is not None
+        assert stopped.status == "return_pending"
+        assert stopped.transient_retries_used == 0
+
+
+def test_timed_out_worker_uses_same_root_retry_budget(
+    kanban_home, organization, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb.time, "time", lambda: 101)
+
+    with kb.connect_closing() as conn:
+        root_id, request = _accept_request(
+            conn, organization, max_transient_retries=1,
+        )
+        task_id = kb.create_task(
+            conn,
+            title="timeout-bound worker",
+            assignee="builder",
+            coordination_source_task_id=root_id,
+        )
+        for pid in (43001, 43002):
+            claimed, _ = kb.claim_task_for_dispatch(
+                conn, task_id, organization=organization, now=101,
+            )
+            assert claimed is not None
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, started_at = 0, "
+                "max_runtime_seconds = 1 WHERE id = ?",
+                (pid, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = 0 WHERE id = ?",
+                (claimed.current_run_id,),
+            )
+            conn.commit()
+            assert task_id in kb.enforce_max_runtime(
+                conn, signal_fn=lambda *_args: None,
+            )
+
+        assert kb.get_task(conn, task_id).status == "blocked"
+        stopped = kb.get_coordination_request(conn, request.id)
+        assert stopped is not None
+        assert stopped.status == "return_pending"
+        assert stopped.transient_retries_used == 1
+
+
+def test_protocol_violation_is_deterministic_and_not_retried(
+    kanban_home, organization, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
+    monkeypatch.setattr(kb.time, "time", lambda: 101)
+
+    with kb.connect_closing() as conn:
+        root_id, request = _accept_request(
+            conn, organization, max_transient_retries=1,
+        )
+        task_id = kb.create_task(
+            conn,
+            title="worker must close its durable task",
+            assignee="builder",
+            coordination_source_task_id=root_id,
+        )
+        claimed, _ = kb.claim_task_for_dispatch(
+            conn, task_id, organization=organization, now=101,
+        )
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, started_at = 0 WHERE id = ?",
+            (44001, task_id),
+        )
+        conn.commit()
+
+        assert kb.detect_crashed_workers(conn) == [task_id]
+        assert kb.get_task(conn, task_id).status == "blocked"
+        stopped = kb.get_coordination_request(conn, request.id)
+        assert stopped is not None
+        assert stopped.status == "return_pending"
+        assert stopped.transient_retries_used == 0
+
+
 def _owned_failure_task(conn):
     body = {
         "kind": "workforce_handoff",

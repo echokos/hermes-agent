@@ -5374,36 +5374,62 @@ def reserve_coordination_retry(
         return True
     if classification not in {"transient", "deterministic"}:
         raise ValueError("retry classification must be transient or deterministic")
-    if classification == "deterministic":
-        return False
     timestamp = int(time.time() if now is None else now)
     with write_txn(conn):
-        request = get_coordination_request(conn, request_root_id)
-        if request is None or request.status != "active":
-            return False
-        if timestamp >= request.checkpoint_at:
-            return False
-        if request.transient_retries_used >= request.max_transient_retries:
-            return False
-        ordinal = request.transient_retries_used + 1
-        conn.execute(
-            "UPDATE coordination_requests "
-            "SET transient_retries_used = transient_retries_used + 1, updated_at = ? "
-            "WHERE id = ?",
-            (timestamp, request.id),
-        )
-        _append_event(
+        return _reserve_coordination_retry_in_txn(
             conn,
-            request.root_task_id,
-            "coordination_retry_reserved",
-            {
-                "request_root_id": request.id,
-                "task_id": task_id,
-                "classification": classification,
-                "cause_code": str(cause_code)[:100],
-                "ordinal": ordinal,
-            },
+            request_root_id,
+            task_id=task_id,
+            classification=classification,
+            cause_code=cause_code,
+            timestamp=timestamp,
         )
+
+
+def _reserve_coordination_retry_in_txn(
+    conn: sqlite3.Connection,
+    request_root_id: str,
+    *,
+    task_id: str,
+    classification: str,
+    cause_code: str,
+    timestamp: int,
+) -> bool:
+    """Reserve a retry while the caller holds the task-state transaction."""
+    if classification == "deterministic":
+        return False
+    request = get_coordination_request(conn, request_root_id)
+    task = get_task(conn, task_id)
+    if (
+        request is None
+        or request.status != "active"
+        or task is None
+        or task.request_root_id != request.id
+    ):
+        return False
+    if timestamp >= request.checkpoint_at:
+        return False
+    if request.transient_retries_used >= request.max_transient_retries:
+        return False
+    ordinal = request.transient_retries_used + 1
+    conn.execute(
+        "UPDATE coordination_requests "
+        "SET transient_retries_used = transient_retries_used + 1, updated_at = ? "
+        "WHERE id = ?",
+        (timestamp, request.id),
+    )
+    _append_event(
+        conn,
+        request.root_task_id,
+        "coordination_retry_reserved",
+        {
+            "request_root_id": request.id,
+            "task_id": task_id,
+            "classification": classification,
+            "cause_code": str(cause_code)[:100],
+            "ordinal": ordinal,
+        },
+    )
     return True
 
 
@@ -5418,32 +5444,100 @@ def mark_coordination_guardrail(
     """Move an active request to return-pending exactly once."""
     timestamp = int(time.time() if now is None else now)
     with write_txn(conn):
-        request = get_coordination_request(conn, request_root_id)
-        if request is None:
-            return False
-        changed = conn.execute(
-            "UPDATE coordination_requests SET status = 'return_pending', "
-            "updated_at = ? WHERE id = ? AND status = 'active'",
-            (timestamp, request_root_id),
-        )
-        if changed.rowcount != 1:
-            return False
-        _append_event(
+        return _mark_coordination_guardrail_in_txn(
             conn,
-            request.root_task_id,
-            "coordination_guardrail_reached",
-            {
-                "request_root_id": request_root_id,
-                "task_id": request.root_task_id,
-                "trigger_task_id": task_id,
-                "responsible_agent": request.responsible_agent,
-                "origin_session_id": request.origin_session_id,
-                "origin_message_id": request.origin_message_id,
-                "reason": str(reason)[:300],
-                "status": "return_pending",
-            },
+            request_root_id,
+            task_id=task_id,
+            reason=reason,
+            timestamp=timestamp,
         )
+
+
+def _mark_coordination_guardrail_in_txn(
+    conn: sqlite3.Connection,
+    request_root_id: str,
+    *,
+    task_id: Optional[str],
+    reason: str,
+    timestamp: int,
+) -> bool:
+    request = get_coordination_request(conn, request_root_id)
+    if request is None:
+        return False
+    changed = conn.execute(
+        "UPDATE coordination_requests SET status = 'return_pending', "
+        "updated_at = ? WHERE id = ? AND status = 'active'",
+        (timestamp, request_root_id),
+    )
+    if changed.rowcount != 1:
+        return False
+    _append_event(
+        conn,
+        request.root_task_id,
+        "coordination_guardrail_reached",
+        {
+            "request_root_id": request_root_id,
+            "task_id": request.root_task_id,
+            "trigger_task_id": task_id,
+            "responsible_agent": request.responsible_agent,
+            "origin_session_id": request.origin_session_id,
+            "origin_message_id": request.origin_message_id,
+            "reason": str(reason)[:300],
+            "status": "return_pending",
+        },
+    )
     return True
+
+
+def _coordination_failure_retry_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    request_root_id: Optional[str],
+    classification: str,
+    cause_code: str,
+    timestamp: int,
+) -> Optional[bool]:
+    """Apply origin-request retry policy inside an existing failure txn."""
+    if not request_root_id:
+        return None
+    request = get_coordination_request(conn, request_root_id)
+    if request is None or request.kind != "origin_request":
+        return None
+    allowed = _reserve_coordination_retry_in_txn(
+        conn,
+        request.id,
+        task_id=task_id,
+        classification=classification,
+        cause_code=cause_code,
+        timestamp=timestamp,
+    )
+    if allowed:
+        return True
+    reason = (
+        f"deterministic worker failure: {cause_code}"
+        if classification == "deterministic"
+        else f"transient retry exhausted: {cause_code}"
+    )
+    _append_event(
+        conn,
+        request.root_task_id,
+        "coordination_retry_exhausted",
+        {
+            "request_root_id": request.id,
+            "task_id": task_id,
+            "classification": classification,
+            "cause_code": str(cause_code)[:100],
+        },
+    )
+    _mark_coordination_guardrail_in_txn(
+        conn,
+        request.id,
+        task_id=task_id,
+        reason=reason,
+        timestamp=timestamp,
+    )
+    return False
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
@@ -11262,19 +11356,42 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
     # on top of the event we already emitted).
     #
-    # Protocol-violation crashes (clean exit, no terminal tool call) get a
-    # BOUNDED retry, not an immediate trip: empirically ~96% of these tasks
-    # complete on a later run (a goal-mode finalize nudge, or the model simply
-    # emitting kanban_complete/kanban_block next time), so blocking on the first
-    # occurrence just churned them through the respawn cycle. The retry budget
-    # is a violation-only streak (``_protocol_violation_streak``): earlier
-    # timeouts / nonzero exits neither consume nor extend it, and a
-    # below-budget violation does not tick the unified
-    # ``consecutive_failures`` counter, so the two budgets stay independent.
-    # A per-task ``max_retries`` overrides the violation bound with the same
-    # top precedence it has for every other failure kind. Systemic same-error
-    # crashes still trip immediately.
+    # Legacy protocol-violation crashes keep their existing bounded retry.
+    # Accepted origin requests treat that unchanged protocol breach as
+    # deterministic and stop immediately. Their rate-limit exits remain
+    # excluded from the generic failure counter, but still consume the root's
+    # one durable transient-retry allowance so a quota wall cannot starve the
+    # final return forever.
     auto_blocked: list[str] = []
+    for tid in rate_limited:
+        with write_txn(conn):
+            task = get_task(conn, tid)
+            decision = _coordination_failure_retry_in_txn(
+                conn,
+                task_id=tid,
+                request_root_id=task.request_root_id if task is not None else None,
+                classification="transient",
+                cause_code="rate_limited",
+                timestamp=int(time.time()),
+            )
+            if decision is False:
+                changed = conn.execute(
+                    "UPDATE tasks SET status = 'blocked' "
+                    "WHERE id = ? AND status IN ('ready', 'review')",
+                    (tid,),
+                )
+                if changed.rowcount:
+                    _append_event(
+                        conn,
+                        tid,
+                        "gave_up",
+                        {
+                            "trigger_outcome": "rate_limited",
+                            "coordination_retry_exhausted": True,
+                            "coordination_classification": "transient",
+                        },
+                    )
+                    auto_blocked.append(tid)
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
@@ -11283,6 +11400,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
         for tid, pid, claimer, protocol_violation, error_text in crash_details:
             if protocol_violation:
+                task = get_task(conn, tid)
+                request = (
+                    get_coordination_request(conn, task.request_root_id)
+                    if task is not None and task.request_root_id
+                    else None
+                )
+                if request is not None and request.kind == "origin_request":
+                    tripped = _record_task_failure(
+                        conn,
+                        tid,
+                        error=error_text,
+                        outcome="protocol_violation",
+                        release_claim=False,
+                        end_run=False,
+                        event_payload_extra={
+                            "pid": pid,
+                            "claimer": claimer,
+                            "protocol_violation": True,
+                        },
+                        coordination_classification="deterministic",
+                    )
+                    if tripped:
+                        auto_blocked.append(tid)
+                    continue
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
                     "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
@@ -11377,6 +11518,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    coordination_classification: str = "transient",
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -11423,10 +11565,14 @@ def _record_task_failure(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    if coordination_classification not in {"transient", "deterministic"}:
+        raise ValueError("invalid coordination failure classification")
     blocked = False
+    timestamp = int(time.time())
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, "
+            "request_root_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
@@ -11450,7 +11596,23 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
-        if force_trip or failures >= effective_limit:
+        coordination_retry = _coordination_failure_retry_in_txn(
+            conn,
+            task_id=task_id,
+            request_root_id=row["request_root_id"],
+            classification=coordination_classification,
+            cause_code=outcome,
+            timestamp=timestamp,
+        )
+        should_trip = force_trip or failures >= effective_limit
+        if coordination_retry is True:
+            # The accepted root owns the retry decision. A lower generic
+            # circuit-breaker threshold must not consume the retry it reserved.
+            should_trip = False
+        elif coordination_retry is False:
+            should_trip = True
+
+        if should_trip:
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
@@ -11494,6 +11656,11 @@ def _record_task_failure(
                 "trigger_outcome": outcome,
                 "retry_status": retry_status,
             }
+            if coordination_retry is False:
+                payload["coordination_retry_exhausted"] = True
+                payload["coordination_classification"] = (
+                    coordination_classification
+                )
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
@@ -11550,6 +11717,7 @@ def _record_spawn_failure(
     error: str,
     *,
     failure_limit: int = None,
+    coordination_classification: str = "transient",
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
@@ -11557,6 +11725,7 @@ def _record_spawn_failure(
         failure_limit=failure_limit,
         release_claim=True,
         end_run=True,
+        coordination_classification=coordination_classification,
     )
 
 
@@ -12580,6 +12749,7 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                coordination_classification="deterministic",
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -12721,6 +12891,7 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                coordination_classification="deterministic",
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
