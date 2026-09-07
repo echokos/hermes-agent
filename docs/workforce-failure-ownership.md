@@ -67,10 +67,12 @@ the Cron execution and tracked workflow fail even if the model returns
 the one-write allowance, so a valid retry can still commit. Repeated invalid
 attempts stop at the existing six-call job budget.
 
-Before activating Chloe, its prompt/runbook must supply a durable, explicit
-Aurora assignment ID as `aurora_assignment_id` whenever a material signal is
-written. Do not increase its tool-call or write quota and do not require a
-synthetic signal on quiet runs.
+Before activating Chloe, regenerate its prompt with `build_runbook_agent_prompt`
+for the existing `chloe_observe` step. The builder supplies the durable assignment
+ID `workflow:wf_workforce_proactive_operating_cycles_v1:step:chloe_observe` only as
+directed factual intake under the canonical Aurora-owned, Chloe-executed step.
+No new task or authority is created. Do not increase its tool-call or write quota
+and do not require a synthetic signal on quiet runs.
 
 ## Host activation
 

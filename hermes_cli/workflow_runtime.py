@@ -46,14 +46,27 @@ def build_runbook_agent_prompt(
         "[WORKFLOW_STATUS:failed]",
     ]
     if selected_step is not None:
+        assignment_ref = f"workflow:{metadata['id']}:step:{selected_step['step_key']}"
         lines.extend(
             [
                 "",
                 f"Execute step `{selected_step['step_key']}`: {selected_step['name']}",
+                f"Standing assignment reference: `{assignment_ref}`.",
             ]
         )
         if selected_step.get("description"):
             lines.append(str(selected_step["description"]))
+        if (
+            metadata.get("owner_profile") == "aurora"
+            and selected_step.get("executor_profile") == "chloe"
+        ):
+            lines.extend([
+                "For a material factual workforce_signal within this assigned step, "
+                f"use aurora_assignment_id: `{assignment_ref}`.",
+                "Include the observation, expected factual outcome, and evidence references; "
+                "omit department_recommendation and estimated_effort. This reference "
+                "does not authorize recommendations, execution, or a signal on a quiet run.",
+            ])
     if trigger_context:
         lines.extend(["", "Trigger context:", trigger_context.strip()])
     lines.extend(["", "RUNBOOK.md:", "", parsed.body.strip()])
