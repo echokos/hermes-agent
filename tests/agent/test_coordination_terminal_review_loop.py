@@ -242,11 +242,13 @@ def terminal_review_context(tmp_path, monkeypatch):
     )
 
 
-def _new_agent():
+def _new_agent(*tool_names: str):
+    if not tool_names:
+        tool_names = ("read_file", "kanban_complete")
     with (
         patch(
             "run_agent.get_tool_definitions",
-            return_value=_tool_definitions("read_file", "kanban_complete"),
+            return_value=_tool_definitions(*tool_names),
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
@@ -387,3 +389,163 @@ def test_terminal_review_request_review_is_not_a_clean_stop(terminal_review_cont
         db_path=kb.kanban_db_path(),
     ):
         assert _terminal_review_tool_round_completed(messages) is False
+
+
+@pytest.mark.parametrize(
+    ("purpose", "env", "messages"),
+    [
+        (
+            None,
+            {},
+            [{"role": "tool", "name": "kanban_complete", "content": {"ok": True}}],
+        ),
+        (
+            "work",
+            {},
+            [{"role": "tool", "name": "kanban_complete", "content": {"ok": True}}],
+        ),
+        (
+            "terminal_review",
+            {"HERMES_KANBAN_TASK": None},
+            [{"role": "tool", "name": "kanban_complete", "content": {"ok": True}}],
+        ),
+        (
+            "terminal_review",
+            {"HERMES_KANBAN_TASK": "wrong-task"},
+            [{"role": "tool", "name": "kanban_complete", "content": {"ok": True}}],
+        ),
+        (
+            "terminal_review",
+            {"HERMES_SESSION_SOURCE": None},
+            [{"role": "tool", "name": "kanban_complete", "content": {"ok": True}}],
+        ),
+        (
+            "terminal_review",
+            {"HERMES_SESSION_SOURCE": "cli"},
+            [{"role": "tool", "name": "kanban_complete", "content": {"ok": True}}],
+        ),
+        (
+            "terminal_review",
+            {"HERMES_KANBAN_RUN_ID": None},
+            [{"role": "tool", "name": "kanban_complete", "content": {"ok": True}}],
+        ),
+        (
+            "terminal_review",
+            {"HERMES_KANBAN_RUN_ID": "0"},
+            [{"role": "tool", "name": "kanban_complete", "content": {"ok": True}}],
+        ),
+        (
+            "terminal_review",
+            {"HERMES_KANBAN_RUN_ID": "invalid"},
+            [{"role": "tool", "name": "kanban_complete", "content": {"ok": True}}],
+        ),
+        (
+            "terminal_review",
+            {},
+            [{"role": "tool", "name": "kanban_complete", "content": {"ok": False}}],
+        ),
+        (
+            "terminal_review",
+            {},
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"function": {"name": "kanban_complete"}}],
+                }
+            ],
+        ),
+    ],
+    ids=[
+        "no-active-scope",
+        "non-review-purpose",
+        "missing-task",
+        "wrong-task",
+        "missing-source",
+        "wrong-source",
+        "missing-run",
+        "zero-run",
+        "invalid-run",
+        "rejected-result",
+        "invocation-only",
+    ],
+)
+def test_terminal_review_guard_rejects_untrusted_context(
+    terminal_review_context,
+    monkeypatch,
+    purpose,
+    env,
+    messages,
+):
+    """Environment strings never substitute for the active dispatcher scope."""
+    _home, request_id, task_id, _run_id, _preface, _artifact, _source = (
+        terminal_review_context
+    )
+    for name, value in env.items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    if purpose is None:
+        assert _terminal_review_tool_round_completed(messages) is False
+        return
+    with scoped_coordination_budget(
+        request_root_id=request_id,
+        task_id=task_id,
+        purpose=purpose,
+        db_path=kb.kanban_db_path(),
+    ):
+        assert _terminal_review_tool_round_completed(messages) is False
+
+
+def test_terminal_review_request_changes_stops_after_one_final_call(
+    terminal_review_context,
+):
+    """A real rework verdict needs no narrative follow-up at call 20."""
+    _home, request_id, task_id, _run_id, preface, _artifact, _source = (
+        terminal_review_context
+    )
+    with kb.connect_closing() as conn:
+        for ordinal in (18, 19):
+            assert (
+                kb.charge_coordination_model_call(
+                    conn,
+                    request_id,
+                    purpose="terminal_review",
+                    task_id=task_id,
+                )
+                == ordinal
+            )
+
+    agent = _new_agent("kanban_request_changes")
+    agent.max_iterations = 1
+    agent.client.chat.completions.create.return_value = _tool_response(
+        _tool_call(
+            "kanban_request_changes",
+            {"reason": "The verified source needs an additional assertion."},
+            "call-20-changes",
+        )
+    )
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.turn_finalizer._record_kanban_budget_exhausted") as record_timeout,
+        scoped_coordination_budget(),
+    ):
+        result = agent.run_conversation(preface, task_id=task_id)
+
+    assert agent.client.chat.completions.create.call_count == 1
+    record_timeout.assert_not_called()
+    assert result["completed"] is True
+    assert result["final_response"] == ""
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.assignee == "builder"
+        request = kb.get_coordination_request(conn, request_id)
+        assert request is not None
+        assert request.status == "active"
+        assert request.model_calls_used == 20
