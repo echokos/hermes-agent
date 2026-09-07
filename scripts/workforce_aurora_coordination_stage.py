@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +23,22 @@ BLOCK_RE = re.compile(rf"{re.escape(BEGIN)}.*?{re.escape(END)}", re.DOTALL)
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _atomic_write(path: Path, content: bytes, mode: int) -> None:
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, mode)
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
 
 
 def _load_block(path: Path) -> str:
@@ -84,13 +102,21 @@ def stage_profile(
     if repeated != candidate:
         raise RuntimeError("Aurora intake staging is not idempotent")
 
-    output_dir = output.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = output.expanduser().absolute()
+    if output_dir.is_symlink() or (
+        output_dir.exists() and not output_dir.is_dir()
+    ):
+        raise ValueError("staging output must be a real directory")
+    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(output_dir, 0o700)
     candidate_path = output_dir / "AGENTS.md"
-    if candidate_path == source:
+    manifest_path = output_dir / "manifest.json"
+    if candidate_path.is_symlink() or manifest_path.is_symlink():
+        raise ValueError("staging output files must not be symbolic links")
+    if candidate_path.resolve() == source:
         raise ValueError("staging output must not be the live Aurora profile")
     candidate_bytes = candidate.encode("utf-8")
-    candidate_path.write_bytes(candidate_bytes)
+    _atomic_write(candidate_path, candidate_bytes, 0o600)
     manifest = {
         "profile": "aurora",
         "source": str(source),
@@ -104,9 +130,10 @@ def stage_profile(
         "source_unchanged": source.read_bytes() == original_bytes,
         "idempotent": True,
     }
-    (output_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    _atomic_write(
+        manifest_path,
+        (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        0o600,
     )
     return manifest
 

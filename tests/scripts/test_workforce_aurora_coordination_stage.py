@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -49,6 +52,10 @@ def test_stages_only_compact_aurora_block_and_preserves_source(tmp_path):
     assert candidate.endswith(
         module.ROUTING_ANCHOR + original.split(module.ROUTING_ANCHOR, 1)[1]
     )
+    if os.name != "nt":
+        assert output.stat().st_mode & 0o777 == 0o700
+        assert (output / "AGENTS.md").stat().st_mode & 0o777 == 0o600
+        assert (output / "manifest.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_restage_is_idempotent_and_replaces_only_managed_block(tmp_path):
@@ -76,3 +83,35 @@ def test_rejects_noncompact_or_non_aurora_target(tmp_path):
 
     with pytest.raises(ValueError, match="compact externalized"):
         module.stage_profile(profile=profile, output=tmp_path / "stage")
+
+
+def test_rejects_symlink_output_directory_or_file(tmp_path):
+    profile, _ = _profile(tmp_path)
+    real_output = tmp_path / "real-output"
+    real_output.mkdir()
+    linked_output = tmp_path / "linked-output"
+    try:
+        linked_output.symlink_to(real_output, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+    with pytest.raises(ValueError, match="real directory"):
+        module.stage_profile(profile=profile, output=linked_output)
+
+    candidate_output = tmp_path / "candidate-output"
+    candidate_output.mkdir()
+    (candidate_output / "AGENTS.md").symlink_to(profile / "AGENTS.md")
+    with pytest.raises(ValueError, match="symbolic links"):
+        module.stage_profile(profile=profile, output=candidate_output)
+
+
+def test_cli_can_run_from_outside_repository(tmp_path):
+    result = subprocess.run(
+        [sys.executable, str(module.__file__), "--help"],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--profile" in result.stdout
