@@ -628,10 +628,17 @@ def mark_coordination_final_return_pending(
     event_id: int,
     *,
     error: str = "",
+    claim_token: str = "",
+    only_unstarted: bool = False,
 ) -> CoordinationFinalReturnDelivery:
     """Record a definite no-send outcome that a watcher may safely retry."""
     return _set_coordination_final_return_state(
-        request_root_id, event_id, state="pending", error=error,
+        request_root_id,
+        event_id,
+        state="pending",
+        error=error,
+        claim_token=claim_token,
+        only_unstarted=only_unstarted,
     )
 
 
@@ -653,6 +660,8 @@ def _set_coordination_final_return_state(
     *,
     state: str,
     error: str,
+    claim_token: str = "",
+    only_unstarted: bool = False,
 ) -> CoordinationFinalReturnDelivery:
     if state not in {"pending", "uncertain"}:  # pragma: no cover - private guard
         raise ValueError("invalid coordination final-return state")
@@ -671,10 +680,17 @@ def _set_coordination_final_return_state(
             return record
         if record.state != "sending":
             return record
+        where = "WHERE obligation_id = ? AND state = 'sending'"
+        params: list[Any] = [state, time.time(), str(error or "")[:500] or None, obligation_id]
+        if claim_token:
+            where += " AND claim_token = ?"
+            params.append(_coordination_claim_token(claim_token))
+        if only_unstarted:
+            where += " AND attempts = 0"
         conn.execute(
-            "UPDATE delivery_obligations SET state = ?, updated_at = ?, last_error = ? "
-            "WHERE obligation_id = ? AND state = 'sending'",
-            (state, time.time(), str(error or "")[:500] or None, obligation_id),
+            "UPDATE delivery_obligations SET state = ?, updated_at = ?, last_error = "
+            f"? {where}",
+            params,
         )
         row = conn.execute(
             "SELECT obligation_id, state, coordination_root_id, "

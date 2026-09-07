@@ -887,6 +887,29 @@ async def _record_final_return_persisted_receipt(
         return False
 
 
+async def _release_final_return_before_send(
+    delivery_state: Any,
+    *,
+    error: str,
+) -> bool:
+    """Release only this unstarted ticket after a definite local failure."""
+    try:
+        from gateway.delivery_ledger import mark_coordination_final_return_pending
+
+        released = await asyncio.to_thread(
+            mark_coordination_final_return_pending,
+            delivery_state.context["request_root_id"],
+            int(delivery_state.context["event_id"]),
+            error=error,
+            claim_token=delivery_state.claim_token,
+            only_unstarted=True,
+        )
+        return released.state == "pending"
+    except Exception:
+        logger.warning("Could not release unstarted final-return ticket", exc_info=True)
+        return False
+
+
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery.
 
@@ -8678,19 +8701,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # it up.  Clearing happens on /new and /reset via
     # _handle_reset_command.
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> bool:
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
-            return
+            return False
         pending_slot = getattr(adapter, "_pending_messages", None)
-        if pending_slot is None:
-            return
+        if not isinstance(pending_slot, dict):
+            return False
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(
                 queued_event
             )
         else:
             pending_slot[session_key] = queued_event
+        return True
 
     def _promote_queued_event(
         self,
@@ -9785,10 +9809,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -9798,7 +9822,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the head slot via ``merge_pending_message_event`` (album
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
-        existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        if not isinstance(pending_slot, dict):
+            return False
+        existing = pending_slot.get(session_key)
         security_metadata_keys = (
             "hermes_plugin_id",
             "hermes_plugin_injection",
@@ -9833,7 +9859,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -9841,9 +9867,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
-        self._enqueue_fifo(session_key, event, adapter)
+        return self._enqueue_fifo(session_key, event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -9889,6 +9915,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # its budget scope is attached only when this exact queued event later
         # reaches AIAgent execution.
         from gateway.wake import (
+            final_return_delivery_state_from_event,
             final_return_context_from_event,
             is_final_return_isolated_followup,
         )
@@ -9897,7 +9924,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             final_return_context_from_event(event) is not None
             or is_final_return_isolated_followup(event)
         ):
-            self._queue_or_replace_pending_event(session_key, event)
+            admitted = self._queue_or_replace_pending_event(session_key, event)
+            if not admitted and final_return_context_from_event(event) is not None:
+                from gateway.wake import WakeDeliveryOutcome, complete_final_return_delivery
+
+                delivery_state = final_return_delivery_state_from_event(event)
+                released = bool(delivery_state) and await _release_final_return_before_send(
+                    delivery_state, error="final_return_queue_rejected"
+                )
+                complete_final_return_delivery(
+                    event,
+                    WakeDeliveryOutcome(
+                        "pending" if released else "uncertain",
+                        detail="final-return queue admission was rejected",
+                    ),
+                )
             return True
 
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -20536,10 +20577,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         complete_final_return_delivery,
                     )
 
+                    released = await _release_final_return_before_send(
+                        _final_return_delivery_state,
+                        error="final_return_receipt_missing",
+                    )
                     complete_final_return_delivery(
                         event,
                         WakeDeliveryOutcome(
-                            "pending",
+                            "pending" if released else "uncertain",
                             detail="final-return turn lacks an exact persisted receipt",
                         ),
                     )
