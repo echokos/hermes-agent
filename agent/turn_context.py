@@ -183,7 +183,9 @@ def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
 # - subagent — a delegated child's session is hidden from every picker, so its
 #   title is never read. A batch at `max_concurrent_children` would pay N title
 #   calls for N names nobody sees.
-_UNTITLED_PLATFORMS = frozenset({"cron", "subagent"})
+# - kanban — dispatcher sessions already carry the task's deterministic name;
+#   cosmetic calls must not consume their bounded work or review allowance.
+_UNTITLED_PLATFORMS = frozenset({"cron", "subagent", "kanban"})
 
 
 def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
@@ -202,6 +204,14 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
         return
 
     try:
+        from gateway.session_context import get_session_env
+
+        # Dispatcher workers use the CLI platform with a Kanban session source.
+        # Respect scoped gateway values so a process-level source cannot leak
+        # into an unrelated human conversation.
+        if str(get_session_env("HERMES_SESSION_SOURCE", "") or "").strip().lower() == "kanban":
+            return
+
         from agent.message_content import flatten_message_text
         from agent.title_generator import maybe_auto_title
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import types
+from contextvars import Context
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -444,7 +445,7 @@ def test_prologue_titles_the_surfaces_a_person_reads(platform):
     assert _title_turn(platform).called
 
 
-@pytest.mark.parametrize("platform", ["cron", "CRON", "subagent"])
+@pytest.mark.parametrize("platform", ["cron", "CRON", "subagent", "kanban"])
 def test_prologue_does_not_title_machine_driven_runs(platform):
     """Cron names its own session after the job, and nobody opens a subagent's.
 
@@ -452,3 +453,29 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+def test_dispatcher_cli_source_does_not_start_auxiliary_title(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    assert not Context().run(_title_turn, "cli").called
+
+
+@pytest.mark.parametrize(
+    "process_source,scoped_source,expected_title",
+    [("cli", "kanban", False), ("kanban", "api_server", True), ("kanban", "", True)],
+)
+def test_title_source_uses_turn_context_without_process_leak(
+    monkeypatch, process_source, scoped_source, expected_title,
+):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", process_source)
+
+    def run_scoped():
+        tokens = set_session_vars(source=scoped_source)
+        try:
+            return _title_turn("cli").called
+        finally:
+            clear_session_vars(tokens)
+
+    assert Context().run(run_scoped) is expected_title
