@@ -3005,6 +3005,7 @@ def run_conversation(
                         model_name=str(agent.model or ""),
                         metadata={
                             "api_mode": agent.api_mode,
+                            "physical_attempt": agent.api_mode != "codex_responses",
                             "api_request_id": api_request_id,
                             "call_role": (
                                 "delegated"
@@ -4264,6 +4265,11 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                from hermes_cli.kanban_db import CoordinationBudgetExceeded
+
+                if isinstance(api_error, CoordinationBudgetExceeded):
+                    raise
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
@@ -8165,6 +8171,10 @@ def run_conversation(
                 break
             
         except Exception as e:
+            from hermes_cli.kanban_db import CoordinationBudgetExceeded
+
+            if isinstance(e, CoordinationBudgetExceeded):
+                raise
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the
             # returned assistant message. Deterministic local bugs (e.g.

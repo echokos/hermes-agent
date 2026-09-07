@@ -16,6 +16,16 @@ from agent import relay_runtime
 logger = logging.getLogger(__name__)
 
 
+def _admit_provider_attempt(name: str, metadata: dict[str, Any] | None) -> None:
+    # MoA is a local fan-out facade; its concrete auxiliary routes each charge.
+    # Likewise the outer nonstreaming Codex wrapper delegates to metered streams.
+    if name == "moa" or (metadata or {}).get("physical_attempt") is False:
+        return
+    from agent.coordination_budget import charge_provider_attempt
+
+    charge_provider_attempt()
+
+
 _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset(
     {"reasoning_content", "reasoning_details"}
 )
@@ -37,6 +47,7 @@ def execute(
     """Run one non-streaming physical provider attempt through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
+        _admit_provider_attempt(name, metadata)
         return callback(request)
     logical = _logical_parent(runtime, session, parent, metadata)
     parent = logical[1] if logical is not None else parent
@@ -60,6 +71,7 @@ def execute(
             # Nested relay calls inside a managed provider callback must run
             # unmanaged (#77244) — see relay_runtime.managed_callback_guard.
             with relay_runtime.managed_callback_guard():
+                _admit_provider_attempt(name, metadata)
                 return callback(final)
 
         try:
@@ -129,6 +141,7 @@ async def execute_async(
     """Run one asynchronous physical provider attempt through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
+        _admit_provider_attempt(name, metadata)
         return await callback(request)
     logical = _logical_parent(runtime, session, parent, metadata)
     parent = logical[1] if logical is not None else parent
@@ -159,6 +172,7 @@ async def execute_async(
                 # Nested relay calls inside a managed provider callback must
                 # run unmanaged (#77244).
                 with relay_runtime.managed_callback_guard():
+                    _admit_provider_attempt(name, metadata)
                     return await callback(final_request)
 
             task = callback_context.copy().run(
@@ -221,6 +235,7 @@ def execute_current(
     """Run a provider attempt under the inherited Hermes turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
+        _admit_provider_attempt(name, metadata)
         return callback(request)
     return execute(
         request,
@@ -245,6 +260,7 @@ async def execute_current_async(
     """Run an async provider attempt under the inherited turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
+        _admit_provider_attempt(name, metadata)
         return await callback(request)
     return await execute_async(
         request,
@@ -289,6 +305,7 @@ def stream_current(
     """
     turn = relay_runtime.active_turn()
     if turn is None:
+        _admit_provider_attempt(name, metadata)
         return stream_factory(request)
     if _has_running_event_loop():
         # Managed provider callbacks execute on the Relay session's event
@@ -300,6 +317,7 @@ def stream_current(
         # own completed_response_predicate traps a completed response (e.g.
         # the MoA facade's auxiliary ``call_llm(stream=True)`` returning a
         # full response when an adapter ignores ``stream=True``).
+        _admit_provider_attempt(name, metadata)
         return stream_factory(request)
     managed = stream(
         request,
@@ -377,6 +395,12 @@ class ManagedLlmStream(Iterator[Any]):
         metadata: dict[str, Any] | None,
         defer_logical_completion: bool,
     ) -> None:
+        raw_factory = stream_factory
+
+        def stream_factory(request):
+            _admit_provider_attempt(name, metadata)
+            return raw_factory(request)
+
         self.final_response: Any = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream: Any = None
