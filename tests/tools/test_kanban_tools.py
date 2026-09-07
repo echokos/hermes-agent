@@ -1095,6 +1095,11 @@ def test_create_accepts_coordination_root_and_inherits_within_origin_turn(
         "HERMES_WORKFORCE_ORG",
         str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
     )
+    monkeypatch.setattr(
+        kt,
+        "load_config",
+        lambda: {"kanban": {"auto_subscribe_on_create": True}},
+    )
     set_session_vars(
         platform="buzz",
         chat_id="elliott-dm",
@@ -1154,6 +1159,9 @@ def test_create_accepts_coordination_root_and_inherits_within_origin_turn(
     assert root_task.request_root_id == root["request_root_id"]
     assert child_task.request_root_id == root["request_root_id"]
     assert unrelated_task.request_root_id is None
+    assert len(_list_subs_for_task(root["task_id"])) == 1
+    assert _list_subs_for_task(child["task_id"]) == []
+    assert len(_list_subs_for_task(unrelated["task_id"])) == 1
 
 
 def test_create_coordination_root_rolls_back_without_final_route(
@@ -1326,6 +1334,71 @@ def test_same_origin_coordination_retry_returns_existing_root(
             "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?",
             (first["task_id"],),
         ).fetchone()[0] == 1
+
+
+def test_same_origin_coordination_retry_settles_accepting_scope_calls(
+    monkeypatch, worker_env,
+):
+    from contextlib import contextmanager
+
+    from agent import coordination_budget
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "aurora")
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    set_session_vars(
+        platform="buzz",
+        chat_id="elliott-dm",
+        session_id="settlement-race-session",
+        message_id="settlement-race-message",
+        profile="aurora",
+    )
+    try:
+        first = json.loads(kt._handle_create({
+            "title": "root accepted by another scope",
+            "assignee": "aurora",
+            "report_to_origin": True,
+            "coordination": {},
+        }))
+
+        @contextmanager
+        def raced_acceptance_binding():
+            yield coordination_budget.CoordinationAcceptanceBinding(
+                model_calls=2,
+                scope_id="scope-that-missed-early-lookup",
+            )
+
+        monkeypatch.setattr(
+            coordination_budget,
+            "coordination_acceptance_binding",
+            raced_acceptance_binding,
+        )
+        retry = json.loads(kt._handle_create({
+            "title": "idempotent retry after concurrent acceptance",
+            "assignee": "aurora",
+            "report_to_origin": True,
+            "coordination": {},
+        }))
+    finally:
+        reset_session_vars()
+
+    assert retry["ok"] is True
+    assert retry["task_id"] == first["task_id"]
+    with kb.connect() as conn:
+        request = kb.get_coordination_request(conn, first["request_root_id"])
+        debit = conn.execute(
+            "SELECT model_calls FROM coordination_acceptance_debits "
+            "WHERE request_root_id = ? AND acceptance_scope_id = ?",
+            (first["request_root_id"], "scope-that-missed-early-lookup"),
+        ).fetchone()
+    assert request.model_calls_used == 2
+    assert debit["model_calls"] == 2
 
 
 def test_concurrent_child_committed_before_root_is_adopted_by_origin_message(

@@ -1446,11 +1446,21 @@ def _handle_create(args: dict, **kw) -> str:
     # Prefer request-scoped bindings over process-global os.environ: concurrent
     # gateway turns each carry their own ContextVar, while os.environ is
     # last-writer-wins and may also contain a delegated child's internal id.
+    from agent.coordination_budget import (
+        coordination_acceptance_binding,
+        current_coordination_origin,
+        current_coordination_request_id,
+    )
     from tools.async_delegation import _current_origin_session_id
     from gateway.session_context import get_session_env
 
+    coordination_origin_session, coordination_origin_message = (
+        current_coordination_origin()
+    )
+    scoped_request_root_id = current_coordination_request_id()
     authoritative_session_id = (
-        _current_origin_session_id()
+        coordination_origin_session
+        or _current_origin_session_id()
         or get_session_env("HERMES_SESSION_ID", "")
         or os.environ.get("HERMES_SESSION_ID")
     )
@@ -1550,9 +1560,9 @@ def _handle_create(args: dict, **kw) -> str:
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
     board = args.get("board")
-    if coordination is not None and board:
+    if (coordination is not None or scoped_request_root_id) and board:
         return tool_error(
-            "coordination roots must use the current canonical board"
+            "coordinated work must use the current canonical board"
         )
     try:
         kb, conn = _connect(board=board)
@@ -1569,7 +1579,11 @@ def _handle_create(args: dict, **kw) -> str:
                         project_source_task_id = _self_task.id
             from gateway.session_context import get_session_env
 
-            message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
+            message_id = (
+                coordination_origin_message
+                or get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+                or ""
+            )
             coordination_source_task_id = os.environ.get("HERMES_KANBAN_TASK")
             if (
                 coordination_source_task_id
@@ -1589,20 +1603,37 @@ def _handle_create(args: dict, **kw) -> str:
                         )
                 coordination_source_task_id = None
             request = None
-            with kb.write_txn(conn):
+            from contextlib import nullcontext
+
+            acceptance_context = (
+                coordination_acceptance_binding()
+                if coordination is not None
+                else nullcontext(None)
+            )
+            with acceptance_context as acceptance, kb.write_txn(conn):
                 same_turn_request = None
-                if authoritative_session_id and message_id:
+                if scoped_request_root_id:
+                    same_turn_request = kb.get_coordination_request(
+                        conn, scoped_request_root_id
+                    )
+                    if same_turn_request is None:
+                        raise ValueError(
+                            "trusted coordination request root is missing"
+                        )
+                elif authoritative_session_id and message_id:
                     same_turn_request = kb.get_coordination_request(
                         conn,
                         kb.coordination_request_id(
                             authoritative_session_id, message_id
                         ),
                     )
-                if coordination is None and not coordination_source_task_id:
-                    if same_turn_request is not None:
-                        coordination_source_task_id = (
-                            same_turn_request.root_task_id
+                if same_turn_request is not None:
+                    if same_turn_request.status != "active":
+                        raise ValueError(
+                            "coordination request is closed to new tasks"
                         )
+                    if coordination is None and not coordination_source_task_id:
+                        coordination_source_task_id = same_turn_request.root_task_id
 
                 org = None
                 if coordination is not None:
@@ -1640,7 +1671,22 @@ def _handle_create(args: dict, **kw) -> str:
                             raise ValueError(
                                 f"origin request already has a different {name}"
                             )
-                    request = same_turn_request
+                    # The request may have been accepted by another tool thread
+                    # after this scope's early lookup. Settle this accepting
+                    # scope even on the idempotent existing-root path so those
+                    # already-observed provider calls cannot escape the root
+                    # budget.
+                    kb.settle_coordination_acceptance_calls(
+                        conn,
+                        same_turn_request.id,
+                        acceptance.scope_id,
+                        acceptance.model_calls,
+                    )
+                    request = kb.get_coordination_request(
+                        conn, same_turn_request.id
+                    )
+                    if request is None:  # pragma: no cover - serialized invariant
+                        raise RuntimeError("coordination request disappeared")
                     new_tid = request.root_task_id
                     new_task = kb.get_task(conn, new_tid)
                     subscribed = conn.execute(
@@ -1687,12 +1733,21 @@ def _handle_create(args: dict, **kw) -> str:
                         session_id=session_id,
                     )
                     new_task = kb.get_task(conn, new_tid)
-                    subscribed = _maybe_auto_subscribe(
-                        conn,
-                        new_tid,
-                        explicit=report_to_origin,
-                        delivery_mode="wake" if report_to_origin else None,
+                    # Exactly the accepted root owns the human origin route.
+                    # Same-origin children inherit the budget implicitly but
+                    # must not inherit global/explicit auto-subscription and
+                    # expose raw internal completion events to that user.
+                    inherited_coordination_child = (
+                        coordination is None and same_turn_request is not None
                     )
+                    subscribed = False
+                    if not inherited_coordination_child:
+                        subscribed = _maybe_auto_subscribe(
+                            conn,
+                            new_tid,
+                            explicit=report_to_origin,
+                            delivery_mode="wake" if report_to_origin else None,
+                        )
                     if coordination is not None:
                         if not subscribed:
                             raise ValueError(
@@ -1703,9 +1758,13 @@ def _handle_create(args: dict, **kw) -> str:
                             root_task_id=new_tid,
                             origin_session_id=str(session_id or ""),
                             origin_message_id=str(message_id),
+                            acceptance_scope_id=acceptance.scope_id,
+                            accepting_model_calls=acceptance.model_calls,
                             organization=org,
                             **coordination,
                         )
+                if coordination is not None:
+                    acceptance.accept(request)
             attached_session_id = new_task.session_id if new_task else session_id
             wake_attached = bool(subscribed and attached_session_id)
             if wake_attached:
