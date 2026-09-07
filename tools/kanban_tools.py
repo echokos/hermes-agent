@@ -2681,8 +2681,9 @@ KANBAN_CREATE_SCHEMA = {
                     "Its terminal event wakes the originating agent in this exact "
                     "conversation so the agent can verify the outcome and deliver "
                     "a final report. Never set it on internal work, speculative "
-                    "tasks, or multiple child cards for the same commitment. Build "
-                    "worker cards first, then make this final card depend on them."
+                    "tasks, or multiple child cards for the same commitment. Create "
+                    "this root before worker cards; later coordinated worker and "
+                    "verification cards inherit its request scope internally."
                 ),
             },
             "coordination": {

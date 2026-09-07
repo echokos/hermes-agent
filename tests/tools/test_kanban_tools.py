@@ -41,6 +41,16 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     )
 
 
+def test_coordination_schema_requires_root_before_worker_cards():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+
+    description = KANBAN_CREATE_SCHEMA["parameters"]["properties"][
+        "report_to_origin"
+    ]["description"]
+    assert "Create this root before worker cards" in description
+    assert "Build worker cards first" not in description
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------
