@@ -33,7 +33,7 @@ def _required_text(args: dict[str, Any], name: str) -> str:
     return value
 
 
-def _preflight(args: dict[str, Any]):
+def _validate_preflight(args: dict[str, Any]):
     """Reject impossible records before the bounded-write reservation."""
     source = active_workforce_agent()
     if not source.operational or source.status not in {"active", "planned"}:
@@ -51,6 +51,22 @@ def _preflight(args: dict[str, Any]):
         _required_text(args, "estimated_effort")
         _required_text(args, "department_recommendation")
     return source
+
+
+def _preflight(args: dict[str, Any]):
+    try:
+        return _validate_preflight(args)
+    except (PermissionError, TypeError, ValueError) as exc:
+        from tools.workforce_signal_runtime import mark_failure
+
+        mark_failure(str(exc))
+        raise
+
+
+def _observe_attempt() -> None:
+    from tools.workforce_signal_runtime import mark_attempted
+
+    mark_attempted()
 
 
 def _handle(args: dict[str, Any], **_kwargs: Any) -> str:
@@ -147,4 +163,5 @@ registry.register(
     schema=WORKFORCE_SIGNAL_SCHEMA, handler=_handle,
     check_fn=_enabled, emoji="📡",
     preflight=_preflight,
+    attempt_observer=_observe_attempt,
 )

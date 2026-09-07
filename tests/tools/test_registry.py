@@ -81,7 +81,7 @@ class TestRegisterAndDispatch:
             reset_runtime_tool_budget(token)
 
         assert state.snapshot() == {
-            "calls": 3,
+            "calls": 4,
             "writes": 1,
             "detail_reads": 1,
             "denied": 3,
@@ -92,35 +92,91 @@ class TestRegisterAndDispatch:
         }
         assert json.loads(reg.dispatch("kanban_create", {}))["ok"] is True
 
-    def test_preflight_rejection_happens_before_budget_reservation(self):
+    def test_preflight_rejection_spends_attempt_but_preserves_write_for_retry(self):
+        from tools.workforce_signal_runtime import (
+            activate as activate_required_signal,
+            mark_attempted,
+            mark_failure,
+            mark_success,
+            reset as reset_required_signal,
+        )
+
         reg = ToolRegistry()
         handled = []
 
         def preflight(args):
             if not args.get("aurora_assignment_id"):
+                mark_failure("Chloe requires an explicit aurora_assignment_id")
                 raise ValueError("Chloe requires an explicit aurora_assignment_id")
 
         reg.register(
             name="workforce_signal", toolset="workforce",
             schema=_make_schema("workforce_signal"),
-            handler=lambda args, **_kwargs: handled.append(args) or json.dumps({"ok": True}),
+            handler=lambda args, **_kwargs: (
+                handled.append(args), mark_success(), json.dumps({"ok": True})
+            )[-1],
             preflight=preflight,
+            attempt_observer=mark_attempted,
         )
         token, state = activate_runtime_tool_budget({
-            "max_calls": 1, "max_writes": 1, "max_detail_reads": 1,
+            "max_calls": 2, "max_writes": 1, "max_detail_reads": 1,
             "max_list_items": 1, "allowed_tools": ["workforce_signal"],
         })
+        signal_token, signal_state = activate_required_signal(True)
         try:
-            denied = json.loads(reg.dispatch("workforce_signal", {}))
-            assert denied["error_type"] == "tool_input_validation_failed"
-            accepted = json.loads(reg.dispatch(
-                "workforce_signal", {"aurora_assignment_id": "t_aurora"}
-            ))
+            try:
+                denied = json.loads(reg.dispatch("workforce_signal", {}))
+                assert denied["error_type"] == "tool_input_validation_failed"
+                assert signal_state.failure is not None
+                accepted = json.loads(reg.dispatch(
+                    "workforce_signal", {"aurora_assignment_id": "t_aurora"}
+                ))
+            finally:
+                reset_required_signal(signal_token)
         finally:
             reset_runtime_tool_budget(token)
         assert accepted["ok"] is True
         assert handled == [{"aurora_assignment_id": "t_aurora"}]
+        assert state.snapshot()["calls"] == 2
         assert state.snapshot()["writes"] == 1
+        assert signal_state.completed is True
+        assert signal_state.failure is None
+
+    def test_preflight_retries_are_bounded_by_attempt_budget(self):
+        reg = ToolRegistry()
+        handled = []
+
+        def preflight(args):
+            if not args.get("valid"):
+                raise ValueError("invalid attempt")
+
+        reg.register(
+            name="workforce_signal", toolset="workforce",
+            schema=_make_schema("workforce_signal"),
+            handler=lambda args, **_kwargs: (
+                handled.append(args), json.dumps({"ok": True})
+            )[-1],
+            preflight=preflight,
+        )
+        token, state = activate_runtime_tool_budget({
+            "max_calls": 2, "max_writes": 1, "max_detail_reads": 1,
+            "max_list_items": 1, "allowed_tools": ["workforce_signal"],
+        })
+        try:
+            first = json.loads(reg.dispatch("workforce_signal", {}))
+            second = json.loads(reg.dispatch("workforce_signal", {}))
+            exhausted = json.loads(reg.dispatch(
+                "workforce_signal", {"valid": True}
+            ))
+        finally:
+            reset_runtime_tool_budget(token)
+
+        assert first["error_type"] == "tool_input_validation_failed"
+        assert second["error_type"] == "tool_input_validation_failed"
+        assert exhausted["error_type"] == "runtime_tool_budget_exceeded"
+        assert handled == []
+        assert state.snapshot()["calls"] == 2
+        assert state.snapshot()["writes"] == 0
 
     def test_runtime_budget_counts_only_mutating_workforce_actions_as_writes(self):
         reg = ToolRegistry()

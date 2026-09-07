@@ -10,6 +10,8 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+import json
+
 import cron.scheduler as s
 
 
@@ -395,14 +397,36 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
 
 
 def test_required_workforce_signal_absence_cannot_leave_a_cron_run_green(monkeypatch):
+    from cron.executions import list_executions
+    from hermes_cli import workflow_registry as reg
+
+    with reg.connect_closing() as conn:
+        reg.create_definition(
+            conn,
+            id="wf-required-signal",
+            slug="required-signal",
+            name="Required Signal",
+            owner_profile="chloe",
+            status="active",
+            runtime_kind="hermes",
+        )
+        reg.replace_steps(
+            conn,
+            "wf-required-signal",
+            [{"step_key": "observe", "position": 0, "name": "Observe"}],
+        )
     calls = _patch_pipeline(monkeypatch, success=True, final="apparently complete")
-    recorded = []
+    marked = []
     monkeypatch.setattr(
-        "cron.operational_failures.append_profile_failure",
-        lambda _home, job, error: recorded.append((job["id"], error)) or {"event_id": "evt"},
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, **kwargs: marked.append((jid, ok, err, kwargs)),
     )
     ok = s.run_one_job({
         "id": "chloe-control", "name": "Chloe control plane",
+        "workflow_id": "wf-required-signal",
+        "workflow_step_key": "observe",
+        "track_workflow_status": True,
         "required_workforce_signal": True,
         "failure_ownership": {
             "technical_owner": "root", "director": "aurora",
@@ -411,9 +435,120 @@ def test_required_workforce_signal_absence_cannot_leave_a_cron_run_green(monkeyp
     # ``run_one_job`` returns whether the processing path completed; the
     # authoritative execution/run record must still be failed.
     assert ok is True
-    assert recorded and "not submitted" in recorded[0][1]
-    assert [call[0] for call in calls] == ["run_job", "save", "mark"]
-    assert calls[-1] == ("mark", "chloe-control", False)
+    assert [call[0] for call in calls] == ["run_job", "save"]
+    assert len(marked) == 1
+    assert marked[0][0:2] == ("chloe-control", False)
+    assert "not submitted" in marked[0][2]
+    assert marked[0][3]["workflow_status"] == "failed"
+    executions = list_executions(job_id="chloe-control")
+    assert len(executions) == 1
+    assert executions[0]["status"] == "failed"
+    assert "not submitted" in executions[0]["error"]
+    with reg.connect_closing() as conn:
+        workflow_run = reg.list_runs(conn, "wf-required-signal")[0]
+        workflow_step = conn.execute(
+            "SELECT * FROM workflow_step_runs WHERE workflow_run_id = ?",
+            (workflow_run.id,),
+        ).fetchone()
+    assert workflow_run.status == "failed"
+    assert workflow_step["status"] == "failed"
+    assert not any(call[0] == "deliver" for call in calls)
+
+
+def test_optional_observer_signal_contract_allows_verified_quiet_run(monkeypatch):
+    calls = _patch_pipeline(monkeypatch, success=True, final="[SILENT]")
+
+    assert s.run_one_job({
+        "id": "chloe-quiet", "name": "Chloe factual reconciliation",
+        "observe_workforce_signal_attempts": True,
+    })
+
+    assert ("mark", "chloe-quiet", True) in calls
+    assert "deliver" not in [call[0] for call in calls]
+
+
+def test_failed_optional_signal_attempt_cannot_be_hidden_by_no_action_prose(
+    monkeypatch, tmp_path,
+):
+    calls = []
+
+    def failed_signal_run(job, *, defer_agent_teardown=None, **_kwargs):
+        from tools.workforce_signal_runtime import mark_failure
+
+        mark_failure("signal persistence offline")
+        return True, "output", "[NO_ACTION]", None
+
+    monkeypatch.setattr(s, "run_job", failed_signal_run)
+    monkeypatch.setattr(s, "save_job_output", lambda *args, **kwargs: "/tmp/out")
+    monkeypatch.setattr(
+        s, "_deliver_result", lambda *args, **kwargs: calls.append("deliver")
+    )
+    marked = []
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, **kwargs: marked.append((jid, ok, err)),
+    )
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: tmp_path)
+
+    assert s.run_one_job({
+        "id": "chloe-attempt", "name": "Chloe factual reconciliation",
+        "workflow_id": "workforce-proactive-operating-cycles",
+        "observe_workforce_signal_attempts": True,
+        "failure_ownership": {
+            "technical_owner": "root", "director": "aurora",
+        },
+    })
+
+    assert marked[0][0:2] == ("chloe-attempt", False)
+    assert "persistence offline" in marked[0][2]
+    assert calls == []
+
+
+def test_owned_failure_is_persisted_and_not_delivered(monkeypatch, tmp_path):
+    calls = _patch_pipeline(
+        monkeypatch, success=False, final="", error="upstream timeout"
+    )
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: tmp_path)
+
+    assert s.run_one_job({
+        "id": "owned-job", "name": "owned job", "workflow_id": "owned-workflow",
+        "failure_ownership": {
+            "technical_owner": "root", "director": "aurora",
+        },
+    })
+
+    assert "deliver" not in [call[0] for call in calls]
+    intake = (tmp_path / "cron" / "operational-failures.jsonl").read_text().splitlines()
+    assert len(intake) == 1
+    assert json.loads(intake[0])["execution_id"]
+
+
+def test_owned_exception_is_persisted_and_not_delivered(monkeypatch, tmp_path):
+    calls = []
+
+    def raise_from_job(job, *, defer_agent_teardown=None, **_kwargs):
+        raise RuntimeError("raised failure")
+
+    monkeypatch.setattr(s, "run_job", raise_from_job)
+    monkeypatch.setattr(
+        s, "_deliver_result", lambda *args, **kwargs: calls.append("deliver")
+    )
+    monkeypatch.setattr(s, "mark_job_run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: tmp_path)
+
+    assert s.run_one_job({
+        "id": "owned-exception", "name": "owned exception",
+        "workflow_id": "owned-exception-workflow",
+        "failure_ownership": {
+            "technical_owner": "root", "director": "aurora",
+        },
+    }) is False
+
+    assert calls == []
+    intake = (tmp_path / "cron" / "operational-failures.jsonl").read_text().splitlines()
+    assert len(intake) == 1
+    assert "raised failure" in json.loads(intake[0])["sanitized_error"]
 
 
 def test_run_one_job_operator_only_script_failure_skips_delivery(monkeypatch):

@@ -6914,7 +6914,8 @@ def _run_one_job_body(
         from tools.workforce_signal_runtime import activate as activate_required_signal
         from tools.workforce_signal_runtime import reset as reset_required_signal
         _required_signal_token, _required_signal_state = activate_required_signal(
-            bool(job.get("required_workforce_signal"))
+            bool(job.get("required_workforce_signal")),
+            observe_attempts=bool(job.get("observe_workforce_signal_attempts")),
         )
         try:
             _run_kwargs = {"defer_agent_teardown": _deferred_agents}
@@ -6937,18 +6938,30 @@ def _run_one_job_body(
             reset_required_signal(_required_signal_token)
             reset_secret_scope(_scope_token)
 
-        required_signal_failure = None
+        workforce_signal_failure = None
         if _required_signal_state is not None and (
-            _required_signal_state.failure or not _required_signal_state.completed
+            _required_signal_state.failure
+            or (
+                _required_signal_state.required
+                and not _required_signal_state.completed
+            )
+            or (
+                _required_signal_state.attempted
+                and not _required_signal_state.completed
+            )
         ):
-            required_signal_failure = (
+            workforce_signal_failure = (
                 _required_signal_state.failure
-                or "The required workforce factual record was not submitted."
+                or (
+                    "The attempted workforce factual record did not complete."
+                    if _required_signal_state.attempted
+                    else "The required workforce factual record was not submitted."
+                )
             )
             success = False
             error = (
-                "Required workforce factual record failed: "
-                f"{required_signal_failure}"
+                "Workforce factual record failed: "
+                f"{workforce_signal_failure}"
             )
 
         if isinstance(error, ProtectedMutationFailure) and error.uncooperative:
@@ -7004,12 +7017,12 @@ def _run_one_job_body(
             workflow_status, final_response = _extract_workflow_status(
                 final_response
             )
-            if workflow_status == "failed" or required_signal_failure:
+            if workflow_status == "failed" or workforce_signal_failure:
                 success = False
                 error = (
-                    "Required workforce factual record failed: "
-                    f"{required_signal_failure}"
-                    if required_signal_failure
+                    "Workforce factual record failed: "
+                    f"{workforce_signal_failure}"
+                    if workforce_signal_failure
                     else "Workflow reported failed outcome."
                 )
                 workflow_status = "failed"
@@ -7036,15 +7049,27 @@ def _run_one_job_body(
                     "(tool subprocess was killed mid-flight)."
                 )
 
+            # Resolve the empty-response soft failure before operational
+            # intake. Otherwise an opted-in job could emit a recovery event,
+            # then be marked failed a few lines later with no owned incident.
+            empty_response_failure = success and not final_response.strip()
+            if empty_response_failure:
+                success = False
+                error = (
+                    "Agent completed but produced empty response "
+                    "(model error, timeout, or misconfiguration)"
+                )
+
             operational_failure_event = None
             if not success:
                 from cron.operational_failures import append_profile_failure
 
                 try:
                     operational_failure_event = append_profile_failure(
-                        _get_hermes_home(), job, error
+                        _get_hermes_home(), job, error,
+                        execution_id=execution_id,
                     )
-                except OSError:
+                except Exception:
                     logger.error(
                         "Job '%s': operational failure intake persistence failed",
                         job["id"],
@@ -7060,8 +7085,10 @@ def _run_one_job_body(
                 # current mutable job state.
                 from cron.operational_failures import append_profile_recovery
                 try:
-                    append_profile_recovery(_get_hermes_home(), job)
-                except OSError:
+                    append_profile_recovery(
+                        _get_hermes_home(), job, execution_id=execution_id
+                    )
+                except Exception:
                     logger.error(
                         "Job '%s': operational recovery intake persistence failed",
                         job["id"], exc_info=True,
@@ -7136,7 +7163,7 @@ def _run_one_job_body(
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
-            if operational_failure_event is not None:
+            if empty_response_failure or operational_failure_event is not None:
                 should_deliver = False
             if blocked_config_silent or drift_skip_silent:
                 should_deliver = False
@@ -7213,13 +7240,6 @@ def _run_one_job_body(
                     error="Fire claim ownership lost; stale result was discarded.",
                 )
             return True
-
-        # Treat empty final_response as a soft failure so last_status
-        # is not "ok" — the agent ran but produced nothing useful.
-        # (issue #8585)
-        if success and not final_response.strip():
-            success = False
-            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if (
             job.get("track_workflow_status")
@@ -7323,12 +7343,35 @@ def _run_one_job_body(
         _err_text = str(e) or type(e).__name__
         logger.error("Error processing job %s: %s", job['id'], _err_text)
         delivery_outcome = "suppressed"
+        owned_failure = isinstance(job.get("failure_ownership"), dict)
+        if owned_failure:
+            try:
+                from cron.operational_failures import append_profile_failure
+
+                append_profile_failure(
+                    _get_hermes_home(),
+                    job,
+                    _err_text,
+                    execution_id=execution_id,
+                )
+            except Exception:
+                # The terminal execution row below is the recovery source for
+                # the deterministic monitor. JSONL and SQLite are separate
+                # durability boundaries; do not claim an atomic cross-store
+                # write or fall back to a raw user alert.
+                logger.error(
+                    "Job '%s': operational failure intake persistence failed; "
+                    "execution-ledger recovery remains pending",
+                    job["id"],
+                    exc_info=True,
+                )
         # Owner fencing: a stale worker whose fire claim was taken over (or a
         # transport-cancelled worker) must not send a failure alert on top of
         # the replacement run's own delivery — fall through silently and let
         # the fenced bookkeeping below decide what (if anything) to record.
         if (
             isinstance(e, Exception)
+            and not owned_failure
             and not delivery_attempted
             and not isinstance(e, _FireClaimLostDuringSideEffect)
             and not _fire_claim_ownership_lost()

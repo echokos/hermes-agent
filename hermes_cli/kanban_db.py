@@ -5511,6 +5511,83 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _source_acceptance_handoff(body: Optional[str]) -> Optional[dict]:
+    try:
+        payload = json.loads(body or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("kind") != "workforce_handoff"
+        or not payload.get("requires_source_acceptance")
+    ):
+        return None
+    return payload
+
+
+def _handoff_source_review_is_current(
+    conn: sqlite3.Connection,
+    task_id: str,
+    payload: dict,
+    expected_run_id: Optional[int],
+) -> bool:
+    """Prove target acknowledgement and source-owned review execution."""
+    if expected_run_id is None:
+        return False
+    target = _canonical_assignee(str(payload.get("target_agent") or ""))
+    source = _canonical_assignee(str(payload.get("source_agent") or ""))
+    if not target or not source:
+        return False
+    rows = conn.execute(
+        "SELECT id, run_id, kind, payload FROM task_events "
+        "WHERE task_id = ? ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    acknowledged_at = None
+    review_at = None
+    for event in rows:
+        try:
+            event_payload = json.loads(event["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            event_payload = {}
+        if not isinstance(event_payload, dict):
+            event_payload = {}
+        if (
+            event["kind"] == "workforce_handoff_acknowledged"
+            and _canonical_assignee(str(event_payload.get("actor") or "")) == target
+        ):
+            acknowledged_at = int(event["id"])
+        elif (
+            acknowledged_at is not None
+            and event["kind"] == "review_requested"
+            and _canonical_assignee(str(event_payload.get("implementer") or "")) == target
+            and _canonical_assignee(str(event_payload.get("reviewer") or "")) == source
+        ):
+            review_at = int(event["id"])
+    if review_at is None:
+        return False
+    run = conn.execute(
+        "SELECT profile FROM task_runs WHERE id = ? AND task_id = ? "
+        "AND status = 'running' AND outcome IS NULL",
+        (int(expected_run_id), task_id),
+    ).fetchone()
+    if run is None or _canonical_assignee(run["profile"]) != source:
+        return False
+    claimed = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+        (task_id, int(expected_run_id)),
+    ).fetchone()
+    try:
+        claimed_payload = json.loads(claimed["payload"] or "{}") if claimed else {}
+    except (TypeError, json.JSONDecodeError):
+        claimed_payload = {}
+    return (
+        isinstance(claimed_payload, dict)
+        and claimed_payload.get("source_status") == "review"
+    )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5555,6 +5632,23 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    handoff_row = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    handoff = _source_acceptance_handoff(
+        handoff_row["body"] if handoff_row else None
+    )
+    if handoff is not None and not _handoff_source_review_is_current(
+        conn, task_id, handoff, expected_run_id
+    ):
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_handoff_acceptance",
+                {"reason": "target acknowledgment and source-owned review are required"},
+            )
+        return False
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5595,6 +5689,10 @@ def complete_task(
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
         if not _parents_satisfied(conn, task_id):
+            return False
+        if handoff is not None and not _handoff_source_review_is_current(
+            conn, task_id, handoff, expected_run_id
+        ):
             return False
         prior = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -6689,7 +6787,7 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, body "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -6709,6 +6807,17 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
+        handoff = _source_acceptance_handoff(trow["body"])
+        if handoff is not None:
+            if handoff.get("state") not in {"accepted", "active"}:
+                return _ret(False, "handoff must be acknowledged before review")
+            target = _canonical_assignee(str(handoff.get("target_agent") or ""))
+            source = _canonical_assignee(str(handoff.get("source_agent") or ""))
+            if _canonical_assignee(implementer) != target:
+                return _ret(False, "handoff implementation is not owned by its target")
+            if reviewer is not None and _canonical_assignee(reviewer) != source:
+                return _ret(False, "handoff review must return to its source")
+            reviewer = source
         if reviewer is None:
             changes_run = conn.execute(
                 "SELECT id FROM task_runs "
