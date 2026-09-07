@@ -1803,7 +1803,13 @@ def _create_titled_session(title: str) -> Optional[str]:
         new_session_id = f"{timestamp_str}_{short_uuid}"
 
         db = SessionDB()
-        db.create_session(new_session_id, source="cli")
+        # Programmatic callers may have already set an explicit source before
+        # this helper resolves ``-c <title> --create-if-missing``.  Preserve
+        # it so a tool-owned session is not misclassified as a user CLI chat.
+        db.create_session(
+            new_session_id,
+            source=os.environ.get("HERMES_SESSION_SOURCE", "cli") or "cli",
+        )
         db.set_session_title(new_session_id, title)
         return new_session_id
     except Exception:

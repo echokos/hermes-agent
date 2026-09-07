@@ -85,6 +85,21 @@ class TestCreateTitledSession:
         finally:
             db.close()
 
+    def test_created_session_preserves_explicit_programmatic_source(
+        self, isolated_home, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "tool")
+        sid = _create_titled_session("Internal Pickup")
+        assert sid
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            assert db.get_session(sid)["source"] == "tool"
+        finally:
+            db.close()
+
 
 class TestChatCFailLoudlyOnStderr:
     """Behavior-level: run the real cmd_chat path and inspect channels."""
