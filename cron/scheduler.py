@@ -3076,7 +3076,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
-            if platform_name == "photon":
+            if platform.value == "photon":
                 photon_identity, target_fingerprint = _photon_delivery_identity(
                     job, chat_id, thread_id, cleaned_delivery_content,
                 )
@@ -3336,7 +3336,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
         if not delivered:
-            if platform_name == "photon":
+            if platform.value == "photon":
                 if photon_identity is None:
                     photon_identity, target_fingerprint = _photon_delivery_identity(
                         job, chat_id, thread_id, cleaned_delivery_content,

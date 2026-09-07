@@ -22,6 +22,15 @@ from tools.registry import registry, tool_error, tool_result
 TOOLSET = "agent_photo"
 _MAX_PROMPT_CHARS = 4_000
 _MAX_OUTPUT_CHARS = 12_000
+_NO_SPEND_TIMEOUT_SECONDS = 60
+_GENERATION_PROVIDER_TIMEOUT_SECONDS = 240
+_GENERATION_DOWNLOAD_TIMEOUT_SECONDS = 60
+_GENERATION_RUNNER_SETUP_TIMEOUT_SECONDS = 60
+_GENERATION_TIMEOUT_SECONDS = (
+    _GENERATION_PROVIDER_TIMEOUT_SECONDS
+    + _GENERATION_DOWNLOAD_TIMEOUT_SECONDS
+    + _GENERATION_RUNNER_SETUP_TIMEOUT_SECONDS
+)
 
 _ACTION_ALLOWED_KEYS = {
     "instructions": {"action"},
@@ -97,6 +106,13 @@ def _default_wrapper_path() -> Path | None:
 
 
 WRAPPER_PATH = _default_wrapper_path()
+
+
+def _wrapper_timeout(action: str) -> int:
+    """Keep paid generation alive through its fixed provider and runner budgets."""
+    if action == "generate":
+        return _GENERATION_TIMEOUT_SECONDS
+    return _NO_SPEND_TIMEOUT_SECONDS
 
 
 def _active_personal_profile() -> Path:
@@ -349,7 +365,7 @@ def _run_wrapper(profile: Path, command: list[str], action: str) -> str:
             [f"/proc/self/fd/{wrapper_fd}", *command],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=_wrapper_timeout(action),
             env=_wrapper_environment(profile, profile_fd=profile_fd),
             pass_fds=(wrapper_fd, profile_fd),
         )

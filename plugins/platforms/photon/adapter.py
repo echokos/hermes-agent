@@ -2549,6 +2549,7 @@ class PhotonAdapter(BasePlatformAdapter):
                 success=False,
                 error=str(e),
                 raw_response={
+                    "http_status": e.status_code,
                     "error_class": e.error_class,
                     "retryable": e.retryable,
                 },

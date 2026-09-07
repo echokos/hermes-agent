@@ -97,6 +97,19 @@ def test_personal_profile_directory_matches_runner_mode_contract(tmp_path):
         os.close(descriptor)
 
 
+def test_generation_timeout_covers_the_fixed_provider_download_and_runner_budgets():
+    from tools import agent_photo_tool
+
+    assert agent_photo_tool._wrapper_timeout("generate") == (
+        agent_photo_tool._GENERATION_PROVIDER_TIMEOUT_SECONDS
+        + agent_photo_tool._GENERATION_DOWNLOAD_TIMEOUT_SECONDS
+        + agent_photo_tool._GENERATION_RUNNER_SETUP_TIMEOUT_SECONDS
+    )
+    assert agent_photo_tool._wrapper_timeout("generate") > agent_photo_tool._wrapper_timeout(
+        "preview"
+    )
+
+
 @pytest.mark.parametrize(
     ("root_mode", "profiles_mode", "profile_mode"),
     [
@@ -186,7 +199,7 @@ def test_personal_profiles_can_discover_skill_and_use_no_spend_actions(
         assert kwargs == {
             "capture_output": True,
             "text": True,
-            "timeout": 60,
+            "timeout": agent_photo_tool._wrapper_timeout("preview"),
             "env": agent_photo_tool._wrapper_environment(profile, profile_fd=profile_fd),
             "pass_fds": kwargs["pass_fds"],
         }
@@ -385,6 +398,7 @@ def test_generation_treats_dash_prefixed_prompt_as_data_after_approval(monkeypat
     assert kwargs["env"] == agent_photo_tool._wrapper_environment(
         profile, profile_fd=kwargs["pass_fds"][1]
     )
+    assert kwargs["timeout"] == agent_photo_tool._wrapper_timeout("generate")
 
 
 @pytest.mark.parametrize(

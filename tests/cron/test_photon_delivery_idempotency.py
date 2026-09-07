@@ -108,6 +108,79 @@ def test_confirmed_absence_uses_one_fallback_then_blocks_process_retry(monkeypat
     assert standalone.await_count == 1
 
 
+def test_real_photon_adapter_4xx_allows_one_standalone_fallback(monkeypatch, tmp_path):
+    """The scheduler must classify the actual adapter's structured 4xx shape."""
+    import cron.executions as executions
+    from cron.scheduler import _deliver_result
+    from gateway.config import PlatformConfig
+    from plugins.platforms.photon.adapter import PhotonAdapter, PhotonSidecarError
+
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    monkeypatch.setenv("PHOTON_PROJECT_ID", "test-project-id")
+    monkeypatch.setenv("PHOTON_PROJECT_SECRET", "test-project-secret")
+    photon, config, job = _config_and_job()
+    loop = MagicMock()
+    loop.is_running.return_value = True
+    adapter = PhotonAdapter(PlatformConfig(enabled=True, token="", extra={}))
+
+    async def rejected_before_acceptance(*_args, **_kwargs):
+        raise PhotonSidecarError(
+            path="/send",
+            status_code=400,
+            error="invalid request",
+            error_class="validation_error",
+            retryable=False,
+        )
+
+    monkeypatch.setattr(adapter, "_sidecar_call", rejected_before_acceptance)
+    fallback = AsyncMock(return_value={"success": True})
+
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+         patch("asyncio.run_coroutine_threadsafe", side_effect=_run_on_gateway_loop), \
+         patch("tools.send_message_tool._send_to_platform", new=fallback):
+        assert _deliver_result(job, "one final response", adapters={photon: adapter}, loop=loop) is None
+        replay = _deliver_result(job, "one final response", adapters={photon: adapter}, loop=loop)
+
+    assert replay is not None and "already" in replay
+    fallback.assert_awaited_once()
+
+
+def test_mixed_case_photon_target_uses_the_ledger_for_live_and_standalone_delivery(
+    monkeypatch, tmp_path
+):
+    import cron.executions as executions
+    from cron.scheduler import _deliver_result
+
+    db_path = tmp_path / "cron" / "executions.db"
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", db_path)
+    photon, config, job = _config_and_job()
+    job["origin"]["platform"] = "Photon"
+    live_loop = MagicMock()
+    live_loop.is_running.return_value = True
+    adapter = MagicMock()
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True))
+
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+         patch("asyncio.run_coroutine_threadsafe", side_effect=_run_on_gateway_loop):
+        assert _deliver_result(job, "one final response", adapters={photon: adapter}, loop=live_loop) is None
+
+    assert _delivery_state(db_path) == "confirmed_sent"
+
+    standalone_job = {**job, "execution_id": "execution-photon-standalone"}
+    standalone = AsyncMock(return_value={"success": True})
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+         patch("tools.send_message_tool._send_to_platform", new=standalone):
+        assert _deliver_result(standalone_job, "one final response", adapters={}, loop=None) is None
+
+    standalone.assert_awaited_once()
+    with sqlite3.connect(db_path) as conn:
+        states = [row[0] for row in conn.execute("SELECT state FROM deliveries ORDER BY execution_id")]
+    assert states == ["confirmed_sent", "confirmed_sent"]
+
+
 def test_run_body_passes_each_persisted_execution_id_to_photon_delivery(monkeypatch, tmp_path):
     """Same-content executions must not share a Photon delivery identity."""
     import cron.executions as executions
