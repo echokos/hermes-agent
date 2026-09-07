@@ -177,10 +177,17 @@ def organization_path() -> Path:
     return Path(override).expanduser() if override else get_default_hermes_root() / "organization" / "organization.yaml"
 
 
-def load_organization(path: Path | None = None, *, validate_profiles: bool = False) -> WorkforceOrganization:
+def load_organization(
+    path: Path | None = None,
+    *,
+    validate_profiles: bool = False,
+    source_text: str | None = None,
+) -> WorkforceOrganization:
     source = (path or organization_path()).expanduser()
     try:
-        raw = yaml.safe_load(source.read_text(encoding="utf-8-sig")) or {}
+        raw = yaml.safe_load(
+            source.read_text(encoding="utf-8-sig") if source_text is None else source_text
+        ) or {}
     except OSError as exc:
         raise WorkforceOrganizationError(f"cannot read organization file {source}: {exc}") from exc
     except yaml.YAMLError as exc:

@@ -355,6 +355,7 @@ def _fire_dispatch_tick_hook(
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
+            result.rejected_non_operational,
         )):
             outcome = "idle"
         invoke_hook(
@@ -3179,6 +3180,50 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _non_operational_assignee_reason(assignee: Optional[str]) -> Optional[str]:
+    """Return the workforce-policy rejection reason for a known assignee.
+
+    Kanban also supports external/control-plane lanes that intentionally do
+    not appear in the workforce organization.  Preserve those lanes by
+    applying this guard only when the canonical organization recognizes the
+    assignee (by agent id or profile name).  Organization discovery remains
+    best-effort so partial installations retain their legacy behavior.
+    """
+    if not isinstance(assignee, str) or not assignee.strip():
+        return None
+    try:
+        from hermes_cli.workforce_org import (
+            WorkforceOrganizationError,
+            load_organization,
+        )
+
+        org = load_organization()
+        try:
+            org.resolve_profile(assignee)
+        except WorkforceOrganizationError:
+            # Unknown names are external/control-plane lanes, not policy
+            # violations.
+            return None
+        try:
+            org.validate_execution_profile(assignee)
+        except WorkforceOrganizationError as exc:
+            # A known but non-operational workforce identity must never
+            # receive Kanban work.
+            return str(exc)
+    except Exception:
+        return None
+    return None
+
+
+def _require_operational_assignee(assignee: Optional[str]) -> None:
+    """Reject task creation for known workforce identities outside execution."""
+    reason = _non_operational_assignee_reason(assignee)
+    if reason:
+        raise ValueError(
+            f"assignee {assignee!r} cannot receive operational Kanban work: {reason}"
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3253,6 +3298,7 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    _require_operational_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3783,6 +3829,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
+    _require_operational_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -6701,6 +6748,7 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        _require_operational_assignee(reviewer)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
@@ -7329,6 +7377,7 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
+    _require_operational_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
@@ -7433,6 +7482,7 @@ def decompose_triage_task(
         return None
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
+        _require_operational_assignee(root_assignee)
 
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
@@ -7452,6 +7502,7 @@ def decompose_triage_task(
                 )
             if p == idx:
                 raise ValueError(f"child[{idx}] cannot list itself as a parent")
+        _require_operational_assignee(_canonical_assignee(child.get("assignee")))
 
     # Detect cycles in the sibling parent graph (Kahn's topological sort).
     # link_tasks() calls _would_cycle() for every new edge; here we check
@@ -8238,6 +8289,11 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    rejected_non_operational: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks rejected because a canonical workforce identity is explicitly
+    non-operational. Each entry is ``(task_id, assignee, policy_reason)``.
+    Unlike ``skipped_nonspawnable``, these assignments violate durable
+    workforce policy and are surfaced as operator-actionable errors."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -9734,6 +9790,77 @@ def check_respawn_guard(
     return None
 
 
+def _resolve_dispatch_profile(assignee: Optional[str]) -> Optional[str]:
+    """Return the real Hermes profile used to launch an assignee's worker.
+
+    Kanban keeps the task's canonical workforce assignee intact for ownership,
+    events, and historical reporting.  At the dispatch boundary, though, an
+    agent id may map to a differently named profile directory (for example,
+    canonical ``root`` runs from the ``main`` profile).  Direct profile names
+    remain supported unchanged; names that resolve neither way are control
+    plane lanes and must not be auto-spawned.
+
+    A known workforce identity must satisfy the canonical execution policy
+    before its local profile is considered. If profile discovery is unavailable
+    in a partial installation, preserve the legacy fail-open dispatch behavior
+    by returning the supplied assignee.
+    """
+    if not isinstance(assignee, str) or not assignee.strip():
+        return None
+    if _non_operational_assignee_reason(assignee):
+        return None
+    try:
+        from hermes_cli.profiles import normalize_profile_name, profile_exists
+    except Exception:
+        return assignee
+
+    try:
+        profile = normalize_profile_name(assignee)
+    except (TypeError, ValueError):
+        return None
+    if profile_exists(profile):
+        return profile
+
+    try:
+        from hermes_cli.workforce_org import load_organization
+
+        agent = load_organization().resolve_profile(assignee)
+        if not agent.profile_path:
+            return None
+        profile = normalize_profile_name(Path(agent.profile_path).name)
+    except Exception:
+        return None
+    return profile if profile_exists(profile) else None
+
+
+def _record_non_operational_dispatch_rejection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    reason: str,
+) -> None:
+    """Persist one auditable rejection for an unchanged bad assignment."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'dispatch_rejected' ORDER BY created_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        if payload.get("assignee") == assignee and payload.get("reason") == reason:
+            return
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "dispatch_rejected",
+            {"assignee": assignee, "reason": reason},
+        )
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -9755,13 +9882,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _resolve_dispatch_profile(row["assignee"]) is not None:
             return True
     return False
 
@@ -9781,12 +9903,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _resolve_dispatch_profile(row["assignee"]) is not None:
             return True
     return False
 
@@ -10285,11 +10403,7 @@ def _dispatch_once_locked(
             return False
         if not review_rows:
             return False
-        try:
-            from hermes_cli.profiles import profile_exists as _rpe
-        except Exception:
-            _rpe = None
-        if _rpe is not None and not _rpe(assignee):
+        if _resolve_dispatch_profile(assignee) is None:
             return False
         if (
             _per_profile_cap is not None
@@ -10316,20 +10430,13 @@ def _dispatch_once_locked(
     # "this profile is busy, try again later" not "this needs routing").
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
-    # We also resolve profile_exists once here for the same reason.
+    # We also resolve the launch profile once here for the same reason.
     _default_assignee = (default_assignee or "").strip() or None
     _default_assignee_resolved = False
     if _default_assignee:
-        try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
-        except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+        _default_assignee_resolved = (
+            _resolve_dispatch_profile(_default_assignee) is not None
+        )
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
@@ -10377,9 +10484,12 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
-        # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
-        # with "Profile 'X' does not exist" when the assignee names a
+        # Skip ready tasks whose assignee does not resolve to a real Hermes
+        # profile. Canonical workforce ids may map to a differently named
+        # profile directory; preserve the task assignee and resolve only at
+        # this dispatch boundary.
+        # `_default_spawn` invokes ``hermes -p <resolved-profile>`` which
+        # fails with "Profile 'X' does not exist" when the assignee names a
         # control-plane lane (e.g. an interactive Claude Code terminal
         # like ``orion-cc`` / ``orion-research``) rather than a Hermes
         # profile. Those task lanes are pulled by terminals via
@@ -10387,11 +10497,17 @@ def _dispatch_once_locked(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
+        policy_reason = _non_operational_assignee_reason(row_assignee)
+        if policy_reason:
+            result.rejected_non_operational.append(
+                (row["id"], row_assignee, policy_reason)
+            )
+            if not dry_run:
+                _record_non_operational_dispatch_rejection(
+                    conn, row["id"], row_assignee, policy_reason,
+                )
+            continue
+        if _resolve_dispatch_profile(row_assignee) is None:
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -10549,11 +10665,17 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        policy_reason = _non_operational_assignee_reason(row["assignee"])
+        if policy_reason:
+            result.rejected_non_operational.append(
+                (row["id"], row["assignee"], policy_reason)
+            )
+            if not dry_run:
+                _record_non_operational_dispatch_rejection(
+                    conn, row["id"], row["assignee"], policy_reason,
+                )
+            continue
+        if _resolve_dispatch_profile(row["assignee"]) is None:
             result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:
@@ -10955,9 +11077,13 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
-    from hermes_cli.profiles import normalize_profile_name
-
-    profile_arg = normalize_profile_name(task.assignee)
+    profile_arg = _resolve_dispatch_profile(task.assignee)
+    if profile_arg is None:
+        # Dispatch eligibility already rejects unknown lanes.  Preserve the
+        # direct-call contract of this low-level helper for test harnesses and
+        # integrations that supply a profile created immediately afterward.
+        from hermes_cli.profiles import normalize_profile_name
+        profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)

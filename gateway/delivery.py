@@ -544,6 +544,9 @@ class DeliveryRouter:
             }
 
         send_metadata = dict(metadata or {})
+        preserve_failed_send_result = bool(
+            send_metadata.pop("_preserve_failed_send_result", False)
+        )
         if transport.is_relay:
             home = self.config.get_home_channel(target.platform)
             if home is not None and home.chat_id == target.chat_id:
@@ -638,6 +641,8 @@ class DeliveryRouter:
                     metadata=send_metadata or None,
                 )
             if _send_result_failed(result):
+                if preserve_failed_send_result:
+                    return result
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
 

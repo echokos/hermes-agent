@@ -152,6 +152,16 @@ TOOLSETS = {
         "includes": []
     },
 
+    "agent_photo": {
+        "description": (
+            "Identity-locked agent-photo access for authorized personal profiles. "
+            "It exposes only the shared procedure and the fixed operator-installed wrapper; "
+            "it is not terminal, file, skill-management, or workforce access."
+        ),
+        "tools": ["agent_photo"],
+        "includes": []
+    },
+
     "video_gen": {
         "description": (
             "Video generation tools. Single ``video_generate`` tool covers "

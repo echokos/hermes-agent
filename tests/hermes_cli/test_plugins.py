@@ -1050,6 +1050,18 @@ class TestResolvePreToolBlock:
     """Tests for the single dispatch-site chokepoint that resolves a
     directive (incl. the approve→gate escalation) to a block message."""
 
+    def test_approve_defaults_to_allow_single_query(self, monkeypatch):
+        from hermes_cli.plugins import _get_pre_tool_call_directive_details
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda *_args, **_kwargs: [{"action": "approve", "message": "why"}],
+        )
+
+        directive = _get_pre_tool_call_directive_details("terminal", {})
+
+        assert directive.allow_single_query is True
+
 
     def test_approve_gate_receives_tool_observability_context(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block
@@ -1160,6 +1172,7 @@ class TestResolvePreToolBlock:
                     "allow_permanent": False,
                     "allow_yolo": False,
                     "allow_cron": False,
+                    "allow_single_query": False,
                 }
             ],
         )
@@ -1185,6 +1198,7 @@ class TestResolvePreToolBlock:
             "allow_permanent": False,
             "allow_yolo": False,
             "allow_cron": False,
+            "allow_single_query": False,
         }
 
     @pytest.mark.parametrize("rule_key", [None, "", "   ", 123, object()])
