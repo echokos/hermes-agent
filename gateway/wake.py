@@ -313,14 +313,15 @@ async def deliver_wake(
         try:
             await adapter.handle_message(synth_event)
         except Exception:
-            from gateway.delivery_ledger import mark_coordination_final_return_pending
+            if final_return_context is not None:
+                from gateway.delivery_ledger import mark_coordination_final_return_pending
 
-            await asyncio.to_thread(
-                mark_coordination_final_return_pending,
-                final_return_context["request_root_id"],
-                int(final_return_context["event_id"]),
-                error="wake_enqueue_failed",
-            )
+                await asyncio.to_thread(
+                    mark_coordination_final_return_pending,
+                    final_return_context["request_root_id"],
+                    int(final_return_context["event_id"]),
+                    error="wake_enqueue_failed",
+                )
             raise
         if delivery_state is None:
             return None

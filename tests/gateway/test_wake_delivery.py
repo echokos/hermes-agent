@@ -51,6 +51,12 @@ class HangingPushAdapter(PushAdapter):
         self.handled.append(event)
 
 
+class FailingPushAdapter(PushAdapter):
+    async def handle_message(self, event):
+        self.handled.append(event)
+        raise RuntimeError("adapter wake failed")
+
+
 class ApiServerLikeAdapter:
     supports_async_delivery = False
 
@@ -75,6 +81,15 @@ def _source():
 def test_adapter_supports_push_default_true():
     assert adapter_supports_push(PushAdapter()) is True
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
+
+
+def test_ordinary_push_wake_preserves_adapter_failure():
+    adapter = FailingPushAdapter()
+
+    with pytest.raises(RuntimeError, match="adapter wake failed"):
+        asyncio.run(deliver_wake(adapter, text="ordinary wake", source=_source()))
+
+    assert len(adapter.handled) == 1
 
 
 def _final_return_context(tmp_path):
