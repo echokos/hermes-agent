@@ -103,7 +103,7 @@ def _pickup_command(*, target_agent: str, request_root_id: str, task_id: str) ->
         "--create-if-missing",
         "--no-restore-cwd",
         "-t", "workforce",
-        "--max-turns", "1",
+        "--max-turns", "2",
         "-q", (
             "Acknowledge exactly the assigned workforce handoff "
             f"{task_id} using workforce_handoff. Do not take any other action."
