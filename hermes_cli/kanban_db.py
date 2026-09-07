@@ -102,6 +102,15 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Small-repair pilot defaults. They are persisted per request so larger work
+# can opt into different explicit limits without changing a fleet-wide knob.
+DEFAULT_COORDINATION_MAX_LEAF_LAUNCHES = 4
+DEFAULT_COORDINATION_MAX_CONCURRENT_LEAF = 2
+DEFAULT_COORDINATION_MAX_MODEL_CALLS = 40
+DEFAULT_COORDINATION_FINAL_CALL_RESERVE = 2
+DEFAULT_COORDINATION_CHECKPOINT_SECONDS = 20 * 60
+DEFAULT_COORDINATION_MAX_TRANSIENT_RETRIES = 1
+
 
 def _task_body_forbids_launch(body: Optional[str]) -> bool:
     """Recognize a structured, explicit non-execution invariant."""
@@ -1146,6 +1155,9 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Explicit accepted-request identity. Internal tasks inherit this only
+    # from an authoritative current task or dependency parent.
+    request_root_id: Optional[str] = None
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
@@ -1239,6 +1251,9 @@ class Task:
             session_id=(
                 row["session_id"] if "session_id" in keys else None
             ),
+            request_root_id=(
+                row["request_root_id"] if "request_root_id" in keys else None
+            ),
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
             ),
@@ -1248,6 +1263,69 @@ class Task:
                 else 0
             ),
         )
+
+
+@dataclass(frozen=True)
+class CoordinationRequest:
+    """Durable whole-request identity and aggregate pilot budget."""
+
+    id: str
+    root_task_id: str
+    origin_session_id: str
+    origin_message_id: str
+    responsible_agent: str
+    status: str
+    created_at: int
+    checkpoint_at: int
+    updated_at: int
+    max_leaf_launches: int
+    max_concurrent_leaf: int
+    max_model_calls: int
+    final_model_call_reserve: int
+    max_transient_retries: int
+    leaf_launches_used: int
+    model_calls_used: int
+    transient_retries_used: int
+    manager_handoffs: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "CoordinationRequest":
+        return cls(
+            id=row["id"],
+            root_task_id=row["root_task_id"],
+            origin_session_id=row["origin_session_id"],
+            origin_message_id=row["origin_message_id"],
+            responsible_agent=row["responsible_agent"],
+            status=row["status"],
+            created_at=int(row["created_at"]),
+            checkpoint_at=int(row["checkpoint_at"]),
+            updated_at=int(row["updated_at"]),
+            max_leaf_launches=int(row["max_leaf_launches"]),
+            max_concurrent_leaf=int(row["max_concurrent_leaf"]),
+            max_model_calls=int(row["max_model_calls"]),
+            final_model_call_reserve=int(row["final_model_call_reserve"]),
+            max_transient_retries=int(row["max_transient_retries"]),
+            leaf_launches_used=int(row["leaf_launches_used"]),
+            model_calls_used=int(row["model_calls_used"]),
+            transient_retries_used=int(row["transient_retries_used"]),
+            manager_handoffs=int(row["manager_handoffs"]),
+        )
+
+
+@dataclass(frozen=True)
+class CoordinationLaunchReservation:
+    request_root_id: str
+    role: str
+    leaf_launch_ordinal: Optional[int]
+
+
+class CoordinationBudgetExceeded(RuntimeError):
+    """Raised before work crosses an accepted request's aggregate guardrail."""
+
+    def __init__(self, request_root_id: str, reason: str):
+        self.request_root_id = request_root_id
+        self.reason = reason
+        super().__init__(f"coordination request {request_root_id}: {reason}")
 
 
 @dataclass
@@ -1422,6 +1500,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Accepted asynchronous user-request identity. Inherited through an
+    -- authoritative current task or dependency parent, never a model field.
+    request_root_id      TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -1526,6 +1607,31 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- One aggregate record per explicitly accepted asynchronous user request.
+-- Per-task events remain the audit stream; this row owns the stable origin,
+-- hard pilot guardrails, and counters that need atomic cross-worker updates.
+CREATE TABLE IF NOT EXISTS coordination_requests (
+    id                       TEXT PRIMARY KEY,
+    root_task_id             TEXT NOT NULL UNIQUE,
+    origin_session_id        TEXT NOT NULL,
+    origin_message_id        TEXT NOT NULL,
+    responsible_agent        TEXT NOT NULL,
+    status                   TEXT NOT NULL DEFAULT 'active',
+    created_at               INTEGER NOT NULL,
+    checkpoint_at            INTEGER NOT NULL,
+    updated_at               INTEGER NOT NULL,
+    max_leaf_launches        INTEGER NOT NULL,
+    max_concurrent_leaf      INTEGER NOT NULL,
+    max_model_calls          INTEGER NOT NULL,
+    final_model_call_reserve INTEGER NOT NULL,
+    max_transient_retries    INTEGER NOT NULL,
+    leaf_launches_used       INTEGER NOT NULL DEFAULT 0,
+    model_calls_used         INTEGER NOT NULL DEFAULT 0,
+    transient_retries_used   INTEGER NOT NULL DEFAULT 0,
+    manager_handoffs         INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (origin_session_id, origin_message_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1536,6 +1642,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_coordination_root_task ON coordination_requests(root_task_id);
 """
 
 
@@ -2688,6 +2795,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "request_root_id" not in cols:
+        # Explicit accepted-request identity. NULL keeps every legacy and
+        # ordinary task outside request-wide coordination policy.
+        _add_column_if_missing(
+            conn, "tasks", "request_root_id", "request_root_id TEXT"
+        )
+
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
         # blocks. Existing blocked rows get NULL, which is treated as a
@@ -2717,6 +2831,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_request_root "
+        "ON tasks(request_root_id)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -3157,6 +3275,16 @@ def _new_task_id() -> str:
     return "t_" + secrets.token_hex(4)
 
 
+def coordination_request_id(origin_session_id: str, origin_message_id: str) -> str:
+    """Return a stable opaque identity for one accepted origin message."""
+    session = str(origin_session_id or "").strip()
+    message = str(origin_message_id or "").strip()
+    if not session or not message:
+        raise ValueError("coordination origin requires session_id and message_id")
+    digest = hashlib.sha256(f"{session}\0{message}".encode()).hexdigest()[:24]
+    return f"cr_{digest}"
+
+
 def _claimer_id() -> str:
     """Return a ``host:pid`` string that identifies this claimer."""
     import socket
@@ -3224,6 +3352,35 @@ def _require_operational_assignee(assignee: Optional[str]) -> None:
         )
 
 
+def _inherited_coordination_root(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: Optional[str],
+    parents: Iterable[str],
+) -> Optional[str]:
+    """Resolve one root from authoritative task relationships only."""
+    parent_ids = tuple(dict.fromkeys(str(value) for value in parents if value))
+    source_id = str(source_task_id or "").strip() or None
+    task_ids = tuple(dict.fromkeys((*parent_ids, *((source_id,) if source_id else ()))))
+    if not task_ids:
+        return None
+    placeholders = ",".join("?" * len(task_ids))
+    rows = conn.execute(
+        f"SELECT id, request_root_id FROM tasks WHERE id IN ({placeholders})",
+        task_ids,
+    ).fetchall()
+    if source_id and source_id not in {row["id"] for row in rows}:
+        raise ValueError(f"unknown coordination source task: {source_id}")
+    roots = {
+        str(row["request_root_id"])
+        for row in rows
+        if row["request_root_id"]
+    }
+    if len(roots) > 1:
+        raise ValueError("task relationships span multiple coordination requests")
+    return next(iter(roots), None)
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3252,6 +3409,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    coordination_source_task_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3291,6 +3449,10 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``coordination_source_task_id`` is the authoritative currently executing
+    task, when present. Its accepted request root and any parent roots must
+    agree; the root is inherited internally and is not a model-tool argument.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3417,6 +3579,11 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    request_root_id = _inherited_coordination_root(
+        conn,
+        source_task_id=coordination_source_task_id,
+        parents=parents,
+    )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3567,8 +3734,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, request_root_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3594,6 +3761,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        request_root_id,
                     ),
                 )
                 for pid in parents:
@@ -3622,8 +3790,35 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "request_root_id": request_root_id,
                     },
                 )
+                if (
+                    request_root_id
+                    and assignee
+                    and coordination_execution_role(assignee) == "manager"
+                ):
+                    request = get_coordination_request(conn, request_root_id)
+                    if request is None:
+                        raise ValueError(
+                            f"unknown coordination request root: {request_root_id}"
+                        )
+                    conn.execute(
+                        "UPDATE coordination_requests "
+                        "SET manager_handoffs = manager_handoffs + 1, updated_at = ? "
+                        "WHERE id = ?",
+                        (now, request_root_id),
+                    )
+                    _append_event(
+                        conn,
+                        request.root_task_id,
+                        "coordination_manager_handoff",
+                        {
+                            "request_root_id": request_root_id,
+                            "task_id": task_id,
+                            "assignee": assignee,
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -3701,6 +3896,344 @@ def _inherit_notify_subs(
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
+
+
+def get_coordination_request(
+    conn: sqlite3.Connection,
+    request_root_id: str,
+) -> Optional[CoordinationRequest]:
+    row = conn.execute(
+        "SELECT * FROM coordination_requests WHERE id = ?",
+        (request_root_id,),
+    ).fetchone()
+    return CoordinationRequest.from_row(row) if row else None
+
+
+def create_coordination_request(
+    conn: sqlite3.Connection,
+    *,
+    root_task_id: str,
+    origin_session_id: str,
+    origin_message_id: str,
+    max_leaf_launches: int = DEFAULT_COORDINATION_MAX_LEAF_LAUNCHES,
+    max_concurrent_leaf: int = DEFAULT_COORDINATION_MAX_CONCURRENT_LEAF,
+    max_model_calls: int = DEFAULT_COORDINATION_MAX_MODEL_CALLS,
+    final_model_call_reserve: int = DEFAULT_COORDINATION_FINAL_CALL_RESERVE,
+    checkpoint_seconds: int = DEFAULT_COORDINATION_CHECKPOINT_SECONDS,
+    max_transient_retries: int = DEFAULT_COORDINATION_MAX_TRANSIENT_RETRIES,
+    organization=None,
+    now: Optional[int] = None,
+) -> CoordinationRequest:
+    """Accept one explicit asynchronous request with one valid final route."""
+    session_id = str(origin_session_id or "").strip()
+    message_id = str(origin_message_id or "").strip()
+    request_id = coordination_request_id(session_id, message_id)
+    root = get_task(conn, root_task_id)
+    if root is None:
+        raise ValueError(f"unknown coordination root task: {root_task_id}")
+    if not root.session_id or root.session_id != session_id:
+        raise ValueError("coordination root task must retain the origin session_id")
+
+    routes = conn.execute(
+        "SELECT delivery_mode FROM kanban_notify_subs WHERE task_id = ?",
+        (root_task_id,),
+    ).fetchall()
+    if len(routes) != 1 or routes[0]["delivery_mode"] not in {"wake", "notify+wake"}:
+        raise ValueError("coordination root requires exactly one wake-capable final route")
+
+    from hermes_cli.workforce_org import load_organization
+
+    org = organization or load_organization()
+    if not root.assignee:
+        raise ValueError("coordination root requires a responsible assignee")
+    responsible = org.validate_execution_profile(root.assignee).agent
+
+    values = {
+        "max_leaf_launches": max_leaf_launches,
+        "max_concurrent_leaf": max_concurrent_leaf,
+        "max_model_calls": max_model_calls,
+        "checkpoint_seconds": checkpoint_seconds,
+        "max_transient_retries": max_transient_retries,
+    }
+    parsed: dict[str, int] = {}
+    for name, value in values.items():
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a positive integer")
+        try:
+            parsed[name] = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a positive integer") from exc
+        if parsed[name] <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if isinstance(final_model_call_reserve, bool):
+        raise ValueError("final_model_call_reserve must be a positive integer")
+    try:
+        reserve = int(final_model_call_reserve)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("final_model_call_reserve must be a positive integer") from exc
+    if reserve <= 0 or reserve >= parsed["max_model_calls"]:
+        raise ValueError("final_model_call_reserve must be below max_model_calls")
+
+    existing = conn.execute(
+        "SELECT * FROM coordination_requests "
+        "WHERE origin_session_id = ? AND origin_message_id = ?",
+        (session_id, message_id),
+    ).fetchone()
+    if existing is not None:
+        request = CoordinationRequest.from_row(existing)
+        if request.root_task_id != root_task_id:
+            raise ValueError("origin message already belongs to another request root")
+        return request
+
+    created_at = int(time.time() if now is None else now)
+    checkpoint_at = created_at + parsed["checkpoint_seconds"]
+    with write_txn(conn, allow_nested=True):
+        inserted = conn.execute(
+            """
+            INSERT OR IGNORE INTO coordination_requests (
+                id, root_task_id, origin_session_id, origin_message_id,
+                responsible_agent, status, created_at, checkpoint_at, updated_at,
+                max_leaf_launches, max_concurrent_leaf, max_model_calls,
+                final_model_call_reserve, max_transient_retries
+            ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id, root_task_id, session_id, message_id, responsible,
+                created_at, checkpoint_at, created_at,
+                parsed["max_leaf_launches"], parsed["max_concurrent_leaf"],
+                parsed["max_model_calls"], reserve,
+                parsed["max_transient_retries"],
+            ),
+        )
+        if inserted.rowcount != 1:
+            raced = conn.execute(
+                "SELECT * FROM coordination_requests "
+                "WHERE origin_session_id = ? AND origin_message_id = ?",
+                (session_id, message_id),
+            ).fetchone()
+            if raced is None:
+                raise ValueError("root task already belongs to another request")
+            request = CoordinationRequest.from_row(raced)
+            if request.root_task_id != root_task_id:
+                raise ValueError("origin message already belongs to another request root")
+            return request
+        updated = conn.execute(
+            "UPDATE tasks SET request_root_id = ? WHERE id = ? "
+            "AND (request_root_id IS NULL OR request_root_id = ?)",
+            (request_id, root_task_id, request_id),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("root task already belongs to another coordination request")
+        _append_event(
+            conn,
+            root_task_id,
+            "coordination_request_accepted",
+            {
+                "request_root_id": request_id,
+                "origin_session_id": session_id,
+                "origin_message_id": message_id,
+                "responsible_agent": responsible,
+                "checkpoint_at": checkpoint_at,
+                "max_leaf_launches": parsed["max_leaf_launches"],
+                "max_concurrent_leaf": parsed["max_concurrent_leaf"],
+                "max_model_calls": parsed["max_model_calls"],
+                "final_model_call_reserve": reserve,
+                "max_transient_retries": parsed["max_transient_retries"],
+            },
+        )
+    request = get_coordination_request(conn, request_id)
+    if request is None:  # pragma: no cover - protected by the transaction
+        raise RuntimeError("coordination request insert did not persist")
+    return request
+
+
+def coordination_execution_role(assignee: str, *, organization=None) -> str:
+    """Classify a launch from canonical roster data, never caller input."""
+    from hermes_cli.workforce_org import load_organization
+
+    org = organization or load_organization()
+    agent = org.validate_execution_profile(assignee)
+    function = (agent.function or "").casefold()
+    if agent.direct_reports:
+        return "manager"
+    if (
+        "reviewer" in function
+        or "quality assurance" in function
+        or re.search(r"\bqa\b", function)
+    ):
+        return "qa"
+    return "leaf"
+
+
+def reserve_coordination_launch(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    organization=None,
+    now: Optional[int] = None,
+) -> Optional[CoordinationLaunchReservation]:
+    """Reserve a ready/review launch before claim, enforcing request caps."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"unknown task: {task_id}")
+    if not task.request_root_id:
+        return None
+    if task.status not in {"ready", "review"}:
+        raise ValueError("coordination launch must be reserved before task claim")
+    if not task.assignee:
+        raise CoordinationBudgetExceeded(task.request_root_id, "task has no assignee")
+    if organization is None:
+        from hermes_cli.workforce_org import load_organization
+
+        organization = load_organization()
+    role = coordination_execution_role(task.assignee, organization=organization)
+    timestamp = int(time.time() if now is None else now)
+
+    with write_txn(conn):
+        request = get_coordination_request(conn, task.request_root_id)
+        if request is None:
+            raise CoordinationBudgetExceeded(task.request_root_id, "request root is missing")
+        if request.status != "active":
+            raise CoordinationBudgetExceeded(request.id, f"request is {request.status}")
+        if timestamp >= request.checkpoint_at:
+            raise CoordinationBudgetExceeded(request.id, "elapsed checkpoint reached")
+
+        ordinal: Optional[int] = None
+        if role == "leaf":
+            running = conn.execute(
+                "SELECT assignee FROM tasks "
+                "WHERE request_root_id = ? AND status = 'running'",
+                (request.id,),
+            ).fetchall()
+            active_leaf = sum(
+                coordination_execution_role(row["assignee"], organization=organization)
+                == "leaf"
+                for row in running
+                if row["assignee"]
+            )
+            if active_leaf >= request.max_concurrent_leaf:
+                raise CoordinationBudgetExceeded(request.id, "leaf concurrency exhausted")
+            if request.leaf_launches_used >= request.max_leaf_launches:
+                raise CoordinationBudgetExceeded(request.id, "leaf launch budget exhausted")
+            ordinal = request.leaf_launches_used + 1
+            conn.execute(
+                "UPDATE coordination_requests "
+                "SET leaf_launches_used = leaf_launches_used + 1, updated_at = ? "
+                "WHERE id = ?",
+                (timestamp, request.id),
+            )
+        _append_event(
+            conn,
+            request.root_task_id,
+            "coordination_launch_reserved",
+            {
+                "request_root_id": request.id,
+                "task_id": task_id,
+                "role": role,
+                "leaf_launch_ordinal": ordinal,
+            },
+        )
+    return CoordinationLaunchReservation(request.id, role, ordinal)
+
+
+def charge_coordination_model_call(
+    conn: sqlite3.Connection,
+    request_root_id: Optional[str],
+    *,
+    purpose: str = "work",
+    task_id: Optional[str] = None,
+    now: Optional[int] = None,
+) -> Optional[int]:
+    """Charge immediately before a physical provider attempt."""
+    if not request_root_id:
+        return None
+    if purpose not in {"work", "final_return"}:
+        raise ValueError("coordination model-call purpose must be work or final_return")
+    timestamp = int(time.time() if now is None else now)
+    with write_txn(conn):
+        request = get_coordination_request(conn, request_root_id)
+        if request is None:
+            raise CoordinationBudgetExceeded(request_root_id, "request root is missing")
+        if request.status not in {"active", "return_pending"}:
+            raise CoordinationBudgetExceeded(request.id, f"request is {request.status}")
+        if purpose == "work" and timestamp >= request.checkpoint_at:
+            raise CoordinationBudgetExceeded(request.id, "elapsed checkpoint reached")
+        limit = request.max_model_calls
+        if purpose == "work":
+            limit -= request.final_model_call_reserve
+        if request.model_calls_used >= limit:
+            reason = (
+                "aggregate model-call budget exhausted"
+                if purpose == "final_return"
+                else "work model-call budget exhausted; final-return reserve preserved"
+            )
+            raise CoordinationBudgetExceeded(request.id, reason)
+        ordinal = request.model_calls_used + 1
+        conn.execute(
+            "UPDATE coordination_requests "
+            "SET model_calls_used = model_calls_used + 1, updated_at = ? "
+            "WHERE id = ?",
+            (timestamp, request.id),
+        )
+        _append_event(
+            conn,
+            request.root_task_id,
+            "coordination_model_call_charged",
+            {
+                "request_root_id": request.id,
+                "task_id": task_id,
+                "purpose": purpose,
+                "ordinal": ordinal,
+            },
+        )
+    return ordinal
+
+
+def reserve_coordination_retry(
+    conn: sqlite3.Connection,
+    request_root_id: Optional[str],
+    *,
+    task_id: str,
+    classification: str,
+    cause_code: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Permit one classified transient retry; deterministic blocks never retry."""
+    if not request_root_id:
+        return True
+    if classification not in {"transient", "deterministic"}:
+        raise ValueError("retry classification must be transient or deterministic")
+    if classification == "deterministic":
+        return False
+    timestamp = int(time.time() if now is None else now)
+    with write_txn(conn):
+        request = get_coordination_request(conn, request_root_id)
+        if request is None or request.status != "active":
+            return False
+        if timestamp >= request.checkpoint_at:
+            return False
+        if request.transient_retries_used >= request.max_transient_retries:
+            return False
+        ordinal = request.transient_retries_used + 1
+        conn.execute(
+            "UPDATE coordination_requests "
+            "SET transient_retries_used = transient_retries_used + 1, updated_at = ? "
+            "WHERE id = ?",
+            (timestamp, request.id),
+        )
+        _append_event(
+            conn,
+            request.root_task_id,
+            "coordination_retry_reserved",
+            {
+                "request_root_id": request.id,
+                "task_id": task_id,
+                "classification": classification,
+                "cause_code": str(cause_code)[:100],
+                "ordinal": ordinal,
+            },
+        )
+    return True
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
