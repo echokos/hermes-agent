@@ -146,6 +146,11 @@ def finalize_turn(
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
     )
+    terminal_review_verdict = (
+        str(_turn_exit_reason) == "terminal_review_verdict"
+        and not interrupted
+        and not failed
+    )
     budget_fallback_eligible = (
         budget_exhausted
         and not interrupted
@@ -207,7 +212,7 @@ def finalize_turn(
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
             )
-    elif budget_exhausted:
+    elif budget_exhausted and not terminal_review_verdict:
         # Bounded fallback (#87096): budget was exhausted but none of the
         # normal fallback paths were eligible (interrupted / failed /
         # anomalous exit_reason). If running as a kanban worker we must
@@ -225,11 +230,14 @@ def finalize_turn(
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
     completed = (
-        final_response is not None
-        and not failed
-        and (
-            api_call_count < agent.max_iterations
-            or normal_text_response
+        terminal_review_verdict
+        or (
+            final_response is not None
+            and not failed
+            and (
+                api_call_count < agent.max_iterations
+                or normal_text_response
+            )
         )
     )
 
@@ -304,8 +312,8 @@ def finalize_turn(
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
 
-        # When the turn was interrupted and the last message is a tool
-        # result, append a synthetic assistant message to close the
+        # When the turn was interrupted, or a terminal-review verdict ended
+        # at a tool result, append a synthetic assistant message to close the
         # tool-call sequence. Without this, the session persists a
         # ``tool → user`` alternation that strict providers (Gemini,
         # Claude) reject, causing them to hallucinate a continuation of
@@ -316,11 +324,20 @@ def finalize_turn(
         # clean ``/stop`` interrupt after a successful tool sets no such
         # flag, so the tool result survives as the tail and we close it
         # here instead. On an interrupt ``final_response`` is typically
-        # empty, so fall back to an explicit placeholder rather than
-        # persisting an empty-content assistant turn.
-        if interrupted:
+        # empty, so fall back to an explicit protocol marker rather than
+        # persisting an empty-content assistant turn. The terminal-review
+        # marker records only a host-committed verdict; it is not a model
+        # approval summary and is never returned to the user as model text.
+        if interrupted or terminal_review_verdict:
             from agent.message_sanitization import close_interrupted_tool_sequence
-            close_interrupted_tool_sequence(messages, final_response)
+            close_interrupted_tool_sequence(
+                messages,
+                (
+                    final_response
+                    if interrupted
+                    else "Kanban terminal verdict recorded by host."
+                ),
+            )
 
         # Some recovery/fallback paths return a real final_response without
         # adding a closing assistant message to the transcript (e.g. the
@@ -544,7 +561,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and not terminal_review_verdict:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
