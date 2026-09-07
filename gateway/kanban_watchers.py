@@ -177,6 +177,159 @@ class GatewayKanbanWatchersMixin:
         _release_singleton_lock(handle)
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+        self._kanban_coordination_jobs: dict[str, asyncio.Task] = {}
+        try:
+            await self._kanban_notifier_loop(interval)
+        finally:
+            jobs = list(self._kanban_coordination_jobs.values())
+            for job in jobs:
+                job.cancel()
+            if jobs:
+                await asyncio.gather(*jobs, return_exceptions=True)
+            self._kanban_coordination_jobs.clear()
+
+    async def _kanban_coordination_tick(self) -> None:
+        """Run deterministic checks and admit at most one turn per profile."""
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.workforce_handoffs import claim_owned_failure_handoff_pickup
+
+        profiles = {self._active_profile_name()}
+        profiles.update(
+            str(profile).strip()
+            for profile in getattr(self, "_profile_adapters", {})
+            if str(profile).strip()
+        )
+        jobs = self._kanban_coordination_jobs
+        for profile, job in list(jobs.items()):
+            if job.done():
+                if not job.cancelled() and job.exception() is not None:
+                    logger.warning("kanban coordination job failed for %s", profile)
+                del jobs[profile]
+        idle_profiles = profiles.difference(jobs)
+        include_unowned = self._owns_kanban_dispatcher_lock()
+        pickup_allowed = _kanban_dispatch_allowed()
+
+        def collect():
+            # Coordination roots are canonical-board contracts, independent
+            # of the currently selected dashboard board or chat adapters.
+            path = kb.kanban_db_path(kb.DEFAULT_BOARD).resolve()
+            if not kb.has_coordination_tick_work(
+                path, notifier_profiles=profiles, include_unowned=include_unowned,
+            ):
+                return [], []
+            conn = kb.connect(path)
+            try:
+                deliveries = kb.prepare_coordination_final_return_deliveries(
+                    conn, notifier_profiles=profiles, include_unowned=include_unowned,
+                )
+                final_profiles = {d["responsible_agent"] for d in deliveries}
+                pickups = []
+                if pickup_allowed:
+                    for profile in sorted(idle_profiles.difference(final_profiles)):
+                        claim = claim_owned_failure_handoff_pickup(
+                            conn, target_agent=profile,
+                        )
+                        if claim is not None:
+                            pickups.append({**claim, "database_path": path})
+                return deliveries, pickups
+            finally:
+                conn.close()
+
+        deliveries, pickups = await asyncio.to_thread(collect)
+        for delivery in deliveries:
+            profile = delivery["responsible_agent"]
+            if profile in idle_profiles and profile not in jobs:
+                jobs[profile] = asyncio.create_task(
+                    self._kanban_deliver_coordination_return(delivery),
+                    name=f"kanban-final-return:{profile}",
+                )
+        for pickup in pickups:
+            profile = pickup["target_agent"]
+            jobs[profile] = asyncio.create_task(
+                self._kanban_pickup_owned_failure(pickup),
+                name=f"kanban-handoff-pickup:{profile}",
+            )
+
+    async def _kanban_pickup_owned_failure(self, pickup: dict) -> None:
+        from hermes_cli.workforce_handoff_pickup import run_workforce_handoff_pickup
+
+        result = await run_workforce_handoff_pickup(
+            task_id=pickup["task_id"],
+            request_root_id=pickup["request_root_id"],
+            target_agent=pickup["target_agent"],
+            source_agent=pickup["source_agent"],
+            database_path=pickup["database_path"],
+        )
+        logger.info(
+            "kanban handoff pickup task=%s profile=%s acknowledged=%s timed_out=%s returncode=%s",
+            pickup["task_id"], pickup["target_agent"], result.acknowledged,
+            result.timed_out, result.returncode,
+        )
+
+    async def _kanban_deliver_coordination_return(self, delivery: dict) -> None:
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+        from gateway.wake import deliver_wake
+        from hermes_cli import kanban_db as kb
+
+        sub = delivery["subscription"]
+        try:
+            platform = Platform(str(sub["platform"]).lower())
+        except ValueError:
+            return
+        profile = delivery["responsible_agent"]
+        adapter = self._authorization_adapter(platform, profile)
+        if adapter is None:
+            return
+        metadata = sub.get("delivery_metadata") or {}
+        chat_type = sub.get("chat_type") or metadata.get("chat_type") or "group"
+        source = SessionSource(
+            platform=platform, chat_id=sub["chat_id"], chat_type=chat_type,
+            thread_id=sub.get("thread_id") or None, user_id=sub.get("user_id"),
+            user_id_alt=sub.get("user_id_alt"), profile=profile,
+            scope_id=_wake_scope_id(adapter, sub),
+        )
+        envelope = {
+            key: str(delivery[key])
+            for key in (
+                "request_root_id", "task_id", "event_id", "responsible_agent", "db_path",
+            )
+        }
+        outcome = await deliver_wake(
+            adapter,
+            text=(
+                "Automatic final-return checkpoint for accepted request "
+                f"{delivery['request_root_id']} (root task {delivery['task_id']}). "
+                "Inspect the recorded cohort outcomes and evidence. Resolve the root "
+                "as done or blocked before returning one concise final response to "
+                "the original conversation. Do not create or delegate new work."
+            ),
+            session_id=delivery["origin_session_id"], source=source,
+            coordination_context=envelope,
+        )
+        # Pending/uncertain remain durable: the delivery outbox arbitrates
+        # retries. In particular, an ambiguous send must not start a new turn.
+        if (
+            outcome is None
+            or outcome.state != "acknowledged"
+            or not outcome.returned_message_id
+        ):
+            return
+
+        def acknowledge():
+            conn = kb.connect(Path(delivery["db_path"]))
+            try:
+                kb.acknowledge_coordination_return(
+                    conn, delivery["request_root_id"], event_id=delivery["event_id"],
+                    responsible_agent=profile,
+                    returned_message_id=outcome.returned_message_id,
+                )
+            finally:
+                conn.close()
+
+        await asyncio.to_thread(acknowledge)
+
+    async def _kanban_notifier_loop(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
@@ -268,6 +421,10 @@ class GatewayKanbanWatchersMixin:
 
         while self._running:
             try:
+                try:
+                    await self._kanban_coordination_tick()
+                except Exception:
+                    logger.warning("kanban coordination tick failed", exc_info=True)
                 _gc_due = time.monotonic() >= _gc_next_at
                 _gc_retention_days = 30
                 if _gc_due:
@@ -416,6 +573,19 @@ class GatewayKanbanWatchersMixin:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
                                 try:
+                                    task = _kb.get_task(conn, sub["task_id"])
+                                    if task and task.request_root_id:
+                                        request = _kb.get_coordination_request(
+                                            conn, task.request_root_id,
+                                        )
+                                        if (
+                                            request is not None
+                                            and request.kind == "origin_request"
+                                            and request.root_task_id == task.id
+                                        ):
+                                            # This route belongs exclusively to
+                                            # the receipt-backed final return.
+                                            continue
                                     owner_profile = sub.get("notifier_profile") or None
                                     if owner_profile and owner_profile != notifier_profile:
                                         _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
