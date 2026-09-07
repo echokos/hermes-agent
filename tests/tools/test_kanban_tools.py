@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -1078,6 +1079,200 @@ def test_create_explicit_user_commitment_wakes_origin_without_global_opt_in(
     assert subs[0]["platform"] == "buzz"
     assert subs[0]["chat_id"] == "elliott-dm"
     assert subs[0]["delivery_mode"] == "wake"
+
+
+def test_create_accepts_coordination_root_and_inherits_within_origin_turn(
+    monkeypatch, worker_env,
+):
+    """The bound origin message, not model-supplied parent ids, scopes a turn."""
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "aurora")
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    set_session_vars(
+        platform="buzz",
+        chat_id="elliott-dm",
+        chat_type="dm",
+        user_id="elliott",
+        session_id="origin-session",
+        message_id="origin-message-1",
+        profile="aurora",
+    )
+    try:
+        root = json.loads(kt._handle_create({
+            "title": "coordinate accepted request",
+            "assignee": "aurora",
+            "report_to_origin": True,
+            "coordination": {
+                "max_leaf_launches": 3,
+                "max_concurrent_leaf": 1,
+                "max_model_calls": 30,
+                "checkpoint_seconds": 900,
+            },
+        }))
+        child = json.loads(kt._handle_create({
+            "title": "same-turn child without model parent",
+            "assignee": "sage",
+        }))
+
+        # A new inbound message in the same durable session is unrelated.
+        set_session_vars(
+            platform="buzz",
+            chat_id="elliott-dm",
+            chat_type="dm",
+            user_id="elliott",
+            session_id="origin-session",
+            message_id="origin-message-2",
+            profile="aurora",
+        )
+        unrelated = json.loads(kt._handle_create({
+            "title": "unrelated later turn",
+            "assignee": "sage",
+        }))
+    finally:
+        reset_session_vars()
+
+    assert root["ok"] is True
+    assert root["request_root_id"].startswith("cr_")
+    assert root["coordination"] == {
+        "max_leaf_launches": 3,
+        "max_concurrent_leaf": 1,
+        "max_model_calls": 30,
+        "final_model_call_reserve": 2,
+        "checkpoint_at": root["coordination"]["checkpoint_at"],
+    }
+    with kb.connect() as conn:
+        root_task = kb.get_task(conn, root["task_id"])
+        child_task = kb.get_task(conn, child["task_id"])
+        unrelated_task = kb.get_task(conn, unrelated["task_id"])
+    assert root_task.request_root_id == root["request_root_id"]
+    assert child_task.request_root_id == root["request_root_id"]
+    assert unrelated_task.request_root_id is None
+
+
+def test_create_coordination_root_rolls_back_without_final_route(
+    monkeypatch, worker_env,
+):
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "aurora")
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    set_session_vars(
+        session_id="origin-without-route",
+        message_id="message-without-route",
+        profile="aurora",
+    )
+    try:
+        result = json.loads(kt._handle_create({
+            "title": "must be atomic",
+            "assignee": "aurora",
+            "report_to_origin": True,
+            "coordination": {},
+        }))
+    finally:
+        reset_session_vars()
+
+    assert "persistent origin route" in result["error"]
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = 'must be atomic'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM coordination_requests"
+        ).fetchone()[0] == 0
+
+
+def test_create_coordination_tool_cannot_raise_pilot_limits(
+    monkeypatch, worker_env,
+):
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "aurora")
+    set_session_vars(
+        platform="buzz",
+        chat_id="elliott-dm",
+        session_id="bounded-origin",
+        message_id="bounded-message",
+        profile="aurora",
+    )
+    try:
+        result = json.loads(kt._handle_create({
+            "title": "inflate budget",
+            "assignee": "aurora",
+            "report_to_origin": True,
+            "coordination": {"max_model_calls": 41},
+        }))
+    finally:
+        reset_session_vars()
+    assert "between 1 and 40" in result["error"]
+
+
+def test_concurrent_origin_turns_inherit_only_their_own_coordination_root(
+    monkeypatch, worker_env,
+):
+    from threading import Barrier
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "aurora")
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    barrier = Barrier(2)
+
+    def create_pair(index: int) -> tuple[dict, dict]:
+        tokens = set_session_vars(
+            platform="buzz",
+            chat_id=f"origin-{index}",
+            chat_type="dm",
+            user_id="elliott",
+            session_id=f"session-{index}",
+            message_id=f"message-{index}",
+            profile="aurora",
+        )
+        try:
+            root = json.loads(kt._handle_create({
+                "title": f"root-{index}",
+                "assignee": "aurora",
+                "report_to_origin": True,
+                "coordination": {},
+            }))
+            barrier.wait(timeout=10)
+            child = json.loads(kt._handle_create({
+                "title": f"child-{index}",
+                "assignee": "sage",
+            }))
+            return root, child
+        finally:
+            clear_session_vars(tokens)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pairs = list(pool.map(create_pair, (1, 2)))
+
+    assert pairs[0][0]["request_root_id"] != pairs[1][0]["request_root_id"]
+    with kb.connect() as conn:
+        for root, child in pairs:
+            child_task = kb.get_task(conn, child["task_id"])
+            assert child_task.request_root_id == root["request_root_id"]
 
 
 def test_create_subscribes_gateway_session_when_opted_in(
