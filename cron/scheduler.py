@@ -6911,6 +6911,11 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        from tools.workforce_signal_runtime import activate as activate_required_signal
+        from tools.workforce_signal_runtime import reset as reset_required_signal
+        _required_signal_token, _required_signal_state = activate_required_signal(
+            bool(job.get("required_workforce_signal"))
+        )
         try:
             _run_kwargs = {"defer_agent_teardown": _deferred_agents}
             if extra_prompt is not None:
@@ -6929,7 +6934,22 @@ def _run_one_job_body(
                 _teardown_cron_agent(_deferred_agent, job["id"])
             raise
         finally:
+            reset_required_signal(_required_signal_token)
             reset_secret_scope(_scope_token)
+
+        required_signal_failure = None
+        if _required_signal_state is not None and (
+            _required_signal_state.failure or not _required_signal_state.completed
+        ):
+            required_signal_failure = (
+                _required_signal_state.failure
+                or "The required workforce factual record was not submitted."
+            )
+            success = False
+            error = (
+                "Required workforce factual record failed: "
+                f"{required_signal_failure}"
+            )
 
         if isinstance(error, ProtectedMutationFailure) and error.uncooperative:
             pending_fail_stop = _prepare_fail_stop_after_uncooperative_handler(
@@ -6984,9 +7004,15 @@ def _run_one_job_body(
             workflow_status, final_response = _extract_workflow_status(
                 final_response
             )
-            if workflow_status == "failed":
+            if workflow_status == "failed" or required_signal_failure:
                 success = False
-                error = "Workflow reported failed outcome."
+                error = (
+                    "Required workforce factual record failed: "
+                    f"{required_signal_failure}"
+                    if required_signal_failure
+                    else "Workflow reported failed outcome."
+                )
+                workflow_status = "failed"
         side_effect_ownership_lost = False
         try:
             with _side_effect_fence() as owns_output:
@@ -7009,6 +7035,37 @@ def _run_one_job_body(
                     "Interrupted by gateway shutdown before the run finished "
                     "(tool subprocess was killed mid-flight)."
                 )
+
+            operational_failure_event = None
+            if not success:
+                from cron.operational_failures import append_profile_failure
+
+                try:
+                    operational_failure_event = append_profile_failure(
+                        _get_hermes_home(), job, error
+                    )
+                except OSError:
+                    logger.error(
+                        "Job '%s': operational failure intake persistence failed",
+                        job["id"],
+                        exc_info=True,
+                    )
+                    # An opted-in operational job must never bypass its durable
+                    # intake with a direct chat alert.
+                    if isinstance(job.get("failure_ownership"), dict):
+                        operational_failure_event = {"intake_unavailable": True}
+            elif isinstance(job.get("failure_ownership"), dict):
+                # A recovery is its own ordered control-plane event. The
+                # monitor never infers recovery from an older failure plus
+                # current mutable job state.
+                from cron.operational_failures import append_profile_recovery
+                try:
+                    append_profile_recovery(_get_hermes_home(), job)
+                except OSError:
+                    logger.error(
+                        "Job '%s': operational recovery intake persistence failed",
+                        job["id"], exc_info=True,
+                    )
 
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
@@ -7079,6 +7136,8 @@ def _run_one_job_body(
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
+            if operational_failure_event is not None:
+                should_deliver = False
             if blocked_config_silent or drift_skip_silent:
                 should_deliver = False
             unresolved_origin = False

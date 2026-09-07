@@ -335,14 +335,15 @@ class ToolEntry:
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
         "execution_capability", "registration_owner",
-        "_registration_owner", "inbound_json_policy",
+        "_registration_owner", "inbound_json_policy", "preflight",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None,
                  execution_capability=None, registration_owner=None,
-                 registration_owner_token=None, inbound_json_policy=None):
+                 registration_owner_token=None, inbound_json_policy=None,
+                 preflight=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -365,6 +366,7 @@ class ToolEntry:
         self.registration_owner = registration_owner
         self._registration_owner = registration_owner_token
         self.inbound_json_policy = inbound_json_policy
+        self.preflight = preflight
 
 
 class _PluginOverridePolicy:
@@ -995,6 +997,7 @@ class ToolRegistry:
         execution_capability=None,
         _registration_owner=None,
         _inbound_json_policy=None,
+        preflight: Callable = None,
         scope: Optional[str] = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -1170,6 +1173,7 @@ class ToolRegistry:
                     else None
                 ),
                 inbound_json_policy=_inbound_json_policy,
+                preflight=preflight,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -1499,6 +1503,16 @@ class ToolRegistry:
                     "Tool is unavailable in this execution context",
                     error_type="execution_capability_unavailable",
                     tool=name,
+                )
+        if entry.preflight is not None:
+            try:
+                entry.preflight(args)
+            except (PermissionError, TypeError, ValueError) as exc:
+                if name == "workforce_signal":
+                    from tools.workforce_signal_runtime import mark_failure
+                    mark_failure(str(exc))
+                return tool_error(
+                    str(exc), error_type="tool_input_validation_failed", tool=name
                 )
         try:
             args = enforce_runtime_tool_budget(name, args)

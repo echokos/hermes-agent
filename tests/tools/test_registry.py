@@ -92,6 +92,36 @@ class TestRegisterAndDispatch:
         }
         assert json.loads(reg.dispatch("kanban_create", {}))["ok"] is True
 
+    def test_preflight_rejection_happens_before_budget_reservation(self):
+        reg = ToolRegistry()
+        handled = []
+
+        def preflight(args):
+            if not args.get("aurora_assignment_id"):
+                raise ValueError("Chloe requires an explicit aurora_assignment_id")
+
+        reg.register(
+            name="workforce_signal", toolset="workforce",
+            schema=_make_schema("workforce_signal"),
+            handler=lambda args, **_kwargs: handled.append(args) or json.dumps({"ok": True}),
+            preflight=preflight,
+        )
+        token, state = activate_runtime_tool_budget({
+            "max_calls": 1, "max_writes": 1, "max_detail_reads": 1,
+            "max_list_items": 1, "allowed_tools": ["workforce_signal"],
+        })
+        try:
+            denied = json.loads(reg.dispatch("workforce_signal", {}))
+            assert denied["error_type"] == "tool_input_validation_failed"
+            accepted = json.loads(reg.dispatch(
+                "workforce_signal", {"aurora_assignment_id": "t_aurora"}
+            ))
+        finally:
+            reset_runtime_tool_budget(token)
+        assert accepted["ok"] is True
+        assert handled == [{"aurora_assignment_id": "t_aurora"}]
+        assert state.snapshot()["writes"] == 1
+
     def test_runtime_budget_counts_only_mutating_workforce_actions_as_writes(self):
         reg = ToolRegistry()
         captured = []

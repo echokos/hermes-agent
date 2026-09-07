@@ -394,6 +394,28 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
     assert mark == ("mark", "j5", False)
 
 
+def test_required_workforce_signal_absence_cannot_leave_a_cron_run_green(monkeypatch):
+    calls = _patch_pipeline(monkeypatch, success=True, final="apparently complete")
+    recorded = []
+    monkeypatch.setattr(
+        "cron.operational_failures.append_profile_failure",
+        lambda _home, job, error: recorded.append((job["id"], error)) or {"event_id": "evt"},
+    )
+    ok = s.run_one_job({
+        "id": "chloe-control", "name": "Chloe control plane",
+        "required_workforce_signal": True,
+        "failure_ownership": {
+            "technical_owner": "root", "director": "aurora",
+        },
+    })
+    # ``run_one_job`` returns whether the processing path completed; the
+    # authoritative execution/run record must still be failed.
+    assert ok is True
+    assert recorded and "not submitted" in recorded[0][1]
+    assert [call[0] for call in calls] == ["run_job", "save", "mark"]
+    assert calls[-1] == ("mark", "chloe-control", False)
+
+
 def test_run_one_job_operator_only_script_failure_skips_delivery(monkeypatch):
     """Pre-run collector failures remain visible to operators, not chat."""
     calls = _patch_pipeline(
