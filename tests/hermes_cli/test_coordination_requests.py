@@ -1325,11 +1325,14 @@ def test_owned_failure_review_waits_for_recovery_then_launches_after_checkpoint(
         assert reservation.leaf_launch_ordinal is None
 
 
-def test_verified_owned_failure_completion_keeps_bound_tail_and_never_retries(
-    kanban_home, organization,
+def test_verified_owned_failure_three_call_review_reaches_acceptance(
+    kanban_home, organization, monkeypatch,
 ):
     from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from unittest.mock import patch
 
+    from agent import turn_context
     from hermes_cli.workforce_handoffs import acknowledge_handoff, create_handoff
 
     now = int(time.time())
@@ -1401,13 +1404,33 @@ def test_verified_owned_failure_completion_keeps_bound_tail_and_never_retries(
         )
         assert reviewer is not None
         assert reviewer.assignee == "director"
-        assert kb.charge_coordination_model_call(
-            conn,
-            request.id,
-            purpose="terminal_review",
-            task_id=task_id,
-            now=now + 301,
-        ) == 18
+
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+        title_agent = SimpleNamespace(
+            platform="cli",
+            session_id="review-session",
+            _session_db=object(),
+            _session_db_created=True,
+        )
+        with patch("agent.title_generator.maybe_auto_title") as title_call:
+            turn_context._maybe_title_session_at_turn_start(
+                title_agent,
+                [{"role": "user", "content": "Review the repaired task"}],
+            )
+        title_call.assert_not_called()
+
+        # The implementation used every general-purpose call, leaving exactly
+        # the fixed three-call terminal-review reserve. With no auxiliary title
+        # charge, the reviewer can inspect the task and evidence before using
+        # its third call to return the source-acceptance transition.
+        for offset, ordinal in enumerate(range(18, 21), start=1):
+            assert kb.charge_coordination_model_call(
+                conn,
+                request.id,
+                purpose="terminal_review",
+                task_id=task_id,
+                now=now + 300 + offset,
+            ) == ordinal
         assert kb.complete_task(
             conn,
             task_id,
@@ -1417,22 +1440,8 @@ def test_verified_owned_failure_completion_keeps_bound_tail_and_never_retries(
         assert kb.get_task(conn, task_id).status == "done"
         assert kb.get_coordination_request(conn, request.id).status == "completed"
 
-        # The same still-running reviewer turn may render its post-tool answer
-        # from the reserved tail, but no later process can reopen the work.
-        assert kb.charge_coordination_model_call(
-            conn,
-            request.id,
-            purpose="terminal_review",
-            task_id=task_id,
-            now=now + 302,
-        ) == 19
-        assert kb.charge_coordination_model_call(
-            conn,
-            request.id,
-            purpose="terminal_review",
-            task_id=task_id,
-            now=now + 303,
-        ) == 20
+        # Acceptance landed before the reserve was exhausted; a later process
+        # cannot spend another call or reopen the completed request.
         with pytest.raises(kb.CoordinationBudgetExceeded, match="aggregate"):
             kb.charge_coordination_model_call(
                 conn,
