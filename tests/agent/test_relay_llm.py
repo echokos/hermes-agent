@@ -39,6 +39,44 @@ def relay_turn(tmp_path, monkeypatch):
         relay_runtime._reset_for_tests()
 
 
+@pytest.mark.parametrize("mode", ["sync", "async", "stream"])
+def test_managed_provider_budget_preserves_context_and_denies_io(relay_turn, monkeypatch, mode):
+    from agent import coordination_budget
+    from hermes_cli.kanban_db import CoordinationBudgetExceeded
+
+    _, turn = relay_turn
+    sentinel = contextvars.ContextVar("budget-test-origin", default="missing")
+    token = sentinel.set("expected-origin")
+    seen = []
+    network = []
+
+    def deny():
+        seen.append(sentinel.get())
+        raise CoordinationBudgetExceeded("cr_test", "no calls remain")
+
+    def provider(_):
+        network.append(True)
+        return {}
+
+    async def async_provider(body):
+        return provider(body)
+
+    monkeypatch.setattr(coordination_budget, "charge_provider_attempt", deny)
+    kwargs = dict(session_id=turn.lease.session_id, name="openai", model_name="test")
+    try:
+        with pytest.raises(CoordinationBudgetExceeded):
+            if mode == "sync":
+                relay_llm.execute({}, provider, **kwargs)
+            elif mode == "async":
+                asyncio.run(relay_llm.execute_async({}, async_provider, **kwargs))
+            else:
+                list(relay_llm.stream({}, lambda body: iter([provider(body)]), finalizer=dict, **kwargs))
+    finally:
+        sentinel.reset(token)
+    assert seen == ["expected-origin"]
+    assert network == []
+
+
 def test_stream_uses_rewritten_request_and_post_intercept_chunks(relay_turn):
     relay, turn = relay_turn
     captured_requests = []

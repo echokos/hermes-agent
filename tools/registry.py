@@ -1512,6 +1512,20 @@ class ToolRegistry:
         if entry.attempt_observer is not None:
             entry.attempt_observer()
         try:
+            from tools.workforce_handoff_pickup_scope import pickup_scope_denial
+
+            denial = pickup_scope_denial(name, args)
+        except Exception:
+            # Scope parsing is a deny-by-default control.  A broken or partial
+            # pickup context must not degrade into an unrestricted tool run.
+            denial = "workforce handoff pickup scope is unavailable"
+        if denial is not None:
+            return tool_error(
+                denial,
+                error_type="workforce_handoff_pickup_scope_denied",
+                tool=name,
+            )
+        try:
             budget_attempt_charged = charge_runtime_tool_attempt(name)
         except RuntimeToolBudgetError as exc:
             return tool_error(

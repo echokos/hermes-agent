@@ -89,6 +89,8 @@ def test_canonical_compile_includes_active_chloe_and_emma(tmp_path):
     assert "I assign DigitalOcean" in aurora_text
     assert "Close every accepted commitment" in aurora_text
     assert "report_to_origin: true" in aurora_text
+    assert "coordination: {}` before any delegation" in aurora_text
+    assert "synchronous answers, exploration or discovery" in aurora_text
     assert "exact DM, room thread, or conversation" in aurora_text
 
     alina_text = (tmp_path / "alina" / "AGENTS.md").read_text()
@@ -98,6 +100,7 @@ def test_canonical_compile_includes_active_chloe_and_emma(tmp_path):
     root_text = (tmp_path / "root" / "AGENTS.md").read_text()
     assert "active Hermes worker under profile directory `main`" in root_text
     assert "I own DigitalOcean" in root_text
+    assert "coordination: {}` before any delegation" not in root_text
 
 
 def test_planned_profile_can_use_owner_only_private_source(tmp_path):

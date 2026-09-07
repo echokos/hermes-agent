@@ -112,6 +112,27 @@ def _moa_reference_output_allowed(agent: Any) -> bool:
     )
 
 
+def _pickup_eager_tool_names(
+    eager_tool_names: set[str] | frozenset[str] | None,
+) -> set[str] | frozenset[str] | None:
+    """Expose the one host-authorized pickup tool past tool-search deferral."""
+    if not os.environ.get("HERMES_WORKFORCE_HANDOFF_PICKUP_TASK", ""):
+        return eager_tool_names
+    try:
+        from tools.workforce_handoff_pickup_scope import pickup_scope_denial
+
+        task_id = os.environ.get("HERMES_COORDINATION_TASK_ID", "")
+        denial = pickup_scope_denial(
+            "workforce_handoff",
+            {"action": "acknowledge", "task_id": task_id},
+        )
+        if denial is not None:
+            return eager_tool_names
+    except Exception:
+        return eager_tool_names
+    return frozenset(set(eager_tool_names or ()) | {"workforce_handoff"})
+
+
 def _relay_moa_reference_event(agent: Any, event: str, **kwargs: Any) -> None:
     """Relay MoA display events while preserving the ``-Q`` stdout contract."""
     if not _moa_reference_output_allowed(agent):
@@ -894,7 +915,8 @@ def init_agent(
     agent.provider_data_collection = provider_data_collection
     agent.openrouter_min_coding_score = openrouter_min_coding_score
 
-    # Store toolset filtering options
+    # Store toolset filtering options.
+    eager_tool_names = _pickup_eager_tool_names(eager_tool_names)
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
     # A late MCP/plugin registry refresh must rebuild the same bounded schema

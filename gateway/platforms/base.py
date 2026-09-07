@@ -21,11 +21,36 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from typing import Any
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
+
+
+def _is_final_return_event(event: Any) -> bool:
+    """Classify only the sealed internal final-return envelope."""
+    try:
+        from gateway.wake import final_return_context_from_event
+
+        return final_return_context_from_event(event) is not None
+    except Exception:
+        return False
+
+
+def _mark_final_return_isolated_followup(event: Any) -> None:
+    """Keep a normal inbound event out of an active final-return turn."""
+    try:
+        from gateway.wake import FINAL_RETURN_ISOLATED_FOLLOWUP_METADATA_KEY
+
+        metadata = dict(getattr(event, "metadata", None) or {})
+        metadata[FINAL_RETURN_ISOLATED_FOLLOWUP_METADATA_KEY] = True
+        event.metadata = metadata
+    except Exception:
+        # Failing to annotate is unsafe: callers use this only at the busy
+        # boundary, so surface it rather than falling through to steering.
+        raise RuntimeError("could not isolate follow-up from final-return wake")
 
 
 def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
@@ -6073,6 +6098,15 @@ class BasePlatformAdapter(ABC):
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
+            final_return_busy = (
+                session_key in getattr(self, "_final_return_active_sessions", set())
+                or _is_final_return_event(self._pending_messages.get(session_key))
+            )
+            if final_return_busy and not _is_final_return_event(event):
+                # This must run BEFORE the runner's busy-policy hook: a
+                # normal follow-up may otherwise steer into the reserved final
+                # turn, or be merged into its synthetic input by photo logic.
+                _mark_final_return_isolated_followup(event)
             # Certain commands must bypass the active-session guard and be
             # dispatched directly to the gateway runner.  Without this, they
             # are queued as pending messages and either:
@@ -6236,6 +6270,12 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
+        if _is_final_return_event(event):
+            final_return_sessions = getattr(self, "_final_return_active_sessions", None)
+            if final_return_sessions is None:
+                final_return_sessions = set()
+                self._final_return_active_sessions = final_return_sessions
+            final_return_sessions.add(session_key)
         self._start_session_processing(event, session_key)
     
     @staticmethod
@@ -6267,6 +6307,18 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        is_final_return = _is_final_return_event(event)
+        final_return_state = None
+        if is_final_return:
+            from gateway.wake import final_return_delivery_state_from_event
+
+            final_return_state = final_return_delivery_state_from_event(event)
+        if is_final_return:
+            final_return_sessions = getattr(self, "_final_return_active_sessions", None)
+            if final_return_sessions is None:
+                final_return_sessions = set()
+                self._final_return_active_sessions = final_return_sessions
+            final_return_sessions.add(session_key)
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -6429,6 +6481,23 @@ class BasePlatformAdapter(ABC):
                         )
                         text_content = _recovered
 
+                if final_return_state is not None and (
+                    images or local_files or media_files
+                ):
+                    # The coordination outbox has one concrete terminal text
+                    # receipt. Do not leak an attachment/voice side channel
+                    # before that receipt and final authority are established.
+                    from gateway.wake import WakeDeliveryOutcome
+
+                    final_return_state.complete(WakeDeliveryOutcome(
+                        "pending",
+                        detail="final-return output contains unsupported attachment delivery",
+                    ))
+                    text_content = ""
+                    images = []
+                    local_files = []
+                    media_files = []
+
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
@@ -6444,7 +6513,8 @@ class BasePlatformAdapter(ABC):
                 _tts_path = None
                 _tts_paths: List[str] = []
                 _tts_requested_path = None
-                if (self._should_auto_tts_for_chat(event.source.chat_id)
+                if (final_return_state is None
+                        and self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
@@ -6546,6 +6616,49 @@ class BasePlatformAdapter(ABC):
                         event.source.chat_id,
                     )
                     _reply_anchor = _reply_anchor_for_event(event)
+                    if final_return_state is not None:
+                        try:
+                            from gateway.delivery_ledger import (
+                                claim_coordination_final_return_delivery,
+                            )
+
+                            _final_claim = await asyncio.to_thread(
+                                claim_coordination_final_return_delivery,
+                                request_root_id=final_return_state.context["request_root_id"],
+                                task_id=final_return_state.context["task_id"],
+                                event_id=int(final_return_state.context["event_id"]),
+                                responsible_agent=final_return_state.context["responsible_agent"],
+                                board_path=final_return_state.context["db_path"],
+                                session_key=session_key,
+                                platform=str(getattr(event.source.platform, "value", event.source.platform)),
+                                chat_id=event.source.chat_id,
+                                thread_id=getattr(event.source, "thread_id", None),
+                                content=text_content,
+                                claim_token=final_return_state.claim_token,
+                            )
+                        except Exception as exc:
+                            from gateway.wake import WakeDeliveryOutcome
+
+                            logger.warning("final-return delivery admission failed: %s", exc)
+                            final_return_state.complete(WakeDeliveryOutcome(
+                                "pending", detail="final-return delivery was not admitted"
+                            ))
+                            text_content = ""
+                        else:
+                            from gateway.wake import WakeDeliveryOutcome
+
+                            if _final_claim.state == "acknowledged":
+                                final_return_state.complete(WakeDeliveryOutcome(
+                                    "acknowledged",
+                                    returned_message_id=_final_claim.returned_message_id,
+                                ))
+                                text_content = ""
+                            elif not _final_claim.send_claimed:
+                                final_return_state.complete(WakeDeliveryOutcome(
+                                    "uncertain",
+                                    detail="final-return delivery requires reconciliation",
+                                ))
+                                text_content = ""
                     # Delivery-obligation ledger: durably record the final
                     # response BEFORE the send attempt so a gateway crash
                     # between finalize and platform ACK can redeliver it on
@@ -6555,9 +6668,13 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
+                    if (
+                        final_return_state is None
+                        and not is_ephemeral_response
+                        and not str(
                         event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                        ).lstrip().startswith(("/", self.typed_command_prefix or "!"))
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
@@ -6588,14 +6705,117 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
+                    try:
+                        result = (
+                            # A final-return ticket represents exactly one
+                            # visible attempt. Generic retry/fallback can
+                            # duplicate an ambiguous platform result, so it
+                            # remains available only for ordinary replies.
+                            await (
+                                delivery_adapter.send(
+                                    chat_id=event.source.chat_id,
+                                    content=text_content,
+                                    reply_to=_reply_anchor,
+                                    metadata=_final_thread_metadata,
+                                )
+                                if final_return_state is not None
+                                else delivery_adapter._send_with_retry(
+                                    chat_id=event.source.chat_id,
+                                    content=text_content,
+                                    reply_to=_reply_anchor,
+                                    metadata=_final_thread_metadata,
+                                )
+                            )
+                            if text_content
+                            else None
+                        )
+                    except Exception as exc:
+                        if final_return_state is None:
+                            raise
+                        from gateway.delivery_ledger import mark_coordination_final_return_uncertain
+                        from gateway.wake import WakeDeliveryOutcome
+
+                        await asyncio.to_thread(
+                            mark_coordination_final_return_uncertain,
+                            final_return_state.context["request_root_id"],
+                            int(final_return_state.context["event_id"]),
+                            error=type(exc).__name__,
+                        )
+                        final_return_state.complete(WakeDeliveryOutcome(
+                            "uncertain", detail="final-return platform send raised"
+                        ))
+                        result = None
                     _record_delivery(result)
-                    if _obligation_id is not None:
+                    if final_return_state is not None and result is not None:
+                        from gateway.delivery_ledger import (
+                            mark_coordination_final_return_acknowledged,
+                            mark_coordination_final_return_uncertain,
+                        )
+                        from gateway.wake import WakeDeliveryOutcome
+
+                        if getattr(result, "success", False):
+                            # The session row proves attribution, but it does
+                            # not prove a chat platform accepted the visible
+                            # message. Persist the adapter's concrete remote
+                            # message id as the delivery receipt.
+                            remote_message_id = str(
+                                getattr(result, "message_id", "") or ""
+                            ).strip()
+                            platform_value = str(
+                                getattr(event.source.platform, "value", event.source.platform)
+                            ).strip()
+                            receipt = (
+                                f"platform-message:{platform_value}:{remote_message_id}"
+                                if remote_message_id and platform_value
+                                else ""
+                            )
+                            if receipt:
+                                try:
+                                    final_return_state.record_receipt(receipt)
+                                    acknowledged = await asyncio.to_thread(
+                                        mark_coordination_final_return_acknowledged,
+                                        final_return_state.context["request_root_id"],
+                                        int(final_return_state.context["event_id"]),
+                                        returned_message_id=receipt,
+                                    )
+                                except Exception:
+                                    logger.warning("final-return receipt acknowledgment failed", exc_info=True)
+                                    await asyncio.to_thread(
+                                        mark_coordination_final_return_uncertain,
+                                        final_return_state.context["request_root_id"],
+                                        int(final_return_state.context["event_id"]),
+                                        error="receipt_ack_failed",
+                                    )
+                                    final_return_state.complete(WakeDeliveryOutcome(
+                                        "uncertain", detail="final-return receipt could not be persisted"
+                                    ))
+                                else:
+                                    final_return_state.complete(WakeDeliveryOutcome(
+                                        "acknowledged",
+                                        returned_message_id=acknowledged.returned_message_id,
+                                    ))
+                            else:
+                                await asyncio.to_thread(
+                                    mark_coordination_final_return_uncertain,
+                                    final_return_state.context["request_root_id"],
+                                    int(final_return_state.context["event_id"]),
+                                    error="missing_persisted_receipt",
+                                )
+                                final_return_state.complete(WakeDeliveryOutcome(
+                                    "uncertain", detail="platform acknowledged without persisted receipt"
+                                ))
+                        else:
+                            uncertain = await asyncio.to_thread(
+                                mark_coordination_final_return_uncertain,
+                                final_return_state.context["request_root_id"],
+                                int(final_return_state.context["event_id"]),
+                                error=str(getattr(result, "error", "") or "send rejected"),
+                            )
+                            final_return_state.complete(WakeDeliveryOutcome(
+                                "uncertain",
+                                detail="final-return platform returned no concrete receipt",
+                            ))
+                    elif _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
                                 mark_delivered,
@@ -6781,6 +7001,13 @@ class BasePlatformAdapter(ABC):
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
 
+            if final_return_state is not None and not final_return_state.completion.done():
+                from gateway.wake import WakeDeliveryOutcome
+
+                final_return_state.complete(WakeDeliveryOutcome(
+                    "pending", detail="final-return turn produced no deliverable text"
+                ))
+
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag (#60671).
@@ -6843,6 +7070,12 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            if final_return_state is not None:
+                from gateway.wake import WakeDeliveryOutcome
+
+                final_return_state.complete(WakeDeliveryOutcome(
+                    "pending", detail="final-return turn was cancelled before send"
+                ))
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -6850,6 +7083,14 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except BaseException as e:
+            if final_return_state is not None:
+                from gateway.wake import WakeDeliveryOutcome
+
+                final_return_state.complete(WakeDeliveryOutcome(
+                    "pending", detail="final-return turn failed before send"
+                ))
+                logger.error("[%s] Final-return processing failed: %s", self.name, e, exc_info=True)
+                return
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
@@ -6880,6 +7121,11 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            if is_final_return:
+                # A queued ordinary follow-up becomes eligible for its own
+                # normal turn after this one unwinds. Do this before pending
+                # promotion so it cannot inherit the final-turn class.
+                getattr(self, "_final_return_active_sessions", set()).discard(session_key)
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

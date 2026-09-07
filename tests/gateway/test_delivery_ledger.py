@@ -9,8 +9,10 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import asyncio
 import time
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -92,6 +94,184 @@ class TestStateMachine:
     def test_record_starts_pending(self):
         _record()
         assert _row("ob-1")["state"] == "pending"
+
+
+class TestCoordinationFinalReturnOutbox:
+    @staticmethod
+    def _claim():
+        with patch.object(dl, "_validate_coordination_final_return_authority"):
+            return dl.claim_coordination_final_return_delivery(
+                request_root_id="cr_return_1",
+                task_id="task_return_1",
+                event_id=42,
+                responsible_agent="aurora",
+                board_path="/tmp/board.db",
+                session_key="agent:aurora:telegram:dm:1",
+                platform="telegram",
+                chat_id="1",
+                thread_id=None,
+                content="finished",
+            )
+
+    def test_claim_is_stable_and_never_enters_generic_restart_sweep(self):
+        first = self._claim()
+        assert first.state == "sending"
+        assert first.obligation_id == "coordination:cr_return_1:final_return:42"
+        assert dl.sweep_recoverable() == []
+
+        # A duplicate watcher observation cannot turn this into a second send.
+        duplicate = self._claim()
+        assert duplicate.state == "sending"
+
+    def test_uncertain_requires_explicit_reconciliation(self):
+        self._claim()
+        uncertain = dl.mark_coordination_final_return_uncertain(
+            "cr_return_1", 42, error="timeout"
+        )
+        assert uncertain.state == "uncertain"
+        assert self._claim().state == "uncertain"
+        assert dl.reconcile_coordination_final_return("cr_return_1", 42) == uncertain
+
+        acknowledged = dl.reconcile_coordination_final_return(
+            "cr_return_1", 42, returned_message_id="session-message:sid:99"
+        )
+        assert acknowledged is not None
+        assert acknowledged.state == "acknowledged"
+        assert acknowledged.returned_message_id == "session-message:sid:99"
+
+    def test_unstarted_ticket_can_release_for_receipt_or_queue_rejection_retry(self):
+        """Only a pre-send ticket may return to pending for a new wake."""
+        with patch.object(dl, "_validate_coordination_final_return_authority"):
+            admitted = dl.admit_coordination_final_return_turn(
+                request_root_id="cr_return_1",
+                task_id="task_return_1",
+                event_id=42,
+                responsible_agent="aurora",
+                board_path="/tmp/board.db",
+                session_key="agent:aurora:telegram:dm:1",
+                platform="telegram",
+                chat_id="1",
+                thread_id=None,
+            )
+            from gateway.run import _release_final_return_before_send
+            state = SimpleNamespace(
+                context={
+                    "request_root_id": "cr_return_1",
+                    "task_id": "task_return_1",
+                    "event_id": "42",
+                    "responsible_agent": "aurora",
+                    "db_path": "/tmp/board.db",
+                },
+                claim_token=admitted.claim_token,
+            )
+            assert asyncio.run(
+                _release_final_return_before_send(state, error="receipt_missing")
+            )
+            assert dl.get_coordination_final_return_delivery("cr_return_1", 42).state == "pending"
+
+            retry = dl.admit_coordination_final_return_turn(
+                request_root_id="cr_return_1",
+                task_id="task_return_1",
+                event_id=42,
+                responsible_agent="aurora",
+                board_path="/tmp/board.db",
+                session_key="agent:aurora:telegram:dm:1",
+                platform="telegram",
+                chat_id="1",
+                thread_id=None,
+            )
+            assert retry.state == "sending" and retry.send_claimed
+
+            # Once the owner crosses the send-start fence, an old local
+            # receipt failure cannot clear the new/outbound obligation.
+            dl.claim_coordination_final_return_delivery(
+                request_root_id="cr_return_1",
+                task_id="task_return_1",
+                event_id=42,
+                responsible_agent="aurora",
+                board_path="/tmp/board.db",
+                session_key="agent:aurora:telegram:dm:1",
+                platform="telegram",
+                chat_id="1",
+                thread_id=None,
+                content="done",
+                claim_token=retry.claim_token,
+            )
+            stale_state = SimpleNamespace(
+                context=state.context,
+                claim_token=retry.claim_token,
+            )
+            assert not asyncio.run(
+                _release_final_return_before_send(stale_state, error="queue_rejected")
+            )
+            assert dl.get_coordination_final_return_delivery("cr_return_1", 42).state == "sending"
+
+    @pytest.mark.asyncio
+    async def test_rejected_final_busy_queue_releases_durable_ticket_for_retry(self, tmp_path):
+        """No adapter/cap rejection must not strand a pre-send ticket."""
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+        from gateway.wake import (
+            FINAL_RETURN_CONTEXT_METADATA_KEY,
+            FINAL_RETURN_DELIVERY_STATE_METADATA_KEY,
+            FinalReturnDeliveryState,
+        )
+
+        board = tmp_path / "board.db"
+        board.touch()
+        context = {
+            "request_root_id": "cr_return_1",
+            "task_id": "task_return_1",
+            "event_id": "42",
+            "responsible_agent": "aurora",
+            "db_path": str(board),
+        }
+        with patch.object(dl, "_validate_coordination_final_return_authority"):
+            admitted = dl.admit_coordination_final_return_turn(
+                request_root_id="cr_return_1",
+                task_id="task_return_1",
+                event_id=42,
+                responsible_agent="aurora",
+                board_path=str(board),
+                session_key="agent:aurora:telegram:dm:1",
+                platform="telegram",
+                chat_id="1",
+                thread_id=None,
+            )
+            state = FinalReturnDeliveryState(
+                context=context,
+                completion=asyncio.get_running_loop().create_future(),
+                claim_token=admitted.claim_token,
+            )
+            event = MessageEvent(
+                text="return",
+                message_type=MessageType.TEXT,
+                source=SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm"),
+                internal=True,
+                metadata={
+                    FINAL_RETURN_CONTEXT_METADATA_KEY: context,
+                    FINAL_RETURN_DELIVERY_STATE_METADATA_KEY: state,
+                },
+            )
+            runner = GatewayRunner.__new__(GatewayRunner)
+            runner._queue_or_replace_pending_event = lambda *_args: False
+            assert await runner._handle_active_session_busy_message(event, "session")
+            assert (await state.completion).state == "pending"
+            assert dl.get_coordination_final_return_delivery("cr_return_1", 42).state == "pending"
+            retry = dl.admit_coordination_final_return_turn(
+                request_root_id="cr_return_1",
+                task_id="task_return_1",
+                event_id=42,
+                responsible_agent="aurora",
+                board_path=str(board),
+                session_key="agent:aurora:telegram:dm:1",
+                platform="telegram",
+                chat_id="1",
+                thread_id=None,
+            )
+            assert retry.send_claimed
 
 
 class TestObligationId:

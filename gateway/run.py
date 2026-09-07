@@ -817,6 +817,99 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
+async def _record_final_return_persisted_receipt(
+    *,
+    delivery_state: Any,
+    session_db: Any,
+    session_id: str,
+    watermark: int,
+    expected_user_content: Any,
+    final_response: str,
+) -> bool:
+    """Attach a receipt only to this wake's exact persisted final assistant row."""
+    if delivery_state is None or session_db is None or not session_id or watermark < 0:
+        return False
+    expected_user = expected_user_content
+    expected_final = str(final_response or "")
+    if not expected_final:
+        return False
+
+    try:
+        rows = await asyncio.to_thread(
+            session_db.get_messages, session_id, after_id=watermark
+        )
+        user_rows = [
+            row for row in rows
+            if row.get("role") == "user" and row.get("content") == expected_user
+        ]
+        if len(user_rows) != 1:
+            return False
+        wake_user_id = int(user_rows[0]["id"])
+        following = [row for row in rows if int(row["id"]) > wake_user_id]
+        assistant_rows = [row for row in following if row.get("role") == "assistant"]
+        if not assistant_rows:
+            return False
+        terminal = assistant_rows[-1]
+        if terminal.get("content") != expected_final:
+            return False
+        metadata = {
+            "request_root_id": delivery_state.context["request_root_id"],
+            "task_id": delivery_state.context["task_id"],
+            "event_id": delivery_state.context["event_id"],
+            "responsible_agent": delivery_state.context["responsible_agent"],
+        }
+        stamped = await asyncio.to_thread(
+            session_db.set_latest_matching_message_display_kind,
+            session_id,
+            role="assistant",
+            content=expected_final,
+            display_kind="coordination_final_return",
+            display_metadata={"coordination_final_return": metadata},
+        )
+        if not stamped:
+            return False
+        verified = await asyncio.to_thread(
+            session_db.get_messages, session_id, after_id=int(terminal["id"]) - 1
+        )
+        matching = [row for row in verified if int(row["id"]) == int(terminal["id"])]
+        if len(matching) != 1:
+            return False
+        if matching[0].get("display_metadata") != {
+            "coordination_final_return": metadata
+        }:
+            return False
+        delivery_state.record_receipt(
+            f"session-message:{session_id}:{int(terminal['id'])}"
+        )
+        return True
+    except Exception:
+        logger.warning("Could not establish final-return persisted receipt", exc_info=True)
+        return False
+
+
+async def _release_final_return_before_send(
+    delivery_state: Any,
+    *,
+    error: str,
+) -> bool:
+    """Release only this unstarted ticket after a definite local failure."""
+    try:
+        from gateway.delivery_ledger import mark_coordination_final_return_pending
+
+        released = await asyncio.to_thread(
+            mark_coordination_final_return_pending,
+            delivery_state.context["request_root_id"],
+            int(delivery_state.context["event_id"]),
+            error=error,
+            claim_token=delivery_state.claim_token,
+            only_unstarted=True,
+        )
+        return released.state == "pending"
+    except Exception:
+        logger.warning("Could not release unstarted final-return ticket", exc_info=True)
+        return False
+
+
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery.
 
@@ -5206,8 +5299,13 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if getattr(ctx, "coordination_context", None) is not None:
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = ctx.interim_assistant_messages_enabled
+        _want_interim_messages = (
+            ctx.interim_assistant_messages_enabled
+            and getattr(ctx, "coordination_context", None) is None
+        )
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -8603,19 +8701,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # it up.  Clearing happens on /new and /reset via
     # _handle_reset_command.
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> bool:
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
-            return
+            return False
         pending_slot = getattr(adapter, "_pending_messages", None)
-        if pending_slot is None:
-            return
+        if not isinstance(pending_slot, dict):
+            return False
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(
                 queued_event
             )
         else:
             pending_slot[session_key] = queued_event
+        return True
 
     def _promote_queued_event(
         self,
@@ -9710,10 +9809,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -9723,7 +9822,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the head slot via ``merge_pending_message_event`` (album
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
-        existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        if not isinstance(pending_slot, dict):
+            return False
+        existing = pending_slot.get(session_key)
         security_metadata_keys = (
             "hermes_plugin_id",
             "hermes_plugin_injection",
@@ -9731,10 +9832,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "gateway_session_id",
             "gateway_session_strict",
         )
+        from gateway.wake import final_return_context_from_event
+
         same_security_context = existing is not None and (
             getattr(existing, "internal", False) == getattr(event, "internal", False)
             and getattr(existing, "allow_gateway_control", True)
             == getattr(event, "allow_gateway_control", True)
+            and bool(final_return_context_from_event(existing))
+            == bool(final_return_context_from_event(event))
             and all(
                 (getattr(existing, "metadata", None) or {}).get(key)
                 == (getattr(event, "metadata", None) or {}).get(key)
@@ -9754,7 +9859,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -9762,9 +9867,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
-        self._enqueue_fifo(session_key, event, adapter)
+        return self._enqueue_fifo(session_key, event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -9805,6 +9910,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
+        # A final-return wake is one indivisible, internal turn.  It must not
+        # be steered into the current agent or merged with a user follow-up:
+        # its budget scope is attached only when this exact queued event later
+        # reaches AIAgent execution.
+        from gateway.wake import (
+            final_return_delivery_state_from_event,
+            final_return_context_from_event,
+            is_final_return_isolated_followup,
+        )
+
+        if (
+            final_return_context_from_event(event) is not None
+            or is_final_return_isolated_followup(event)
+        ):
+            admitted = self._queue_or_replace_pending_event(session_key, event)
+            if not admitted and final_return_context_from_event(event) is not None:
+                from gateway.wake import WakeDeliveryOutcome, complete_final_return_delivery
+
+                delivery_state = final_return_delivery_state_from_event(event)
+                released = bool(delivery_state) and await _release_final_return_before_send(
+                    delivery_state, error="final_return_queue_rejected"
+                )
+                complete_final_return_delivery(
+                    event,
+                    WakeDeliveryOutcome(
+                        "pending" if released else "uncertain",
+                        detail="final-return queue admission was rejected",
+                    ),
+                )
+            return True
+
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
         # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
@@ -16141,6 +16277,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
+        # A final-return envelope names its responsible profile, but that
+        # claim is not sufficient by itself. The route that is about to run
+        # this event must independently be that exact profile before it may
+        # spend the reserved final-return budget or emit a visible result.
+        from gateway.wake import (
+            WakeDeliveryOutcome,
+            complete_final_return_delivery,
+            final_return_context_from_event,
+            final_return_context_matches_profile,
+        )
+
+        _final_return_context = final_return_context_from_event(event)
+        if _final_return_context is not None:
+            _actual_profile = (
+                str(getattr(source, "profile", "") or "").strip()
+                or str(self._profile_name_for_source(source) or "").strip()
+                or self._active_profile_name()
+            )
+            if not final_return_context_matches_profile(
+                _final_return_context, _actual_profile
+            ):
+                logger.warning(
+                    "Dropping final-return wake for responsible=%s on profile=%s",
+                    _final_return_context["responsible_agent"], _actual_profile,
+                )
+                complete_final_return_delivery(
+                    event,
+                    WakeDeliveryOutcome(
+                        "pending", detail="final-return wake routed to the wrong profile"
+                    ),
+                )
+                return None
+
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
@@ -19764,6 +19933,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         try:
+            from gateway.wake import (
+                final_return_context_from_event,
+                final_return_delivery_state_from_event,
+            )
+
+            _final_return_context = final_return_context_from_event(event)
+            _final_return_delivery_state = final_return_delivery_state_from_event(event)
+
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -19781,6 +19958,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            _final_return_receipt_watermark = -1
+            _final_return_expected_user = (
+                persist_user_message
+                if persist_user_message is not None
+                else message_text
+            )
+            if _final_return_context is not None:
+                try:
+                    _receipt_db = self._session_db
+                    _prior_rows = await asyncio.to_thread(
+                        _receipt_db.get_messages,
+                        _run_start_session_id,
+                        latest=True,
+                        limit=1,
+                    )
+                    _final_return_receipt_watermark = int(
+                        _prior_rows[-1]["id"]
+                    ) if _prior_rows else 0
+                except Exception:
+                    logger.warning(
+                        "Final-return wake cannot establish a transcript watermark",
+                        exc_info=True,
+                    )
             _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
@@ -19797,6 +19997,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                coordination_context=_final_return_context,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -19960,7 +20161,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if source.platform == Platform.MATTERMOST
                     else getattr(self, "_show_reasoning", False)
                 )
-            if _show_reasoning_effective and response and not _intentional_silence:
+            if (
+                _show_reasoning_effective
+                and _final_return_context is None
+                and response
+                and not _intentional_silence
+            ):
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     from gateway.stream_consumer import escape_code_fences_for_display
@@ -20019,7 +20225,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
+            if (
+                _footer_line
+                and _final_return_context is None
+                and response
+                and not agent_result.get("already_sent")
+                and not _intentional_silence
+            ):
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
@@ -20350,6 +20562,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key, session_entry.session_id
             )
 
+            if _final_return_context is not None:
+                _receipt_ok = await _record_final_return_persisted_receipt(
+                    delivery_state=_final_return_delivery_state,
+                    session_db=self._session_db,
+                    session_id=session_entry.session_id,
+                    watermark=_final_return_receipt_watermark,
+                    expected_user_content=_final_return_expected_user,
+                    final_response=response,
+                )
+                if not _receipt_ok:
+                    from gateway.wake import (
+                        WakeDeliveryOutcome,
+                        complete_final_return_delivery,
+                    )
+
+                    released = await _release_final_return_before_send(
+                        _final_return_delivery_state,
+                        error="final_return_receipt_missing",
+                    )
+                    complete_final_return_delivery(
+                        event,
+                        WakeDeliveryOutcome(
+                            "pending" if released else "uncertain",
+                            detail="final-return turn lacks an exact persisted receipt",
+                        ),
+                    )
+                    response = ""
+
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
             # still persisted in session history so later turns keep normal
@@ -20371,6 +20611,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
             )
             if (
+                _final_return_context is None
+                and
                 not _streaming_tts_done
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
@@ -27500,6 +27742,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        coordination_context: Optional[dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -27520,6 +27763,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                coordination_context=coordination_context,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -27533,6 +27777,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                coordination_context=coordination_context,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -27676,6 +27921,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        coordination_context: Optional[dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -27691,6 +27937,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            if coordination_context is not None:
+                raise RuntimeError(
+                    "final-return coordination wake cannot execute through a proxy"
+                )
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -27883,6 +28133,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             tool_progress_enabled or _thinking_enabled or _native_slack_task_cards
         )
 
+        if coordination_context is not None:
+            # A final return is buffered until its durable authority and
+            # outbox claim are checked. No deltas, progress, task cards, live
+            # status, or voice acknowledgement may become visible earlier.
+            tool_progress_enabled = False
+            _live_status_adapter = None
+            interim_assistant_messages_enabled = False
+            _thinking_enabled = False
+            _native_slack_task_cards = False
+            needs_progress_queue = False
+
 
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if needs_progress_queue else None
@@ -27991,6 +28252,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_display_kind=persist_user_display_kind,
         )
         turn_runner = TurnRunner(self, turn_ctx)
+        turn_ctx.coordination_context = coordination_context
         # Callback invoked by agent on tool lifecycle events — extracted to
         # TurnRunner.progress_callback (bound method, same signature).
         turn_ctx.progress_callback = turn_runner.progress_callback
@@ -28243,6 +28505,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and str(getattr(message_type, "value", message_type)).lower() == "voice"
         )
         if (
+            coordination_context is None
+            and
             _stts_adapter is not None
             and _is_voice_input
             and _stts_adapter._should_auto_tts_for_chat(source.chat_id)
@@ -28590,7 +28854,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             def _run_sync_with_timeout_lifecycle():
                 try:
-                    return run_sync()
+                    if coordination_context is None:
+                        return run_sync()
+                    # Enter inside the executor worker, immediately around the
+                    # real AIAgent turn.  The ContextVar then reaches tool
+                    # threads/provider admission but cannot leak into the
+                    # queued-follow-up drain after this worker returns.
+                    from agent.coordination_budget import scoped_coordination_budget
+
+                    with scoped_coordination_budget(
+                        request_root_id=coordination_context["request_root_id"],
+                        task_id=coordination_context["task_id"],
+                        purpose="final_return",
+                        db_path=Path(coordination_context["db_path"]),
+                    ):
+                        return run_sync()
                 finally:
                     _turn_worker_done.set()
                     # `.turn.agent` on the session state is only reset to

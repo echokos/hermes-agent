@@ -1446,15 +1446,25 @@ def _handle_create(args: dict, **kw) -> str:
     # Prefer request-scoped bindings over process-global os.environ: concurrent
     # gateway turns each carry their own ContextVar, while os.environ is
     # last-writer-wins and may also contain a delegated child's internal id.
+    from agent.coordination_budget import (
+        coordination_acceptance_binding,
+        current_coordination_origin,
+        current_coordination_request_id,
+    )
     from tools.async_delegation import _current_origin_session_id
     from gateway.session_context import get_session_env
 
-    session_id = (
-        args.get("session_id")
+    coordination_origin_session, coordination_origin_message = (
+        current_coordination_origin()
+    )
+    scoped_request_root_id = current_coordination_request_id()
+    authoritative_session_id = (
+        coordination_origin_session
         or _current_origin_session_id()
         or get_session_env("HERMES_SESSION_ID", "")
         or os.environ.get("HERMES_SESSION_ID")
     )
+    session_id = args.get("session_id") or authoritative_session_id
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
     # mean a fresh scratch workspace, even when a dispatcher-spawned worker
@@ -1491,6 +1501,53 @@ def _handle_create(args: dict, **kw) -> str:
     report_to_origin, report_bool_error = _parse_bool_arg(args, "report_to_origin")
     if report_bool_error:
         return tool_error(report_bool_error)
+    coordination = args.get("coordination")
+    if coordination is not None and not isinstance(coordination, dict):
+        return tool_error("coordination must be an object")
+    if coordination is not None:
+        coordination = dict(coordination)
+    if coordination is not None and not report_to_origin:
+        return tool_error("coordination requires report_to_origin=true")
+    if coordination is not None and os.environ.get("HERMES_KANBAN_TASK"):
+        return tool_error("a dispatcher worker cannot open a new coordination root")
+    coordination_keys = {
+        "max_leaf_launches",
+        "max_concurrent_leaf",
+        "max_model_calls",
+        "checkpoint_seconds",
+    }
+    if coordination is not None:
+        unknown = sorted(set(coordination) - coordination_keys)
+        if unknown:
+            return tool_error(
+                "unsupported coordination field(s): " + ", ".join(unknown)
+            )
+        if not authoritative_session_id:
+            return tool_error(
+                "coordination requires an authoritative current session"
+            )
+        session_id = authoritative_session_id
+        coordination_limits = {
+            "max_leaf_launches": 4,
+            "max_concurrent_leaf": 2,
+            "max_model_calls": 40,
+            "checkpoint_seconds": 20 * 60,
+        }
+        for name, maximum in coordination_limits.items():
+            if name not in coordination:
+                continue
+            value = coordination[name]
+            if isinstance(value, bool):
+                return tool_error(f"coordination.{name} must be a positive integer")
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return tool_error(f"coordination.{name} must be a positive integer")
+            if parsed <= 0 or parsed > maximum:
+                return tool_error(
+                    f"coordination.{name} must be between 1 and {maximum}"
+                )
+            coordination[name] = parsed
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
@@ -1503,6 +1560,10 @@ def _handle_create(args: dict, **kw) -> str:
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
     board = args.get("board")
+    if (coordination is not None or scoped_request_root_id) and board:
+        return tool_error(
+            "coordinated work must use the current canonical board"
+        )
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1516,42 +1577,194 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
-            new_tid = kb.create_task(
-                conn,
-                title=str(title).strip(),
-                body=body,
-                assignee=str(assignee),
-                parents=tuple(parents),
-                tenant=tenant,
-                priority=int(priority) if priority is not None else 0,
-                workspace_kind=str(workspace_kind),
-                workspace_path=workspace_path,
-                project_id=project_id,
-                project_source_task_id=project_source_task_id,
-                triage=triage,
-                idempotency_key=idempotency_key,
-                max_runtime_seconds=(
-                    int(max_runtime_seconds)
-                    if max_runtime_seconds is not None else None
-                ),
-                skills=skills,
-                model_override=model_override,
-                provider_override=provider_override,
-                goal_mode=goal_mode,
-                goal_max_turns=(
-                    int(goal_max_turns) if goal_max_turns is not None else None
-                ),
-                initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
-                session_id=session_id,
+            from gateway.session_context import get_session_env
+
+            message_id = (
+                coordination_origin_message
+                or get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+                or ""
             )
-            new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(
-                conn,
-                new_tid,
-                explicit=report_to_origin,
-                delivery_mode="wake" if report_to_origin else None,
+            coordination_source_task_id = os.environ.get("HERMES_KANBAN_TASK")
+            if (
+                coordination_source_task_id
+                and kb.get_task(conn, coordination_source_task_id) is None
+            ):
+                # A worker may deliberately create on another board, but an
+                # accepted coordination root cannot be dropped at that board
+                # boundary. The originating board remains authoritative.
+                if board:
+                    with kb.connect_closing() as source_conn:
+                        source_task = kb.get_task(
+                            source_conn, coordination_source_task_id
+                        )
+                    if source_task is not None and source_task.request_root_id:
+                        raise ValueError(
+                            "coordinated workers cannot create on another board"
+                        )
+                coordination_source_task_id = None
+            request = None
+            from contextlib import nullcontext
+
+            acceptance_context = (
+                coordination_acceptance_binding()
+                if coordination is not None
+                else nullcontext(None)
             )
+            with acceptance_context as acceptance, kb.write_txn(conn):
+                same_turn_request = None
+                if scoped_request_root_id:
+                    same_turn_request = kb.get_coordination_request(
+                        conn, scoped_request_root_id
+                    )
+                    if same_turn_request is None:
+                        raise ValueError(
+                            "trusted coordination request root is missing"
+                        )
+                elif authoritative_session_id and message_id:
+                    same_turn_request = kb.get_coordination_request(
+                        conn,
+                        kb.coordination_request_id(
+                            authoritative_session_id, message_id
+                        ),
+                    )
+                if same_turn_request is not None:
+                    if same_turn_request.status != "active":
+                        raise ValueError(
+                            "coordination request is closed to new tasks"
+                        )
+                    if coordination is None and not coordination_source_task_id:
+                        coordination_source_task_id = same_turn_request.root_task_id
+
+                org = None
+                if coordination is not None:
+                    if not message_id:
+                        raise ValueError(
+                            "coordination root requires the origin message_id"
+                        )
+                    from hermes_cli.workforce_org import load_organization
+
+                    org = load_organization()
+                    actor_name = (
+                        get_session_env("HERMES_SESSION_PROFILE", "")
+                        or os.environ.get("HERMES_PROFILE")
+                        or ""
+                    )
+                    actor = org.validate_execution_profile(actor_name)
+                    target = org.validate_execution_profile(str(assignee))
+                    if actor.agent != target.agent or not actor.direct_reports:
+                        raise ValueError(
+                            "coordination root must be accepted and owned by the "
+                            "current workforce manager"
+                        )
+
+                if coordination is not None and same_turn_request is not None:
+                    if same_turn_request.kind != "origin_request":
+                        raise ValueError(
+                            "origin is already scoped to a non-user request"
+                        )
+                    if same_turn_request.responsible_agent != target.agent:
+                        raise ValueError(
+                            "origin request already has a different responsible agent"
+                        )
+                    for name, requested_value in coordination.items():
+                        if getattr(same_turn_request, name) != requested_value:
+                            raise ValueError(
+                                f"origin request already has a different {name}"
+                            )
+                    # The request may have been accepted by another tool thread
+                    # after this scope's early lookup. Settle this accepting
+                    # scope even on the idempotent existing-root path so those
+                    # already-observed provider calls cannot escape the root
+                    # budget.
+                    kb.settle_coordination_acceptance_calls(
+                        conn,
+                        same_turn_request.id,
+                        acceptance.scope_id,
+                        acceptance.model_calls,
+                    )
+                    request = kb.get_coordination_request(
+                        conn, same_turn_request.id
+                    )
+                    if request is None:  # pragma: no cover - serialized invariant
+                        raise RuntimeError("coordination request disappeared")
+                    new_tid = request.root_task_id
+                    new_task = kb.get_task(conn, new_tid)
+                    subscribed = conn.execute(
+                        "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? "
+                        "AND delivery_mode IN ('wake', 'notify+wake') LIMIT 1",
+                        (new_tid,),
+                    ).fetchone() is not None
+                else:
+                    new_tid = kb.create_task(
+                        conn,
+                        title=str(title).strip(),
+                        body=body,
+                        assignee=str(assignee),
+                        parents=tuple(parents),
+                        tenant=tenant,
+                        priority=int(priority) if priority is not None else 0,
+                        workspace_kind=str(workspace_kind),
+                        workspace_path=workspace_path,
+                        project_id=project_id,
+                        project_source_task_id=project_source_task_id,
+                        coordination_source_task_id=(
+                            None if coordination is not None
+                            else coordination_source_task_id
+                        ),
+                        coordination_origin_message_id=(
+                            message_id if authoritative_session_id else None
+                        ),
+                        triage=triage,
+                        idempotency_key=idempotency_key,
+                        max_runtime_seconds=(
+                            int(max_runtime_seconds)
+                            if max_runtime_seconds is not None else None
+                        ),
+                        skills=skills,
+                        model_override=model_override,
+                        provider_override=provider_override,
+                        goal_mode=goal_mode,
+                        goal_max_turns=(
+                            int(goal_max_turns)
+                            if goal_max_turns is not None else None
+                        ),
+                        initial_status=str(initial_status),
+                        created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                        session_id=session_id,
+                    )
+                    new_task = kb.get_task(conn, new_tid)
+                    # Exactly the accepted root owns the human origin route.
+                    # Same-origin children inherit the budget implicitly but
+                    # must not inherit global/explicit auto-subscription and
+                    # expose raw internal completion events to that user.
+                    inherited_coordination_child = (
+                        coordination is None and same_turn_request is not None
+                    )
+                    subscribed = False
+                    if not inherited_coordination_child:
+                        subscribed = _maybe_auto_subscribe(
+                            conn,
+                            new_tid,
+                            explicit=report_to_origin,
+                            delivery_mode="wake" if report_to_origin else None,
+                        )
+                    if coordination is not None:
+                        if not subscribed:
+                            raise ValueError(
+                                "coordination root requires a persistent origin route"
+                            )
+                        request = kb.create_coordination_request(
+                            conn,
+                            root_task_id=new_tid,
+                            origin_session_id=str(session_id or ""),
+                            origin_message_id=str(message_id),
+                            acceptance_scope_id=acceptance.scope_id,
+                            accepting_model_calls=acceptance.model_calls,
+                            organization=org,
+                            **coordination,
+                        )
+                if coordination is not None:
+                    acceptance.accept(request)
             attached_session_id = new_task.session_id if new_task else session_id
             wake_attached = bool(subscribed and attached_session_id)
             if wake_attached:
@@ -1582,6 +1795,17 @@ def _handle_create(args: dict, **kw) -> str:
                 wake_attached=wake_attached,
                 delivery_mode=delivery_mode,
                 delivery_warning=delivery_warning,
+                request_root_id=request.id if request else None,
+                coordination=(
+                    {
+                        "max_leaf_launches": request.max_leaf_launches,
+                        "max_concurrent_leaf": request.max_concurrent_leaf,
+                        "max_model_calls": request.max_model_calls,
+                        "final_model_call_reserve": request.final_model_call_reserve,
+                        "checkpoint_at": request.checkpoint_at,
+                    }
+                    if request else None
+                ),
             )
         finally:
             conn.close()
@@ -1710,6 +1934,8 @@ def _maybe_auto_subscribe(
                 delivery_metadata["direct_messages_topic_id"] = str(thread_id)
             if message_id:
                 delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
+        if message_id:
+            delivery_metadata["origin_message_id"] = str(message_id)
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
@@ -2455,9 +2681,52 @@ KANBAN_CREATE_SCHEMA = {
                     "Its terminal event wakes the originating agent in this exact "
                     "conversation so the agent can verify the outcome and deliver "
                     "a final report. Never set it on internal work, speculative "
-                    "tasks, or multiple child cards for the same commitment. Build "
-                    "worker cards first, then make this final card depend on them."
+                    "tasks, or multiple child cards for the same commitment. Create "
+                    "this root before worker cards; later coordinated worker and "
+                    "verification cards inherit its request scope internally."
                 ),
+            },
+            "coordination": {
+                "type": "object",
+                "description": (
+                    "Explicitly accept this report-to-origin task as the one "
+                    "request-wide coordination root. Omit for ordinary tasks. "
+                    "Only the current workforce manager may accept a root."
+                ),
+                "properties": {
+                    "max_leaf_launches": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 4,
+                        "description": "Whole-request leaf launch cap (default 4).",
+                    },
+                    "max_concurrent_leaf": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 2,
+                        "description": (
+                            "Whole-request concurrent leaf cap (default 2)."
+                        ),
+                    },
+                    "max_model_calls": {
+                        "type": "integer",
+                        "minimum": 3,
+                        "maximum": 40,
+                        "description": (
+                            "Whole-request physical provider-call cap, including "
+                            "the reserved final return (default 40)."
+                        ),
+                    },
+                    "checkpoint_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1200,
+                        "description": (
+                            "Elapsed work checkpoint in seconds (default 1200)."
+                        ),
+                    },
+                },
+                "additionalProperties": False,
             },
             "model": {
                 "type": "string",

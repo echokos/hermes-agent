@@ -573,6 +573,95 @@ def test_run_codex_stream_returns_collected_items_when_stream_ends_without_termi
     assert response.output == [output_item]
 
 
+@pytest.mark.parametrize("limit", [1, 2])
+def test_codex_transport_retries_require_fresh_request_budget(monkeypatch, limit):
+    import httpx
+    from agent import coordination_budget
+    from hermes_cli.kanban_db import CoordinationBudgetExceeded
+
+    agent = _build_agent(monkeypatch)
+    charged = []
+    physical_calls = []
+
+    def admit():
+        if len(charged) >= limit:
+            raise CoordinationBudgetExceeded("cr_test", "budget exhausted")
+        charged.append(len(charged) + 1)
+
+    def broken_stream():
+        raise httpx.RemoteProtocolError("interrupted test stream")
+        yield  # pragma: no cover
+
+    def create(**kwargs):
+        physical_calls.append(kwargs)
+        if len(physical_calls) == 1:
+            return broken_stream()
+        return _FakeCreateStream([
+            SimpleNamespace(type="response.output_item.done", item=_codex_message_response("OK").output[0]),
+            SimpleNamespace(type="response.completed", response=_codex_message_response("OK")),
+        ])
+
+    monkeypatch.setattr(coordination_budget, "charge_provider_attempt", admit)
+    agent.client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    if limit == 1:
+        with pytest.raises(CoordinationBudgetExceeded):
+            agent._run_codex_stream(_codex_request_kwargs())
+    else:
+        assert agent._run_codex_stream(_codex_request_kwargs()).status == "completed"
+    assert len(charged) == len(physical_calls) == limit
+
+
+def test_codex_nonstream_conversation_charges_concrete_stream_only(monkeypatch):
+    from agent import coordination_budget
+
+    agent = _build_agent(monkeypatch)
+    agent._disable_streaming = True
+    charged = []
+    physical_calls = []
+
+    def create(**kwargs):
+        physical_calls.append(kwargs)
+        return _FakeCreateStream([
+            SimpleNamespace(type="response.output_item.done", item=_codex_message_response("OK").output[0]),
+            SimpleNamespace(type="response.completed", response=_codex_message_response("OK")),
+        ])
+
+    monkeypatch.setattr(coordination_budget, "charge_provider_attempt", lambda: charged.append(1))
+    client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    agent.client = client
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda *args, **kwargs: client)
+    result = agent.run_conversation("Say OK")
+    assert result["final_response"] == "OK"
+    assert len(charged) == len(physical_calls) == 1
+
+
+def test_coordination_budget_denial_ends_real_turn_without_retry_or_summary(monkeypatch):
+    from agent import coordination_budget
+    from hermes_cli.kanban_db import CoordinationBudgetExceeded
+
+    agent = _build_agent(monkeypatch)
+    agent._disable_streaming = True
+    attempts = []
+    physical_calls = []
+
+    def deny():
+        attempts.append(True)
+        raise CoordinationBudgetExceeded("cr_test", "work budget exhausted")
+
+    def create(**kwargs):
+        physical_calls.append(kwargs)
+        raise AssertionError("provider must not be called")
+
+    monkeypatch.setattr(coordination_budget, "charge_provider_attempt", deny)
+    client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    agent.client = client
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda *args, **kwargs: client)
+    with pytest.raises(CoordinationBudgetExceeded):
+        agent.run_conversation("Say OK")
+    assert attempts == [True]
+    assert physical_calls == []
+
+
 def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkeypatch):
     from agent.codex_runtime import _consume_codex_event_stream
 

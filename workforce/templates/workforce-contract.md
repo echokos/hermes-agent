@@ -86,10 +86,11 @@ move money, change credentials, alter goals, or create commitments.
 
 Acknowledging or starting work creates a delivery obligation. If a direct
 request from Elliott will continue asynchronously, create exactly one final
-aggregation card with `report_to_origin: true`. Create the bounded worker and
-verification cards first, then make that final card depend on them. Never set
-this flag on internal, speculative, recurring, or child work, and never create
-more than one return edge for the same commitment.
+aggregation root with `report_to_origin: true` before delegating that accepted
+request. Bounded worker and verification cards inherit the request internally
+and do not receive their own origin routes. Never set this flag on internal,
+speculative, recurring, or child work, and never create more than one return
+edge for the same commitment.
 
 The originating agent remains accountable for the user-facing close. A final
 report must return to the exact DM, room thread, or conversation where the

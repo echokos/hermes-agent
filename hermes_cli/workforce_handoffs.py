@@ -148,6 +148,101 @@ def acknowledge_handoff(
     return {"task_id": task_id, **payload}
 
 
+def claim_owned_failure_handoff_pickup(
+    conn: sqlite3.Connection,
+    *,
+    target_agent: str,
+    organization: WorkforceOrganization | None = None,
+    now: int | None = None,
+) -> dict[str, Any] | None:
+    """Claim one typed owned-failure acknowledgment for a silent owner turn.
+
+    The task body deliberately remains ``pending_acknowledgment``. Only the
+    genuine target's later ``workforce_handoff(acknowledge)`` tool call may
+    accept it. The one-shot event is the durable pickup claim; failures after
+    this commit stay owned and are handled by the existing overdue sweep.
+    """
+    org = organization or load_organization()
+    target = org.validate_execution_profile(target_agent).agent
+    claimed_at = int(now if now is not None else time.time())
+    with kanban_db.write_txn(conn):
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'triage' "
+            "AND body LIKE ? ORDER BY created_at, id",
+            ('%"kind": "workforce_handoff"%',),
+        ).fetchall()
+        for row in rows:
+            task = kanban_db.get_task(conn, row["id"])
+            if task is None:
+                continue
+            try:
+                payload = _body(task)
+                context = payload.get("context")
+                payload_target = org.validate_execution_profile(
+                    str(payload.get("target_agent") or "")
+                ).agent
+                source = org.validate_execution_profile(
+                    str(payload.get("source_agent") or "")
+                ).agent
+                acknowledgment_deadline = int(
+                    payload.get("acknowledgment_deadline")
+                )
+                checkpoint_at = int(payload.get("checkpoint_at"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                payload.get("state") != "pending_acknowledgment"
+                or payload.get("requires_source_acceptance") is not True
+                or not isinstance(context, dict)
+                or context.get("kind") != "owned_operational_failure"
+                or payload_target != target
+                or claimed_at > acknowledgment_deadline
+                or checkpoint_at <= acknowledgment_deadline
+            ):
+                continue
+            already_claimed = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? "
+                "AND kind = 'workforce_handoff_pickup_claimed' LIMIT 1",
+                (task.id,),
+            ).fetchone()
+            if already_claimed is not None:
+                continue
+            try:
+                request = kanban_db.create_owned_failure_coordination_request(
+                    conn,
+                    root_task_id=task.id,
+                    organization=org,
+                    now=claimed_at,
+                )
+            except ValueError:
+                # The factory performs the full context/assignee authority
+                # validation under a nested savepoint. A malformed earlier
+                # row must not prevent a later valid owned failure from being
+                # picked up in the same scan.
+                continue
+            kanban_db._append_event(
+                conn,
+                task.id,
+                "workforce_handoff_pickup_claimed",
+                {
+                    "actor": target,
+                    "target_agent": target,
+                    "source_agent": source,
+                    "request_root_id": request.id,
+                    "claim_kind": "owned_operational_failure",
+                    "claimed_at": claimed_at,
+                },
+            )
+            return {
+                "task_id": task.id,
+                "target_agent": target,
+                "source_agent": source,
+                "request_root_id": request.id,
+                "claimed_at": claimed_at,
+            }
+    return None
+
+
 def record_checkpoint(
     conn: sqlite3.Connection,
     task_id: str,
@@ -214,16 +309,35 @@ def sweep_overdue_handoffs(
         task = kanban_db.get_task(conn, row["id"])
         if task is None:
             continue
-        payload = _body(task)
-        if (
-            payload["state"] == "pending_acknowledgment"
-            and int(payload["acknowledgment_deadline"]) < current
-        ):
+        try:
+            payload = _body(task)
+            state_value = payload["state"]
+            acknowledgment_deadline = int(payload["acknowledgment_deadline"])
+            checkpoint_at = int(payload["checkpoint_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        # An owned-failure root in source review is not abandoned work. It may
+        # wait beyond the ordinary checkpoint for distinct recovery executions,
+        # then consume the request's reserved terminal source-review turn.
+        if task.status == "review" and task.request_root_id:
+            request = kanban_db.get_coordination_request(
+                conn, task.request_root_id
+            )
+            if (
+                request is not None
+                and request.kind == "owned_operational_failure"
+                and request.root_task_id == task.id
+                and request.status in {"active", "return_pending"}
+            ):
+                continue
+
+        if state_value == "pending_acknowledgment" and acknowledgment_deadline < current:
             state = "acknowledgment_overdue"
             event = "workforce_handoff_acknowledgment_overdue"
         elif (
-            payload["state"] in {"accepted", "active"}
-            and int(payload["checkpoint_at"]) < current
+            state_value in {"accepted", "active"}
+            and checkpoint_at < current
         ):
             state = "stalled"
             event = "workforce_handoff_stalled"

@@ -3647,6 +3647,17 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    # This is the last admission point before child construction. It shares a
+    # lock with coordination-root acceptance, so either generic delegation wins
+    # first and that later acceptance is refused, or the accepted root wins and
+    # all child work must use its budgeted Kanban dispatcher.
+    from agent.coordination_budget import admit_delegate_spawn
+
+    try:
+        admit_delegate_spawn()
+    except ValueError as exc:
+        return tool_error(str(exc))
+
     overall_start = time.monotonic()
     results = []
 

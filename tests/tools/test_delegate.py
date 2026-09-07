@@ -257,6 +257,25 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("parent agent", result["error"])
 
+    def test_coordinated_spawn_is_refused_before_child_construction(self):
+        parent = _make_mock_parent(depth=0)
+        with (
+            patch(
+                "agent.coordination_budget.admit_delegate_spawn",
+                side_effect=ValueError(
+                    "coordinated child work must use budgeted Kanban dispatch"
+                ),
+            ) as admit,
+            patch("run_agent.AIAgent") as agent,
+        ):
+            result = json.loads(
+                delegate_task(goal="bypass the request budget", parent_agent=parent)
+            )
+
+        self.assertIn("budgeted Kanban dispatch", result["error"])
+        admit.assert_called_once_with()
+        agent.assert_not_called()
+
     def test_depth_limit(self):
         parent = _make_mock_parent(depth=2)
         result = json.loads(delegate_task(goal="test", parent_agent=parent))

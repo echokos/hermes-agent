@@ -8886,6 +8886,9 @@ def _create_with_progress(
             "Auxiliary %s: streamed request failed (%s); retrying "
             "non-streaming", task or "call", exc,
         )
+        from agent.coordination_budget import charge_provider_attempt
+
+        charge_provider_attempt()
         return client.chat.completions.create(**kwargs)
 
     # Some shims (MoA virtual provider under quiet mode, defensive adapters)
@@ -9357,6 +9360,9 @@ def _call_llm_impl(
             # Return the provider call directly; the MoA facade converts a
             # completed response into a one-chunk delta iterator at its
             # boundary.
+            from agent.coordination_budget import charge_provider_attempt
+
+            charge_provider_attempt()
             return client.chat.completions.create(**kwargs)
         return _relay_sync_stream(
             client,

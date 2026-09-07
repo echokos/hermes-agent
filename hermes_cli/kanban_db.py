@@ -102,6 +102,21 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Small-repair pilot defaults. They are persisted per request so larger work
+# can opt into different explicit limits without changing a fleet-wide knob.
+DEFAULT_COORDINATION_MAX_LEAF_LAUNCHES = 4
+DEFAULT_COORDINATION_MAX_CONCURRENT_LEAF = 2
+DEFAULT_COORDINATION_MAX_MODEL_CALLS = 40
+DEFAULT_COORDINATION_FINAL_CALL_RESERVE = 2
+DEFAULT_COORDINATION_CHECKPOINT_SECONDS = 20 * 60
+DEFAULT_COORDINATION_MAX_TRANSIENT_RETRIES = 1
+INTERNAL_FAILURE_MAX_LEAF_LAUNCHES = 2
+INTERNAL_FAILURE_MAX_CONCURRENT_LEAF = 1
+INTERNAL_FAILURE_MAX_MODEL_CALLS = 20
+INTERNAL_FAILURE_TERMINAL_REVIEW_RESERVE = 3
+INTERNAL_FAILURE_CHECKPOINT_SECONDS = 20 * 60
+INTERNAL_FAILURE_MAX_TRANSIENT_RETRIES = 1
+
 
 def _task_body_forbids_launch(body: Optional[str]) -> bool:
     """Recognize a structured, explicit non-execution invariant."""
@@ -1146,6 +1161,9 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Explicit accepted-request identity. Internal tasks inherit this only
+    # from an authoritative current task or dependency parent.
+    request_root_id: Optional[str] = None
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
@@ -1153,6 +1171,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Trusted in-memory dispatch annotation. Never persisted or accepted from
+    # task/tool input; the review lane sets it after an authorized claim.
+    coordination_purpose: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1239,6 +1260,9 @@ class Task:
             session_id=(
                 row["session_id"] if "session_id" in keys else None
             ),
+            request_root_id=(
+                row["request_root_id"] if "request_root_id" in keys else None
+            ),
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
             ),
@@ -1248,6 +1272,82 @@ class Task:
                 else 0
             ),
         )
+
+
+@dataclass(frozen=True)
+class CoordinationRequest:
+    """Durable whole-request identity and aggregate pilot budget."""
+
+    id: str
+    root_task_id: str
+    origin_session_id: str
+    origin_message_id: str
+    kind: str
+    responsible_agent: str
+    status: str
+    created_at: int
+    checkpoint_at: int
+    updated_at: int
+    max_leaf_launches: int
+    max_concurrent_leaf: int
+    max_model_calls: int
+    final_model_call_reserve: int
+    max_transient_retries: int
+    leaf_launches_used: int
+    model_calls_used: int
+    transient_retries_used: int
+    manager_handoffs: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "CoordinationRequest":
+        return cls(
+            id=row["id"],
+            root_task_id=row["root_task_id"],
+            origin_session_id=row["origin_session_id"],
+            origin_message_id=row["origin_message_id"],
+            kind=(
+                row["kind"] if "kind" in row.keys() else "origin_request"
+            ),
+            responsible_agent=row["responsible_agent"],
+            status=row["status"],
+            created_at=int(row["created_at"]),
+            checkpoint_at=int(row["checkpoint_at"]),
+            updated_at=int(row["updated_at"]),
+            max_leaf_launches=int(row["max_leaf_launches"]),
+            max_concurrent_leaf=int(row["max_concurrent_leaf"]),
+            max_model_calls=int(row["max_model_calls"]),
+            final_model_call_reserve=int(row["final_model_call_reserve"]),
+            max_transient_retries=int(row["max_transient_retries"]),
+            leaf_launches_used=int(row["leaf_launches_used"]),
+            model_calls_used=int(row["model_calls_used"]),
+            transient_retries_used=int(row["transient_retries_used"]),
+            manager_handoffs=int(row["manager_handoffs"]),
+        )
+
+
+@dataclass(frozen=True)
+class CoordinationLaunchReservation:
+    request_root_id: str
+    role: str
+    leaf_launch_ordinal: Optional[int]
+
+
+class CoordinationBudgetExceeded(RuntimeError):
+    """Raised before work crosses an accepted request's aggregate guardrail."""
+
+    def __init__(self, request_root_id: str, reason: str):
+        self.request_root_id = request_root_id
+        self.reason = reason
+        super().__init__(f"coordination request {request_root_id}: {reason}")
+
+
+class CoordinationLaunchDeferred(RuntimeError):
+    """A bounded request is healthy but not yet eligible for this launch."""
+
+    def __init__(self, request_root_id: str, reason: str):
+        self.request_root_id = request_root_id
+        self.reason = reason
+        super().__init__(f"coordination request {request_root_id}: {reason}")
 
 
 @dataclass
@@ -1422,6 +1522,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Accepted asynchronous user-request identity. Inherited through an
+    -- authoritative current task or dependency parent, never a model field.
+    request_root_id      TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -1526,6 +1629,43 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- One aggregate record per explicitly accepted asynchronous user request.
+-- Per-task events remain the audit stream; this row owns the stable origin,
+-- hard pilot guardrails, and counters that need atomic cross-worker updates.
+CREATE TABLE IF NOT EXISTS coordination_requests (
+    id                       TEXT PRIMARY KEY,
+    root_task_id             TEXT NOT NULL UNIQUE,
+    origin_session_id        TEXT NOT NULL,
+    origin_message_id        TEXT NOT NULL,
+    kind                     TEXT NOT NULL DEFAULT 'origin_request',
+    responsible_agent        TEXT NOT NULL,
+    status                   TEXT NOT NULL DEFAULT 'active',
+    created_at               INTEGER NOT NULL,
+    checkpoint_at            INTEGER NOT NULL,
+    updated_at               INTEGER NOT NULL,
+    max_leaf_launches        INTEGER NOT NULL,
+    max_concurrent_leaf      INTEGER NOT NULL,
+    max_model_calls          INTEGER NOT NULL,
+    final_model_call_reserve INTEGER NOT NULL,
+    max_transient_retries    INTEGER NOT NULL,
+    leaf_launches_used       INTEGER NOT NULL DEFAULT 0,
+    model_calls_used         INTEGER NOT NULL DEFAULT 0,
+    transient_retries_used   INTEGER NOT NULL DEFAULT 0,
+    manager_handoffs         INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (origin_session_id, origin_message_id)
+);
+
+-- Idempotent settlement of physical provider attempts observed by a gateway
+-- turn before it discovered or accepted its durable coordination root.
+CREATE TABLE IF NOT EXISTS coordination_acceptance_debits (
+    request_root_id TEXT NOT NULL,
+    acceptance_scope_id TEXT NOT NULL,
+    model_calls INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (request_root_id, acceptance_scope_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1536,6 +1676,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_coordination_root_task ON coordination_requests(root_task_id);
 """
 
 
@@ -2688,6 +2829,30 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "request_root_id" not in cols:
+        # Explicit accepted-request identity. NULL keeps every legacy and
+        # ordinary task outside request-wide coordination policy.
+        _add_column_if_missing(
+            conn, "tasks", "request_root_id", "request_root_id TEXT"
+        )
+
+    coordination_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'coordination_requests'"
+    ).fetchone() is not None
+    if coordination_table_exists:
+        coordination_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(coordination_requests)")
+        }
+        if "kind" not in coordination_cols:
+            _add_column_if_missing(
+                conn,
+                "coordination_requests",
+                "kind",
+                "kind TEXT NOT NULL DEFAULT 'origin_request'",
+            )
+
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
         # blocks. Existing blocked rows get NULL, which is treated as a
@@ -2717,6 +2882,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_request_root "
+        "ON tasks(request_root_id)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -3157,6 +3326,16 @@ def _new_task_id() -> str:
     return "t_" + secrets.token_hex(4)
 
 
+def coordination_request_id(origin_session_id: str, origin_message_id: str) -> str:
+    """Return a stable opaque identity for one accepted origin message."""
+    session = str(origin_session_id or "").strip()
+    message = str(origin_message_id or "").strip()
+    if not session or not message:
+        raise ValueError("coordination origin requires session_id and message_id")
+    digest = hashlib.sha256(f"{session}\0{message}".encode()).hexdigest()[:24]
+    return f"cr_{digest}"
+
+
 def _claimer_id() -> str:
     """Return a ``host:pid`` string that identifies this claimer."""
     import socket
@@ -3224,6 +3403,35 @@ def _require_operational_assignee(assignee: Optional[str]) -> None:
         )
 
 
+def _inherited_coordination_root(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: Optional[str],
+    parents: Iterable[str],
+) -> Optional[str]:
+    """Resolve one root from authoritative task relationships only."""
+    parent_ids = tuple(dict.fromkeys(str(value) for value in parents if value))
+    source_id = str(source_task_id or "").strip() or None
+    task_ids = tuple(dict.fromkeys((*parent_ids, *((source_id,) if source_id else ()))))
+    if not task_ids:
+        return None
+    placeholders = ",".join("?" * len(task_ids))
+    rows = conn.execute(
+        f"SELECT id, request_root_id FROM tasks WHERE id IN ({placeholders})",
+        task_ids,
+    ).fetchall()
+    if source_id and source_id not in {row["id"] for row in rows}:
+        raise ValueError(f"unknown coordination source task: {source_id}")
+    roots = {
+        str(row["request_root_id"])
+        for row in rows
+        if row["request_root_id"]
+    }
+    if len(roots) > 1:
+        raise ValueError("task relationships span multiple coordination requests")
+    return next(iter(roots), None)
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3252,6 +3460,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    coordination_source_task_id: Optional[str] = None,
+    coordination_origin_message_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3291,6 +3501,10 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``coordination_source_task_id`` is the authoritative currently executing
+    task, when present. Its accepted request root and any parent roots must
+    agree; the root is inherited internally and is not a model-tool argument.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3417,6 +3631,11 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    request_root_id = _inherited_coordination_root(
+        conn,
+        source_task_id=coordination_source_task_id,
+        parents=parents,
+    )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3567,8 +3786,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, request_root_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3594,6 +3813,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        request_root_id,
                     ),
                 )
                 for pid in parents:
@@ -3622,8 +3842,39 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "request_root_id": request_root_id,
+                        "coordination_origin_message_id": (
+                            str(coordination_origin_message_id)
+                            if coordination_origin_message_id else None
+                        ),
                     },
                 )
+                if (
+                    request_root_id
+                    and assignee
+                    and coordination_execution_role(assignee) == "manager"
+                ):
+                    request = get_coordination_request(conn, request_root_id)
+                    if request is None:
+                        raise ValueError(
+                            f"unknown coordination request root: {request_root_id}"
+                        )
+                    conn.execute(
+                        "UPDATE coordination_requests "
+                        "SET manager_handoffs = manager_handoffs + 1, updated_at = ? "
+                        "WHERE id = ?",
+                        (now, request_root_id),
+                    )
+                    _append_event(
+                        conn,
+                        request.root_task_id,
+                        "coordination_manager_handoff",
+                        {
+                            "request_root_id": request_root_id,
+                            "task_id": task_id,
+                            "assignee": assignee,
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -3701,6 +3952,1592 @@ def _inherit_notify_subs(
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
+
+
+def get_coordination_request(
+    conn: sqlite3.Connection,
+    request_root_id: str,
+) -> Optional[CoordinationRequest]:
+    row = conn.execute(
+        "SELECT * FROM coordination_requests WHERE id = ?",
+        (request_root_id,),
+    ).fetchone()
+    return CoordinationRequest.from_row(row) if row else None
+
+
+def _coordination_final_route(
+    conn: sqlite3.Connection,
+    root_task_id: str,
+) -> dict[str, Any]:
+    """Return the one durable user-return route for an accepted root."""
+    routes = list_notify_subs(conn, root_task_id)
+    if (
+        len(routes) != 1
+        or routes[0].get("delivery_mode") not in {"wake", "notify+wake"}
+    ):
+        raise ValueError(
+            "coordination root requires exactly one wake-capable final route"
+        )
+    return routes[0]
+
+
+def create_coordination_request(
+    conn: sqlite3.Connection,
+    *,
+    root_task_id: str,
+    origin_session_id: str,
+    origin_message_id: str,
+    max_leaf_launches: int = DEFAULT_COORDINATION_MAX_LEAF_LAUNCHES,
+    max_concurrent_leaf: int = DEFAULT_COORDINATION_MAX_CONCURRENT_LEAF,
+    max_model_calls: int = DEFAULT_COORDINATION_MAX_MODEL_CALLS,
+    final_model_call_reserve: int = DEFAULT_COORDINATION_FINAL_CALL_RESERVE,
+    checkpoint_seconds: int = DEFAULT_COORDINATION_CHECKPOINT_SECONDS,
+    max_transient_retries: int = DEFAULT_COORDINATION_MAX_TRANSIENT_RETRIES,
+    acceptance_scope_id: str = "",
+    accepting_model_calls: int = 0,
+    organization=None,
+    now: Optional[int] = None,
+) -> CoordinationRequest:
+    """Accept one explicit asynchronous request with one valid final route."""
+    session_id = str(origin_session_id or "").strip()
+    message_id = str(origin_message_id or "").strip()
+    request_id = coordination_request_id(session_id, message_id)
+    root = get_task(conn, root_task_id)
+    if root is None:
+        raise ValueError(f"unknown coordination root task: {root_task_id}")
+    if not root.session_id or root.session_id != session_id:
+        raise ValueError("coordination root task must retain the origin session_id")
+
+    _coordination_final_route(conn, root_task_id)
+
+    from hermes_cli.workforce_org import load_organization
+
+    org = organization or load_organization()
+    if not root.assignee:
+        raise ValueError("coordination root requires a responsible assignee")
+    responsible = org.validate_execution_profile(root.assignee).agent
+
+    values = {
+        "max_leaf_launches": max_leaf_launches,
+        "max_concurrent_leaf": max_concurrent_leaf,
+        "max_model_calls": max_model_calls,
+        "checkpoint_seconds": checkpoint_seconds,
+    }
+    parsed: dict[str, int] = {}
+    for name, value in values.items():
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a positive integer")
+        try:
+            parsed[name] = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a positive integer") from exc
+        if parsed[name] <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if isinstance(max_transient_retries, bool):
+        raise ValueError("max_transient_retries must be a non-negative integer")
+    try:
+        parsed["max_transient_retries"] = int(max_transient_retries)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "max_transient_retries must be a non-negative integer"
+        ) from exc
+    if parsed["max_transient_retries"] < 0:
+        raise ValueError("max_transient_retries must be a non-negative integer")
+    if isinstance(accepting_model_calls, bool):
+        raise ValueError("accepting_model_calls must be a non-negative integer")
+    try:
+        accepted_calls = int(accepting_model_calls)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "accepting_model_calls must be a non-negative integer"
+        ) from exc
+    if accepted_calls < 0:
+        raise ValueError("accepting_model_calls must be a non-negative integer")
+    scope_id = str(acceptance_scope_id or "").strip()
+    if accepted_calls and not scope_id:
+        raise ValueError(
+            "acceptance_scope_id is required when accepting_model_calls is nonzero"
+        )
+    if len(scope_id) > 200:
+        raise ValueError("acceptance_scope_id is too long")
+    if isinstance(final_model_call_reserve, bool):
+        raise ValueError("final_model_call_reserve must be a positive integer")
+    try:
+        reserve = int(final_model_call_reserve)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("final_model_call_reserve must be a positive integer") from exc
+    if reserve <= 0 or reserve >= parsed["max_model_calls"]:
+        raise ValueError("final_model_call_reserve must be below max_model_calls")
+    if accepted_calls > parsed["max_model_calls"] - reserve:
+        raise ValueError(
+            "accepting turn already exceeds the coordination work-call budget"
+        )
+
+    existing = conn.execute(
+        "SELECT * FROM coordination_requests "
+        "WHERE origin_session_id = ? AND origin_message_id = ?",
+        (session_id, message_id),
+    ).fetchone()
+    if existing is not None:
+        request = CoordinationRequest.from_row(existing)
+        if request.root_task_id != root_task_id:
+            raise ValueError("origin message already belongs to another request root")
+        settle_coordination_acceptance_calls(
+            conn, request.id, scope_id, accepted_calls
+        )
+        return get_coordination_request(conn, request.id) or request
+
+    created_at = int(time.time() if now is None else now)
+    checkpoint_at = created_at + parsed["checkpoint_seconds"]
+    with write_txn(conn, allow_nested=True):
+        inserted = conn.execute(
+            """
+            INSERT OR IGNORE INTO coordination_requests (
+                id, root_task_id, origin_session_id, origin_message_id,
+                kind, responsible_agent, status,
+                created_at, checkpoint_at, updated_at,
+                max_leaf_launches, max_concurrent_leaf, max_model_calls,
+                final_model_call_reserve, max_transient_retries
+            ) VALUES (?, ?, ?, ?, 'origin_request', ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id, root_task_id, session_id, message_id, responsible,
+                created_at, checkpoint_at, created_at,
+                parsed["max_leaf_launches"], parsed["max_concurrent_leaf"],
+                parsed["max_model_calls"], reserve,
+                parsed["max_transient_retries"],
+            ),
+        )
+        if inserted.rowcount != 1:
+            raced = conn.execute(
+                "SELECT * FROM coordination_requests "
+                "WHERE origin_session_id = ? AND origin_message_id = ?",
+                (session_id, message_id),
+            ).fetchone()
+            if raced is None:
+                raise ValueError("root task already belongs to another request")
+            request = CoordinationRequest.from_row(raced)
+            if request.root_task_id != root_task_id:
+                raise ValueError("origin message already belongs to another request root")
+            settle_coordination_acceptance_calls(
+                conn, request.id, scope_id, accepted_calls
+            )
+            return get_coordination_request(conn, request.id) or request
+        updated = conn.execute(
+            "UPDATE tasks SET request_root_id = ? WHERE id = ? "
+            "AND (request_root_id IS NULL OR request_root_id = ?)",
+            (request_id, root_task_id, request_id),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("root task already belongs to another coordination request")
+        adopted: list[str] = []
+        candidates = conn.execute(
+            "SELECT t.id, t.assignee, t.status, t.claim_lock, t.current_run_id, "
+            "EXISTS(SELECT 1 FROM task_runs r WHERE r.task_id = t.id) AS has_run, "
+            "e.payload "
+            "FROM tasks t JOIN task_events e ON e.task_id = t.id "
+            "WHERE t.session_id = ? AND t.request_root_id IS NULL "
+            "AND e.kind = 'created'",
+            (session_id,),
+        ).fetchall()
+        for candidate in candidates:
+            try:
+                created_payload = json.loads(candidate["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(created_payload, dict)
+                or created_payload.get("coordination_origin_message_id") != message_id
+            ):
+                continue
+            if (
+                candidate["status"] == "running"
+                or candidate["claim_lock"] is not None
+                or candidate["current_run_id"] is not None
+                or bool(candidate["has_run"])
+            ):
+                raise ValueError(
+                    "same-origin task already launched before coordination acceptance"
+                )
+            changed = conn.execute(
+                "UPDATE tasks SET request_root_id = ? "
+                "WHERE id = ? AND request_root_id IS NULL",
+                (request_id, candidate["id"]),
+            )
+            if changed.rowcount != 1:
+                continue
+            adopted.append(candidate["id"])
+            _append_event(
+                conn,
+                candidate["id"],
+                "coordination_request_adopted",
+                {
+                    "request_root_id": request_id,
+                    "origin_session_id": session_id,
+                    "origin_message_id": message_id,
+                },
+            )
+            if (
+                candidate["assignee"]
+                and coordination_execution_role(
+                    candidate["assignee"], organization=org
+                ) == "manager"
+            ):
+                conn.execute(
+                    "UPDATE coordination_requests "
+                    "SET manager_handoffs = manager_handoffs + 1, updated_at = ? "
+                    "WHERE id = ?",
+                    (created_at, request_id),
+                )
+        _append_event(
+            conn,
+            root_task_id,
+            "coordination_request_accepted",
+            {
+                "request_root_id": request_id,
+                "origin_session_id": session_id,
+                "origin_message_id": message_id,
+                "responsible_agent": responsible,
+                "checkpoint_at": checkpoint_at,
+                "max_leaf_launches": parsed["max_leaf_launches"],
+                "max_concurrent_leaf": parsed["max_concurrent_leaf"],
+                "max_model_calls": parsed["max_model_calls"],
+                "accepting_model_calls": accepted_calls,
+                "final_model_call_reserve": reserve,
+                "max_transient_retries": parsed["max_transient_retries"],
+                "adopted_same_origin_tasks": adopted,
+            },
+        )
+        settle_coordination_acceptance_calls(
+            conn, request_id, scope_id, accepted_calls
+        )
+    request = get_coordination_request(conn, request_id)
+    if request is None:  # pragma: no cover - protected by the transaction
+        raise RuntimeError("coordination request insert did not persist")
+    return request
+
+
+def settle_coordination_acceptance_calls(
+    conn: sqlite3.Connection,
+    request_root_id: str,
+    acceptance_scope_id: str,
+    accepting_model_calls: int,
+    *,
+    now: Optional[int] = None,
+) -> int:
+    """Idempotently settle a turn's cumulative pre-acceptance provider calls."""
+    if isinstance(accepting_model_calls, bool):
+        raise ValueError("accepting_model_calls must be a non-negative integer")
+    try:
+        observed = int(accepting_model_calls)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "accepting_model_calls must be a non-negative integer"
+        ) from exc
+    if observed < 0:
+        raise ValueError("accepting_model_calls must be a non-negative integer")
+    scope_id = str(acceptance_scope_id or "").strip()
+    if observed and not scope_id:
+        raise ValueError(
+            "acceptance_scope_id is required when accepting_model_calls is nonzero"
+        )
+    if len(scope_id) > 200:
+        raise ValueError("acceptance_scope_id is too long")
+
+    timestamp = int(time.time() if now is None else now)
+    with write_txn(conn, allow_nested=True):
+        request = get_coordination_request(conn, request_root_id)
+        if request is None:
+            raise ValueError(f"unknown coordination request: {request_root_id}")
+        if not scope_id:
+            return request.model_calls_used
+        prior = conn.execute(
+            "SELECT model_calls FROM coordination_acceptance_debits "
+            "WHERE request_root_id = ? AND acceptance_scope_id = ?",
+            (request.id, scope_id),
+        ).fetchone()
+        prior_calls = int(prior["model_calls"]) if prior is not None else 0
+        if observed <= prior_calls:
+            return request.model_calls_used
+        delta = observed - prior_calls
+        updated_calls = request.model_calls_used + delta
+        conn.execute(
+            "INSERT INTO coordination_acceptance_debits "
+            "(request_root_id, acceptance_scope_id, model_calls, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(request_root_id, acceptance_scope_id) DO UPDATE SET "
+            "model_calls = excluded.model_calls, updated_at = excluded.updated_at",
+            (request.id, scope_id, observed, timestamp, timestamp),
+        )
+        conn.execute(
+            "UPDATE coordination_requests SET model_calls_used = ?, updated_at = ? "
+            "WHERE id = ?",
+            (updated_calls, timestamp, request.id),
+        )
+        _append_event(
+            conn,
+            request.root_task_id,
+            "coordination_acceptance_calls_settled",
+            {
+                "request_root_id": request.id,
+                "acceptance_scope_id": scope_id,
+                "observed_calls": observed,
+                "settled_delta": delta,
+                "model_calls_used": updated_calls,
+            },
+        )
+        work_limit = request.max_model_calls - request.final_model_call_reserve
+        if updated_calls > work_limit and request.status == "active":
+            changed = conn.execute(
+                "UPDATE coordination_requests SET status = 'return_pending', "
+                "updated_at = ? WHERE id = ? AND status = 'active'",
+                (timestamp, request.id),
+            )
+            if changed.rowcount:
+                _append_event(
+                    conn,
+                    request.root_task_id,
+                    "coordination_guardrail_reached",
+                    {
+                        "request_root_id": request.id,
+                        "task_id": request.root_task_id,
+                        "responsible_agent": request.responsible_agent,
+                        "origin_session_id": request.origin_session_id,
+                        "origin_message_id": request.origin_message_id,
+                        "reason": (
+                            "concurrent accepting turns exhausted the work "
+                            "model-call budget"
+                        ),
+                        "status": "return_pending",
+                    },
+                )
+    return updated_calls
+
+
+def create_owned_failure_coordination_request(
+    conn: sqlite3.Connection,
+    *,
+    root_task_id: str,
+    organization=None,
+    now: Optional[int] = None,
+) -> CoordinationRequest:
+    """Attach fixed aggregate caps to one typed operational-failure handoff.
+
+    This trusted factory is deliberately narrower than user-origin acceptance:
+    it accepts only the health monitor's ``owned_operational_failure`` shape,
+    has no user delivery route, and exposes no caller-controlled limits.
+    """
+    root = get_task(conn, root_task_id)
+    if root is None:
+        raise ValueError(f"unknown owned-failure root task: {root_task_id}")
+    try:
+        handoff = json.loads(root.body or "{}")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("owned-failure root must be a structured handoff") from exc
+    context = handoff.get("context") if isinstance(handoff, dict) else None
+    if (
+        not isinstance(handoff, dict)
+        or handoff.get("kind") != "workforce_handoff"
+        or handoff.get("state") != "pending_acknowledgment"
+        or handoff.get("requires_source_acceptance") is not True
+        or not isinstance(context, dict)
+        or context.get("kind") != "owned_operational_failure"
+    ):
+        raise ValueError(
+            "internal coordination requires a pending owned_operational_failure handoff"
+        )
+
+    from hermes_cli.workforce_org import load_organization
+
+    org = organization or load_organization()
+    target = org.validate_execution_profile(
+        str(handoff.get("target_agent") or "")
+    ).agent
+    source = org.validate_execution_profile(
+        str(handoff.get("source_agent") or "")
+    ).agent
+    if _canonical_assignee(root.assignee) != _canonical_assignee(target):
+        raise ValueError("owned-failure task assignee does not match handoff target")
+    if _canonical_assignee(str(context.get("technical_owner") or "")) != target:
+        raise ValueError("owned-failure context technical_owner does not match target")
+    if _canonical_assignee(str(context.get("director") or "")) != source:
+        raise ValueError("owned-failure context director does not match source")
+
+    origin_session_id = "internal:owned_operational_failure"
+    origin_message_id = root_task_id
+    request_id = coordination_request_id(origin_session_id, origin_message_id)
+    if root.request_root_id:
+        existing = get_coordination_request(conn, root.request_root_id)
+        if (
+            existing is None
+            or existing.id != request_id
+            or existing.kind != "owned_operational_failure"
+        ):
+            raise ValueError("owned-failure task already belongs to another request")
+        return existing
+
+    timestamp = int(time.time() if now is None else now)
+    checkpoint_at = timestamp + INTERNAL_FAILURE_CHECKPOINT_SECONDS
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            """
+            INSERT INTO coordination_requests (
+                id, root_task_id, origin_session_id, origin_message_id, kind,
+                responsible_agent, status, created_at, checkpoint_at, updated_at,
+                max_leaf_launches, max_concurrent_leaf, max_model_calls,
+                final_model_call_reserve, max_transient_retries
+            ) VALUES (?, ?, ?, ?, 'owned_operational_failure', ?, 'active',
+                      ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                root_task_id,
+                origin_session_id,
+                origin_message_id,
+                target,
+                timestamp,
+                checkpoint_at,
+                timestamp,
+                INTERNAL_FAILURE_MAX_LEAF_LAUNCHES,
+                INTERNAL_FAILURE_MAX_CONCURRENT_LEAF,
+                INTERNAL_FAILURE_MAX_MODEL_CALLS,
+                INTERNAL_FAILURE_TERMINAL_REVIEW_RESERVE,
+                INTERNAL_FAILURE_MAX_TRANSIENT_RETRIES,
+            ),
+        )
+        updated = conn.execute(
+            "UPDATE tasks SET request_root_id = ? "
+            "WHERE id = ? AND request_root_id IS NULL",
+            (request_id, root_task_id),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("owned-failure task changed during coordination acceptance")
+        _append_event(
+            conn,
+            root_task_id,
+            "coordination_internal_request_accepted",
+            {
+                "request_root_id": request_id,
+                "kind": "owned_operational_failure",
+                "responsible_agent": target,
+                "director": source,
+                "workflow_id": context.get("workflow_id"),
+                "failure_event_id": context.get("event_id"),
+                "checkpoint_at": checkpoint_at,
+                "max_leaf_launches": INTERNAL_FAILURE_MAX_LEAF_LAUNCHES,
+                "max_concurrent_leaf": INTERNAL_FAILURE_MAX_CONCURRENT_LEAF,
+                "max_model_calls": INTERNAL_FAILURE_MAX_MODEL_CALLS,
+                "terminal_review_reserve": (
+                    INTERNAL_FAILURE_TERMINAL_REVIEW_RESERVE
+                ),
+                "max_transient_retries": (
+                    INTERNAL_FAILURE_MAX_TRANSIENT_RETRIES
+                ),
+            },
+        )
+    request = get_coordination_request(conn, request_id)
+    if request is None:  # pragma: no cover - protected by transaction
+        raise RuntimeError("owned-failure coordination request did not persist")
+    return request
+
+
+def coordination_execution_role(assignee: str, *, organization=None) -> str:
+    """Classify a launch from canonical roster data, never caller input."""
+    from hermes_cli.workforce_org import load_organization
+
+    org = organization or load_organization()
+    agent = org.validate_execution_profile(assignee)
+    function = (agent.function or "").casefold()
+    if agent.direct_reports:
+        return "manager"
+    if (
+        "reviewer" in function
+        or "quality assurance" in function
+        or re.search(r"\bqa\b", function)
+    ):
+        return "qa"
+    return "leaf"
+
+
+def coordination_launch_deferral_reason(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Return a healthy request-local launch deferral without mutating state."""
+    task = get_task(conn, task_id)
+    if task is None or not task.request_root_id:
+        return None
+    request = get_coordination_request(conn, task.request_root_id)
+    if (
+        request is not None
+        and request.kind == "origin_request"
+        and task.id == request.root_task_id
+    ):
+        return "origin root is reserved for the final return turn"
+    if (
+        request is None
+        or request.kind != "owned_operational_failure"
+        or task.id != request.root_task_id
+        or task.status != "review"
+    ):
+        return None
+    try:
+        handoff = json.loads(task.body or "{}")
+    except (TypeError, json.JSONDecodeError):
+        handoff = {}
+    if not _handoff_recovery_verification_is_current(conn, task.id, handoff):
+        return "terminal review awaits durable recovery verification"
+    return None
+
+
+def coordination_completion_blocker(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Return why a request root cannot enter its terminal aggregation yet."""
+    task = get_task(conn, task_id)
+    if task is None or not task.request_root_id:
+        return None
+    request = get_coordination_request(conn, task.request_root_id)
+    if request is None or request.root_task_id != task.id:
+        return None
+    if request.kind == "origin_request":
+        if request.status == "active":
+            return "coordination request has not entered final return"
+        if request.status != "return_pending":
+            return f"coordination request is {request.status}"
+    open_row = conn.execute(
+        "SELECT id, status FROM tasks WHERE request_root_id = ? AND id != ? "
+        "AND status NOT IN ('done', 'archived') "
+        "ORDER BY created_at, id LIMIT 1",
+        (request.id, task.id),
+    ).fetchone()
+    if open_row is None:
+        return None
+    return (
+        f"coordination cohort task {open_row['id']} is still "
+        f"{open_row['status']}"
+    )
+
+
+def _record_coordination_root_completion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    now: int,
+) -> None:
+    """Transition a completed request root to its one terminal delivery phase."""
+    task = get_task(conn, task_id)
+    if task is None or not task.request_root_id:
+        return
+    request = get_coordination_request(conn, task.request_root_id)
+    if request is None or request.root_task_id != task.id:
+        return
+    if request.kind == "origin_request":
+        return
+    changed = conn.execute(
+        "UPDATE coordination_requests SET status = 'completed', updated_at = ? "
+        "WHERE id = ? AND status IN ('active', 'return_pending')",
+        (now, request.id),
+    )
+    if changed.rowcount:
+        _append_event(
+            conn,
+            task.id,
+            "coordination_internal_request_completed",
+            {"request_root_id": request.id},
+        )
+
+
+def acknowledge_coordination_return(
+    conn: sqlite3.Connection,
+    request_root_id: str,
+    *,
+    event_id: int,
+    responsible_agent: str,
+    returned_message_id: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Acknowledge an exact, durably received final-return message once."""
+    message_id = str(returned_message_id or "").strip()
+    if not message_id:
+        raise ValueError("returned_message_id is required for final-return acknowledgment")
+    if isinstance(event_id, bool):
+        raise ValueError("coordination final return event_id must be an integer")
+    try:
+        parsed_event_id = int(event_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "coordination final return event_id must be an integer"
+        ) from exc
+    responsible = _canonical_assignee(responsible_agent)
+    timestamp = int(time.time() if now is None else now)
+    with write_txn(conn):
+        current = get_coordination_request(conn, request_root_id)
+        if current is not None and current.status == "completed":
+            prior = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'coordination_return_acknowledged' "
+                "ORDER BY id DESC LIMIT 1",
+                (current.root_task_id,),
+            ).fetchone()
+            try:
+                prior_payload = json.loads(prior["payload"] or "{}") if prior else {}
+            except (TypeError, json.JSONDecodeError):
+                prior_payload = {}
+            if (
+                isinstance(prior_payload, dict)
+                and prior_payload.get("request_root_id") == current.id
+                and int(prior_payload.get("event_id", -1)) == parsed_event_id
+                and _canonical_assignee(prior_payload.get("responsible_agent")) == responsible
+                and prior_payload.get("returned_message_id") == message_id
+            ):
+                return False
+            raise ValueError("coordination final return was already acknowledged differently")
+        request = validate_coordination_final_return_authority(
+            conn,
+            request_root_id=request_root_id,
+            task_id=current.root_task_id if current is not None else "",
+            event_id=parsed_event_id,
+            responsible_agent=responsible_agent,
+            require_terminal=True,
+        )
+        route = _coordination_final_route(conn, request.root_task_id)
+        changed = conn.execute(
+            "UPDATE coordination_requests SET status = 'completed', updated_at = ? "
+            "WHERE id = ? AND status = 'return_pending'",
+            (timestamp, request.id),
+        )
+        if changed.rowcount != 1:
+            return False
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = "
+            "CASE WHEN last_event_id < ? THEN ? ELSE last_event_id END "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (
+                parsed_event_id,
+                parsed_event_id,
+                request.root_task_id,
+                route["platform"],
+                route["chat_id"],
+                route.get("thread_id") or "",
+            ),
+        )
+        _append_event(
+            conn,
+            request.root_task_id,
+            "coordination_return_acknowledged",
+            {
+                "request_root_id": request.id,
+                "task_id": request.root_task_id,
+                "event_id": parsed_event_id,
+                "responsible_agent": request.responsible_agent,
+                "returned_message_id": message_id,
+            },
+        )
+    return True
+
+
+def begin_coordination_final_return_if_ready(
+    conn: sqlite3.Connection,
+    request_root_id: str,
+    *,
+    now: Optional[int] = None,
+) -> bool:
+    """Enter one successful final-return phase after a real cohort finishes."""
+    timestamp = int(time.time() if now is None else now)
+    with write_txn(conn):
+        request = get_coordination_request(conn, request_root_id)
+        if (
+            request is None
+            or request.kind != "origin_request"
+            or request.status != "active"
+        ):
+            return False
+        root = get_task(conn, request.root_task_id)
+        if root is None or root.status in {"done", "archived"}:
+            return False
+        cohort = conn.execute(
+            "SELECT status FROM tasks WHERE request_root_id = ? AND id != ?",
+            (request.id, request.root_task_id),
+        ).fetchall()
+        if (
+            not cohort
+            or any(row["status"] not in {"done", "archived"} for row in cohort)
+            or not _parents_satisfied(conn, request.root_task_id)
+        ):
+            return False
+        changed = conn.execute(
+            "UPDATE coordination_requests SET status = 'return_pending', "
+            "updated_at = ? WHERE id = ? AND status = 'active'",
+            (timestamp, request.id),
+        )
+        if changed.rowcount != 1:  # pragma: no cover - serialized invariant
+            return False
+        _append_event(
+            conn,
+            request.root_task_id,
+            "coordination_return_pending",
+            {
+                "request_root_id": request.id,
+                "task_id": request.root_task_id,
+                "responsible_agent": request.responsible_agent,
+                "origin_session_id": request.origin_session_id,
+                "origin_message_id": request.origin_message_id,
+                "status": "return_pending",
+                "reason": "cohort_completed",
+            },
+        )
+    return True
+
+
+def _coordination_route_is_owned(
+    route: Mapping[str, Any],
+    notifier_profiles: Optional[Iterable[str]],
+    *,
+    include_unowned: bool,
+) -> bool:
+    if notifier_profiles is None:
+        return True
+    profiles = {
+        str(profile).strip()
+        for profile in notifier_profiles
+        if str(profile).strip()
+    }
+    owner = str(route.get("notifier_profile") or "").strip()
+    return owner in profiles or (not owner and include_unowned)
+
+
+def _coordination_connection_path(conn: sqlite3.Connection) -> str:
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        name = row[1] if not isinstance(row, sqlite3.Row) else row["name"]
+        filename = row[2] if not isinstance(row, sqlite3.Row) else row["file"]
+        if name == "main" and filename:
+            return str(Path(filename).resolve())
+    return ""
+
+
+def has_coordination_tick_work(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+    notifier_profiles: Optional[Iterable[str]] = None,
+    include_unowned: bool = False,
+) -> bool:
+    """Cheap read-only probe for final-return or owned-failure intake work.
+
+    This is the notifier's pre-open gate. It never creates or migrates a DB,
+    and legacy boards without the coordination schema simply return ``False``.
+    """
+    path = Path(db_path) if db_path is not None else kanban_db_path(board=board)
+    if not path.exists():
+        return False
+    profiles = (
+        None
+        if notifier_profiles is None
+        else {
+            str(profile).strip()
+            for profile in notifier_profiles
+            if str(profile).strip()
+        }
+    )
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
+                "('coordination_requests', 'kanban_notify_subs', 'tasks')"
+            ).fetchall()
+        }
+        if {
+            "coordination_requests", "kanban_notify_subs", "tasks"
+        }.issubset(tables):
+            requests = conn.execute(
+                "SELECT id, root_task_id, responsible_agent FROM "
+                "coordination_requests WHERE kind = 'origin_request' "
+                "AND status IN ('active', 'return_pending')"
+            ).fetchall()
+            for request in requests:
+                if profiles is not None and request["responsible_agent"] not in profiles:
+                    continue
+                routes = conn.execute(
+                    "SELECT notifier_profile, delivery_mode FROM kanban_notify_subs "
+                    "WHERE task_id = ?",
+                    (request["root_task_id"],),
+                ).fetchall()
+                if len(routes) != 1 or routes[0]["delivery_mode"] not in {
+                    "wake", "notify+wake",
+                }:
+                    continue
+                if _coordination_route_is_owned(
+                    dict(routes[0]), profiles, include_unowned=include_unowned
+                ):
+                    return True
+
+            params: list[Any] = []
+            assignee_clause = ""
+            if profiles is not None:
+                if not profiles:
+                    return False
+                assignee_clause = (
+                    " AND assignee IN ("
+                    + ",".join("?" for _ in profiles)
+                    + ")"
+                )
+                params.extend(sorted(profiles))
+            candidates = conn.execute(
+                "SELECT assignee, body FROM tasks WHERE status = 'triage' "
+                "AND body LIKE '%\"kind\": \"workforce_handoff\"%'"
+                + assignee_clause,
+                params,
+            ).fetchall()
+            now = int(time.time())
+            for candidate in candidates:
+                try:
+                    payload = json.loads(candidate["body"] or "{}")
+                    context = payload.get("context")
+                    acknowledgment_deadline = int(
+                        payload.get("acknowledgment_deadline")
+                    )
+                    checkpoint_at = int(payload.get("checkpoint_at"))
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("kind") == "workforce_handoff"
+                    and payload.get("state") == "pending_acknowledgment"
+                    and payload.get("requires_source_acceptance") is True
+                    and isinstance(context, dict)
+                    and context.get("kind") == "owned_operational_failure"
+                    and str(payload.get("target_agent") or "").strip()
+                    == str(candidate["assignee"] or "").strip()
+                    and now <= acknowledgment_deadline < checkpoint_at
+                ):
+                    return True
+        return False
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
+def prepare_coordination_final_return_deliveries(
+    conn: sqlite3.Connection,
+    *,
+    notifier_profiles: Optional[Iterable[str]] = None,
+    include_unowned: bool = False,
+    now: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Transition and collect exact final-return obligations without claiming.
+
+    The returned subscription cursor is intentionally untouched. The durable
+    platform outbox owns deduplication until an exact receipt is passed to
+    :func:`acknowledge_coordination_return`, which atomically closes the
+    request and advances its sole route through the pending event.
+    """
+    timestamp = int(time.time() if now is None else now)
+    profiles = (
+        None
+        if notifier_profiles is None
+        else {
+            str(profile).strip()
+            for profile in notifier_profiles
+            if str(profile).strip()
+        }
+    )
+    rows = conn.execute(
+        "SELECT id FROM coordination_requests WHERE kind = 'origin_request' "
+        "AND status IN ('active', 'return_pending') ORDER BY created_at, id"
+    ).fetchall()
+    for row in rows:
+        request = get_coordination_request(conn, row["id"])
+        if request is None:
+            continue
+        if profiles is not None and request.responsible_agent not in profiles:
+            continue
+        try:
+            route = _coordination_final_route(conn, request.root_task_id)
+        except ValueError:
+            continue
+        if not _coordination_route_is_owned(
+            route, profiles, include_unowned=include_unowned
+        ):
+            continue
+        if request.status == "active":
+            if timestamp >= request.checkpoint_at:
+                mark_coordination_guardrail(
+                    conn,
+                    request.id,
+                    task_id=None,
+                    reason="elapsed checkpoint reached",
+                    now=timestamp,
+                )
+            else:
+                begin_coordination_final_return_if_ready(
+                    conn, request.id, now=timestamp
+                )
+
+    db_filename = _coordination_connection_path(conn)
+    deliveries: list[dict[str, Any]] = []
+    pending_rows = conn.execute(
+        "SELECT id FROM coordination_requests WHERE kind = 'origin_request' "
+        "AND status = 'return_pending' ORDER BY created_at, id"
+    ).fetchall()
+    for row in pending_rows:
+        request = get_coordination_request(conn, row["id"])
+        if request is None:
+            continue
+        if profiles is not None and request.responsible_agent not in profiles:
+            continue
+        try:
+            route = _coordination_final_route(conn, request.root_task_id)
+        except ValueError:
+            continue
+        if not _coordination_route_is_owned(
+            route, profiles, include_unowned=include_unowned
+        ):
+            continue
+        event_row = conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? AND kind IN "
+            "('coordination_return_pending', 'coordination_guardrail_reached') "
+            "ORDER BY id DESC LIMIT 1",
+            (request.root_task_id,),
+        ).fetchone()
+        if event_row is None:
+            continue
+        event_id = int(event_row["id"])
+        old_cursor = int(route.get("last_event_id") or 0)
+        if event_id <= old_cursor:
+            continue
+        try:
+            validate_coordination_final_return_authority(
+                conn,
+                request_root_id=request.id,
+                task_id=request.root_task_id,
+                event_id=event_id,
+                responsible_agent=request.responsible_agent,
+            )
+            event_payload = json.loads(event_row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        root = get_task(conn, request.root_task_id)
+        if root is None:
+            continue
+        deliveries.append({
+            "db_path": db_filename,
+            "request_root_id": request.id,
+            "task_id": request.root_task_id,
+            "event_id": event_id,
+            "event_kind": event_row["kind"],
+            "event_payload": event_payload,
+            "responsible_agent": request.responsible_agent,
+            "origin_session_id": request.origin_session_id,
+            "origin_message_id": request.origin_message_id,
+            "root_status": root.status,
+            "root_session_id": root.session_id,
+            "subscription": route,
+            "old_cursor": old_cursor,
+        })
+    return deliveries
+
+
+def validate_coordination_final_return_authority(
+    conn: sqlite3.Connection,
+    *,
+    request_root_id: str,
+    task_id: str,
+    event_id: int,
+    responsible_agent: str,
+    require_terminal: bool = False,
+) -> CoordinationRequest:
+    """Validate one trusted final-return event against current board state.
+
+    The durable authority/version is ``(request_root_id, event_id)``.  Gateway
+    code calls this once before admitting the wake turn and again with
+    ``require_terminal=True`` immediately before its visible final send.
+    """
+    request = get_coordination_request(conn, str(request_root_id or "").strip())
+    if (
+        request is None
+        or request.kind != "origin_request"
+        or request.status != "return_pending"
+    ):
+        raise ValueError("coordination final return is not pending")
+    if str(task_id or "").strip() != request.root_task_id:
+        raise ValueError("coordination final return task does not match request root")
+    responsible = _canonical_assignee(responsible_agent)
+    if not responsible or responsible != _canonical_assignee(request.responsible_agent):
+        raise ValueError("coordination final return responsible agent does not match")
+    root = get_task(conn, request.root_task_id)
+    if (
+        root is None
+        or root.request_root_id != request.id
+        or _canonical_assignee(root.assignee) != responsible
+        or root.status == "running"
+    ):
+        raise ValueError("coordination final return root task authority is stale")
+    if require_terminal and root.status not in {"done", "blocked", "archived"}:
+        raise ValueError("coordination final return root task is not terminal")
+    if isinstance(event_id, bool):
+        raise ValueError("coordination final return event_id must be an integer")
+    try:
+        parsed_event_id = int(event_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "coordination final return event_id must be an integer"
+        ) from exc
+    event = conn.execute(
+        "SELECT id, task_id, kind, payload FROM task_events WHERE id = ?",
+        (parsed_event_id,),
+    ).fetchone()
+    if (
+        event is None
+        or event["task_id"] != request.root_task_id
+        or event["kind"] not in {
+            "coordination_return_pending", "coordination_guardrail_reached",
+        }
+    ):
+        raise ValueError("coordination final return event does not match request root")
+    try:
+        payload = json.loads(event["payload"] or "{}")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("coordination final return event payload is malformed") from exc
+    if not isinstance(payload, dict) or any((
+        payload.get("request_root_id") != request.id,
+        payload.get("task_id") != request.root_task_id,
+        _canonical_assignee(payload.get("responsible_agent")) != responsible,
+        payload.get("origin_session_id") != request.origin_session_id,
+        payload.get("origin_message_id") != request.origin_message_id,
+        payload.get("status") != "return_pending",
+    )):
+        raise ValueError("coordination final return event payload is not authoritative")
+    latest = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? "
+        "AND kind IN ('coordination_return_pending', 'coordination_guardrail_reached') "
+        "ORDER BY id DESC LIMIT 1",
+        (request.root_task_id,),
+    ).fetchone()
+    if latest is None or int(latest["id"]) != parsed_event_id:
+        raise ValueError("coordination final return event is stale")
+    return request
+
+
+def reserve_coordination_launch(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    organization=None,
+    now: Optional[int] = None,
+) -> Optional[CoordinationLaunchReservation]:
+    """Reserve a ready/review launch before claim, enforcing request caps."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"unknown task: {task_id}")
+    if not task.request_root_id:
+        return None
+    if task.status not in {"ready", "review"}:
+        raise ValueError("coordination launch must be reserved before task claim")
+    if not task.assignee:
+        raise CoordinationBudgetExceeded(task.request_root_id, "task has no assignee")
+    if organization is None:
+        from hermes_cli.workforce_org import load_organization
+
+        organization = load_organization()
+    role = coordination_execution_role(task.assignee, organization=organization)
+    timestamp = int(time.time() if now is None else now)
+
+    with write_txn(conn, allow_nested=True):
+        request = get_coordination_request(conn, task.request_root_id)
+        if request is None:
+            raise CoordinationBudgetExceeded(task.request_root_id, "request root is missing")
+        terminal_internal_review = (
+            request.kind == "owned_operational_failure"
+            and task.id == request.root_task_id
+            and task.status == "review"
+        )
+        deferred_reason = coordination_launch_deferral_reason(conn, task.id)
+        if deferred_reason:
+            raise CoordinationLaunchDeferred(request.id, deferred_reason)
+        if request.status != "active" and not (
+            terminal_internal_review and request.status == "return_pending"
+        ):
+            raise CoordinationBudgetExceeded(request.id, f"request is {request.status}")
+        if timestamp >= request.checkpoint_at and not terminal_internal_review:
+            raise CoordinationBudgetExceeded(request.id, "elapsed checkpoint reached")
+
+        work_call_limit = request.max_model_calls - request.final_model_call_reserve
+        call_limit = request.max_model_calls if terminal_internal_review else work_call_limit
+        if request.model_calls_used >= call_limit:
+            reason = (
+                "aggregate model-call budget exhausted"
+                if terminal_internal_review
+                else "work model-call budget exhausted; final-return reserve preserved"
+            )
+            raise CoordinationBudgetExceeded(request.id, reason)
+
+        ordinal: Optional[int] = None
+        if role == "leaf":
+            running = conn.execute(
+                "SELECT assignee FROM tasks "
+                "WHERE request_root_id = ? AND status = 'running'",
+                (request.id,),
+            ).fetchall()
+            active_leaf = sum(
+                coordination_execution_role(row["assignee"], organization=organization)
+                == "leaf"
+                for row in running
+                if row["assignee"]
+            )
+            if active_leaf >= request.max_concurrent_leaf:
+                raise CoordinationLaunchDeferred(
+                    request.id, "leaf concurrency exhausted"
+                )
+            if request.leaf_launches_used >= request.max_leaf_launches:
+                raise CoordinationBudgetExceeded(request.id, "leaf launch budget exhausted")
+            ordinal = request.leaf_launches_used + 1
+            conn.execute(
+                "UPDATE coordination_requests "
+                "SET leaf_launches_used = leaf_launches_used + 1, updated_at = ? "
+                "WHERE id = ?",
+                (timestamp, request.id),
+            )
+        if not terminal_internal_review:
+            remaining = max(1, request.checkpoint_at - timestamp)
+            conn.execute(
+                "UPDATE tasks SET max_runtime_seconds = CASE "
+                "WHEN max_runtime_seconds IS NULL OR max_runtime_seconds > ? "
+                "THEN ? ELSE max_runtime_seconds END WHERE id = ?",
+                (remaining, remaining, task_id),
+            )
+        _append_event(
+            conn,
+            request.root_task_id,
+            "coordination_launch_reserved",
+            {
+                "request_root_id": request.id,
+                "task_id": task_id,
+                "role": role,
+                "leaf_launch_ordinal": ordinal,
+            },
+        )
+    return CoordinationLaunchReservation(request.id, role, ordinal)
+
+
+def claim_task_for_dispatch(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    review: bool = False,
+    ttl_seconds: Optional[int] = None,
+    organization=None,
+    now: Optional[int] = None,
+    board: Optional[str] = None,
+) -> tuple[Optional[Task], Optional[CoordinationLaunchReservation]]:
+    """Atomically reserve request capacity and claim one dispatchable task."""
+    claimed: Optional[Task] = None
+    reservation: Optional[CoordinationLaunchReservation] = None
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        expected_status = "review" if review else "ready"
+        if task is None or task.status != expected_status:
+            return None, None
+
+        # Let the canonical claim functions persist their structural rejection
+        # without consuming a request launch. Under BEGIN IMMEDIATE no writer
+        # can change these predicates before the nested claim executes.
+        if review:
+            if not _parents_satisfied(conn, task_id):
+                claim_review_task(
+                    conn,
+                    task_id,
+                    ttl_seconds=ttl_seconds,
+                    _allow_nested=True,
+                )
+                return None, None
+        elif _task_body_forbids_launch(task.body) or not _parents_satisfied(
+            conn, task_id
+        ):
+            claim_task(
+                conn,
+                task_id,
+                ttl_seconds=ttl_seconds,
+                _allow_nested=True,
+                _fire_lifecycle=False,
+            )
+            return None, None
+
+        reservation = reserve_coordination_launch(
+            conn,
+            task_id,
+            organization=organization,
+            now=now,
+        )
+        if review:
+            claimed = claim_review_task(
+                conn,
+                task_id,
+                ttl_seconds=ttl_seconds,
+                _allow_nested=True,
+            )
+        else:
+            claimed = claim_task(
+                conn,
+                task_id,
+                ttl_seconds=ttl_seconds,
+                _allow_nested=True,
+                _fire_lifecycle=False,
+            )
+        if claimed is None:  # pragma: no cover - serialized invariant guard
+            raise RuntimeError("dispatch claim changed inside serialized reservation")
+
+    if not review and claimed is not None:
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_claimed",
+            task_id,
+            board=board or get_current_board(),
+            assignee=claimed.assignee,
+            run_id=claimed.current_run_id,
+        )
+    return claimed, reservation
+
+
+def charge_coordination_model_call(
+    conn: sqlite3.Connection,
+    request_root_id: Optional[str],
+    *,
+    purpose: str = "work",
+    task_id: Optional[str] = None,
+    now: Optional[int] = None,
+) -> Optional[int]:
+    """Charge immediately before a physical provider attempt."""
+    if not request_root_id:
+        return None
+    if purpose not in {"work", "final_return", "terminal_review"}:
+        raise ValueError(
+            "coordination model-call purpose must be work, final_return, "
+            "or terminal_review"
+        )
+    timestamp = int(time.time() if now is None else now)
+    with write_txn(conn):
+        request = get_coordination_request(conn, request_root_id)
+        if request is None:
+            raise CoordinationBudgetExceeded(request_root_id, "request root is missing")
+        if not task_id:
+            raise CoordinationBudgetExceeded(
+                request.id, "physical call is missing trusted task attribution"
+            )
+        task = get_task(conn, task_id)
+        if task is None or task.request_root_id != request.id:
+            raise CoordinationBudgetExceeded(
+                request.id, "physical call task is outside the request cohort"
+            )
+        terminal_review_tail = (
+            purpose == "terminal_review"
+            and request.kind == "owned_operational_failure"
+            and task.id == request.root_task_id
+            and request.status == "completed"
+            and task.status == "done"
+            and task.current_run_id is None
+        )
+        if request.status not in {"active", "return_pending"} and not terminal_review_tail:
+            raise CoordinationBudgetExceeded(request.id, f"request is {request.status}")
+        if purpose == "work":
+            if request.status != "active":
+                raise CoordinationBudgetExceeded(
+                    request.id, "work is closed after finalization starts"
+                )
+            if timestamp >= request.checkpoint_at:
+                raise CoordinationBudgetExceeded(
+                    request.id, "elapsed checkpoint reached"
+                )
+        elif purpose == "final_return":
+            if (
+                request.kind != "origin_request"
+                or task.id != request.root_task_id
+                or request.status != "return_pending"
+            ):
+                raise CoordinationBudgetExceeded(
+                    request.id,
+                    "final_return requires the return-pending user root task",
+                )
+        else:
+            authorized_review = False
+            if (
+                request.kind == "owned_operational_failure"
+                and task.id == request.root_task_id
+                and (
+                    (task.status == "running" and task.current_run_id is not None)
+                    or terminal_review_tail
+                )
+            ):
+                try:
+                    handoff = json.loads(task.body or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    handoff = {}
+                source = _canonical_assignee(
+                    str(handoff.get("source_agent") or "")
+                )
+                if task.current_run_id is not None:
+                    run = conn.execute(
+                        "SELECT id, profile, status, outcome FROM task_runs "
+                        "WHERE id = ? AND task_id = ? AND status = 'running'",
+                        (int(task.current_run_id), task.id),
+                    ).fetchone()
+                else:
+                    run = conn.execute(
+                        "SELECT id, profile, status, outcome FROM task_runs "
+                        "WHERE task_id = ? AND status = 'done' "
+                        "AND outcome = 'completed' ORDER BY id DESC LIMIT 1",
+                        (task.id,),
+                    ).fetchone()
+                run_id = int(run["id"]) if run is not None else None
+                claimed_event = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? "
+                    "AND run_id = ? AND kind = 'claimed' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task.id, run_id),
+                ).fetchone()
+                completed_event = None
+                if terminal_review_tail and run_id is not None:
+                    completed_event = conn.execute(
+                        "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? "
+                        "AND kind = 'completed' LIMIT 1",
+                        (task.id, run_id),
+                    ).fetchone()
+                try:
+                    claimed_payload = (
+                        json.loads(claimed_event["payload"] or "{}")
+                        if claimed_event else {}
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    claimed_payload = {}
+                authorized_review = (
+                    source is not None
+                    and run is not None
+                    and _canonical_assignee(run["profile"]) == source
+                    and isinstance(claimed_payload, dict)
+                    and claimed_payload.get("source_status") == "review"
+                    and _handoff_recovery_verification_is_current(
+                        conn, task.id, handoff
+                    )
+                    and (not terminal_review_tail or completed_event is not None)
+                )
+            if not authorized_review:
+                raise CoordinationBudgetExceeded(
+                    request.id,
+                    "terminal_review requires the verified source review run",
+                )
+        limit = request.max_model_calls
+        if purpose == "work":
+            limit -= request.final_model_call_reserve
+        if request.model_calls_used >= limit:
+            reason = (
+                "aggregate model-call budget exhausted"
+                if purpose != "work"
+                else "work model-call budget exhausted; final-return reserve preserved"
+            )
+            raise CoordinationBudgetExceeded(request.id, reason)
+        ordinal = request.model_calls_used + 1
+        conn.execute(
+            "UPDATE coordination_requests "
+            "SET model_calls_used = model_calls_used + 1, updated_at = ? "
+            "WHERE id = ?",
+            (timestamp, request.id),
+        )
+        _append_event(
+            conn,
+            request.root_task_id,
+            "coordination_model_call_charged",
+            {
+                "request_root_id": request.id,
+                "task_id": task_id,
+                "purpose": purpose,
+                "ordinal": ordinal,
+            },
+        )
+    return ordinal
+
+
+def reserve_coordination_retry(
+    conn: sqlite3.Connection,
+    request_root_id: Optional[str],
+    *,
+    task_id: str,
+    classification: str,
+    cause_code: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Permit one classified transient retry; deterministic blocks never retry."""
+    if not request_root_id:
+        return True
+    if classification not in {"transient", "deterministic"}:
+        raise ValueError("retry classification must be transient or deterministic")
+    timestamp = int(time.time() if now is None else now)
+    with write_txn(conn):
+        return _reserve_coordination_retry_in_txn(
+            conn,
+            request_root_id,
+            task_id=task_id,
+            classification=classification,
+            cause_code=cause_code,
+            timestamp=timestamp,
+        )
+
+
+def _reserve_coordination_retry_in_txn(
+    conn: sqlite3.Connection,
+    request_root_id: str,
+    *,
+    task_id: str,
+    classification: str,
+    cause_code: str,
+    timestamp: int,
+) -> bool:
+    """Reserve a retry while the caller holds the task-state transaction."""
+    if classification == "deterministic":
+        return False
+    request = get_coordination_request(conn, request_root_id)
+    task = get_task(conn, task_id)
+    if (
+        request is None
+        or request.status != "active"
+        or task is None
+        or task.request_root_id != request.id
+    ):
+        return False
+    if timestamp >= request.checkpoint_at:
+        return False
+    if request.transient_retries_used >= request.max_transient_retries:
+        return False
+    ordinal = request.transient_retries_used + 1
+    conn.execute(
+        "UPDATE coordination_requests "
+        "SET transient_retries_used = transient_retries_used + 1, updated_at = ? "
+        "WHERE id = ?",
+        (timestamp, request.id),
+    )
+    _append_event(
+        conn,
+        request.root_task_id,
+        "coordination_retry_reserved",
+        {
+            "request_root_id": request.id,
+            "task_id": task_id,
+            "classification": classification,
+            "cause_code": str(cause_code)[:100],
+            "ordinal": ordinal,
+        },
+    )
+    return True
+
+
+def mark_coordination_guardrail(
+    conn: sqlite3.Connection,
+    request_root_id: str,
+    *,
+    task_id: Optional[str],
+    reason: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Move an active request to return-pending exactly once."""
+    timestamp = int(time.time() if now is None else now)
+    with write_txn(conn):
+        return _mark_coordination_guardrail_in_txn(
+            conn,
+            request_root_id,
+            task_id=task_id,
+            reason=reason,
+            timestamp=timestamp,
+        )
+
+
+def _mark_coordination_guardrail_in_txn(
+    conn: sqlite3.Connection,
+    request_root_id: str,
+    *,
+    task_id: Optional[str],
+    reason: str,
+    timestamp: int,
+) -> bool:
+    request = get_coordination_request(conn, request_root_id)
+    if request is None:
+        return False
+    changed = conn.execute(
+        "UPDATE coordination_requests SET status = 'return_pending', "
+        "updated_at = ? WHERE id = ? AND status = 'active'",
+        (timestamp, request_root_id),
+    )
+    if changed.rowcount != 1:
+        return False
+    _append_event(
+        conn,
+        request.root_task_id,
+        "coordination_guardrail_reached",
+        {
+            "request_root_id": request_root_id,
+            "task_id": request.root_task_id,
+            "trigger_task_id": task_id,
+            "responsible_agent": request.responsible_agent,
+            "origin_session_id": request.origin_session_id,
+            "origin_message_id": request.origin_message_id,
+            "reason": str(reason)[:300],
+            "status": "return_pending",
+        },
+    )
+    return True
+
+
+def _coordination_failure_retry_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    request_root_id: Optional[str],
+    classification: str,
+    cause_code: str,
+    timestamp: int,
+) -> Optional[bool]:
+    """Apply origin-request retry policy inside an existing failure txn."""
+    if not request_root_id:
+        return None
+    request = get_coordination_request(conn, request_root_id)
+    if request is None or request.kind != "origin_request":
+        return None
+    allowed = _reserve_coordination_retry_in_txn(
+        conn,
+        request.id,
+        task_id=task_id,
+        classification=classification,
+        cause_code=cause_code,
+        timestamp=timestamp,
+    )
+    if allowed:
+        return True
+    reason = (
+        f"deterministic worker failure: {cause_code}"
+        if classification == "deterministic"
+        else f"transient retry exhausted: {cause_code}"
+    )
+    _append_event(
+        conn,
+        request.root_task_id,
+        "coordination_retry_exhausted",
+        {
+            "request_root_id": request.id,
+            "task_id": task_id,
+            "classification": classification,
+            "cause_code": str(cause_code)[:100],
+        },
+    )
+    _mark_coordination_guardrail_in_txn(
+        conn,
+        request.id,
+        task_id=task_id,
+        reason=reason,
+        timestamp=timestamp,
+    )
+    return False
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
@@ -4757,6 +6594,8 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    _allow_nested: bool = False,
+    _fire_lifecycle: bool = True,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4766,7 +6605,7 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         guarded = conn.execute(
             "SELECT status, body FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -4888,13 +6727,14 @@ def claim_task(
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
-    _fire_kanban_lifecycle_hook(
-        "kanban_task_claimed",
-        task_id,
-        board=get_current_board(),
-        assignee=claimed.assignee if claimed else None,
-        run_id=run_id,
-    )
+    if _fire_lifecycle:
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_claimed",
+            task_id,
+            board=get_current_board(),
+            assignee=claimed.assignee if claimed else None,
+            run_id=run_id,
+        )
     return claimed
 
 
@@ -4904,6 +6744,7 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    _allow_nested: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4919,7 +6760,7 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -5519,7 +7360,7 @@ def _source_acceptance_handoff(body: Optional[str]) -> Optional[dict]:
     if (
         not isinstance(payload, dict)
         or payload.get("kind") != "workforce_handoff"
-        or not payload.get("requires_source_acceptance")
+        or payload.get("requires_source_acceptance") is not True
     ):
         return None
     return payload
@@ -5734,6 +7575,16 @@ def complete_task(
                 {"reason": "the latest owned failure has not passed its recovery gate"},
             )
         return False
+    coordination_blocker = coordination_completion_blocker(conn, task_id)
+    if coordination_blocker:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_coordination_cohort",
+                {"reason": coordination_blocker},
+            )
+        return False
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5782,6 +7633,8 @@ def complete_task(
         if handoff is not None and not _handoff_recovery_verification_is_current(
             conn, task_id, handoff
         ):
+            return False
+        if coordination_completion_blocker(conn, task_id):
             return False
         prior = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -5898,6 +7751,7 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        _record_coordination_root_completion(conn, task_id, now=now)
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -8533,6 +10387,12 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    coordination_deferred: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks left queued by a healthy request-local concurrency/recovery gate."""
+    coordination_guardrails: list[tuple[str, str, str]] = field(
+        default_factory=list
+    )
+    """``(task_id, request_root_id, reason)`` hard request guardrails reached."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9496,19 +11356,42 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
     # on top of the event we already emitted).
     #
-    # Protocol-violation crashes (clean exit, no terminal tool call) get a
-    # BOUNDED retry, not an immediate trip: empirically ~96% of these tasks
-    # complete on a later run (a goal-mode finalize nudge, or the model simply
-    # emitting kanban_complete/kanban_block next time), so blocking on the first
-    # occurrence just churned them through the respawn cycle. The retry budget
-    # is a violation-only streak (``_protocol_violation_streak``): earlier
-    # timeouts / nonzero exits neither consume nor extend it, and a
-    # below-budget violation does not tick the unified
-    # ``consecutive_failures`` counter, so the two budgets stay independent.
-    # A per-task ``max_retries`` overrides the violation bound with the same
-    # top precedence it has for every other failure kind. Systemic same-error
-    # crashes still trip immediately.
+    # Legacy protocol-violation crashes keep their existing bounded retry.
+    # Accepted origin requests treat that unchanged protocol breach as
+    # deterministic and stop immediately. Their rate-limit exits remain
+    # excluded from the generic failure counter, but still consume the root's
+    # one durable transient-retry allowance so a quota wall cannot starve the
+    # final return forever.
     auto_blocked: list[str] = []
+    for tid in rate_limited:
+        with write_txn(conn):
+            task = get_task(conn, tid)
+            decision = _coordination_failure_retry_in_txn(
+                conn,
+                task_id=tid,
+                request_root_id=task.request_root_id if task is not None else None,
+                classification="transient",
+                cause_code="rate_limited",
+                timestamp=int(time.time()),
+            )
+            if decision is False:
+                changed = conn.execute(
+                    "UPDATE tasks SET status = 'blocked' "
+                    "WHERE id = ? AND status IN ('ready', 'review')",
+                    (tid,),
+                )
+                if changed.rowcount:
+                    _append_event(
+                        conn,
+                        tid,
+                        "gave_up",
+                        {
+                            "trigger_outcome": "rate_limited",
+                            "coordination_retry_exhausted": True,
+                            "coordination_classification": "transient",
+                        },
+                    )
+                    auto_blocked.append(tid)
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
@@ -9517,6 +11400,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
         for tid, pid, claimer, protocol_violation, error_text in crash_details:
             if protocol_violation:
+                task = get_task(conn, tid)
+                request = (
+                    get_coordination_request(conn, task.request_root_id)
+                    if task is not None and task.request_root_id
+                    else None
+                )
+                if request is not None and request.kind == "origin_request":
+                    tripped = _record_task_failure(
+                        conn,
+                        tid,
+                        error=error_text,
+                        outcome="protocol_violation",
+                        release_claim=False,
+                        end_run=False,
+                        event_payload_extra={
+                            "pid": pid,
+                            "claimer": claimer,
+                            "protocol_violation": True,
+                        },
+                        coordination_classification="deterministic",
+                    )
+                    if tripped:
+                        auto_blocked.append(tid)
+                    continue
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
                     "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
@@ -9611,6 +11518,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    coordination_classification: str = "transient",
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -9657,10 +11565,14 @@ def _record_task_failure(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    if coordination_classification not in {"transient", "deterministic"}:
+        raise ValueError("invalid coordination failure classification")
     blocked = False
+    timestamp = int(time.time())
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, "
+            "request_root_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
@@ -9684,7 +11596,23 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
-        if force_trip or failures >= effective_limit:
+        coordination_retry = _coordination_failure_retry_in_txn(
+            conn,
+            task_id=task_id,
+            request_root_id=row["request_root_id"],
+            classification=coordination_classification,
+            cause_code=outcome,
+            timestamp=timestamp,
+        )
+        should_trip = force_trip or failures >= effective_limit
+        if coordination_retry is True:
+            # The accepted root owns the retry decision. A lower generic
+            # circuit-breaker threshold must not consume the retry it reserved.
+            should_trip = False
+        elif coordination_retry is False:
+            should_trip = True
+
+        if should_trip:
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
@@ -9728,6 +11656,11 @@ def _record_task_failure(
                 "trigger_outcome": outcome,
                 "retry_status": retry_status,
             }
+            if coordination_retry is False:
+                payload["coordination_retry_exhausted"] = True
+                payload["coordination_classification"] = (
+                    coordination_classification
+                )
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
@@ -9784,6 +11717,7 @@ def _record_spawn_failure(
     error: str,
     *,
     failure_limit: int = None,
+    coordination_classification: str = "transient",
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
@@ -9791,6 +11725,7 @@ def _record_spawn_failure(
         failure_limit=failure_limit,
         release_claim=True,
         end_run=True,
+        coordination_classification=coordination_classification,
     )
 
 
@@ -10608,6 +12543,8 @@ def _dispatch_once_locked(
             and _per_profile_running.get(assignee, 0) >= _per_profile_cap
         ):
             return False
+        if coordination_launch_deferral_reason(conn, row["id"]):
+            return False
         return check_respawn_guard(conn, row["id"], lane="review") is None
 
     reserved_review = next(
@@ -10635,6 +12572,37 @@ def _dispatch_once_locked(
         _default_assignee_resolved = (
             _resolve_dispatch_profile(_default_assignee) is not None
         )
+
+    def _claim_with_coordination(task_id: str, *, review: bool) -> Optional[Task]:
+        try:
+            claimed_task, _reservation = claim_task_for_dispatch(
+                conn,
+                task_id,
+                review=review,
+                ttl_seconds=ttl_seconds,
+                board=board,
+            )
+            return claimed_task
+        except CoordinationLaunchDeferred as exc:
+            result.coordination_deferred.append((task_id, exc.reason))
+            return None
+        except CoordinationBudgetExceeded as exc:
+            if exc.reason == "leaf concurrency exhausted":
+                result.coordination_deferred.append((task_id, exc.reason))
+                return None
+            if mark_coordination_guardrail(
+                conn,
+                exc.request_root_id,
+                task_id=task_id,
+                reason=exc.reason,
+            ):
+                result.coordination_guardrails.append(
+                    (task_id, exc.request_root_id, exc.reason)
+                )
+            else:
+                result.coordination_deferred.append((task_id, exc.reason))
+            return None
+
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
@@ -10768,7 +12736,7 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = _claim_with_coordination(row["id"], review=False)
         if claimed is None:
             continue
         try:
@@ -10781,6 +12749,7 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                coordination_classification="deterministic",
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -10901,9 +12870,17 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = _claim_with_coordination(row["id"], review=True)
         if claimed is None:
             continue
+        if claimed.request_root_id:
+            request = get_coordination_request(conn, claimed.request_root_id)
+            if (
+                request is not None
+                and request.kind == "owned_operational_failure"
+                and claimed.id == request.root_task_id
+            ):
+                claimed.coordination_purpose = "terminal_review"
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -10914,6 +12891,7 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                coordination_classification="deterministic",
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -11291,6 +13269,12 @@ def _default_spawn(
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    for key in (
+        "HERMES_COORDINATION_REQUEST_ROOT",
+        "HERMES_COORDINATION_TASK_ID",
+        "HERMES_COORDINATION_PURPOSE",
+    ):
+        env.pop(key, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -11375,6 +13359,12 @@ def _default_spawn(
     # board slug still forces it to the right directory.
     resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
+    if task.request_root_id:
+        env["HERMES_COORDINATION_REQUEST_ROOT"] = task.request_root_id
+        env["HERMES_COORDINATION_TASK_ID"] = task.id
+        env["HERMES_COORDINATION_PURPOSE"] = (
+            task.coordination_purpose or "work"
+        )
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
@@ -11988,7 +13978,7 @@ def add_notify_sub(
     insert_chat_type = chat_type or "dm"
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -12255,6 +14245,12 @@ def purge_stale_done_notify_subs(
             "DELETE FROM kanban_notify_subs WHERE task_id IN ("
             " SELECT t.id FROM tasks t"
             " WHERE t.status = 'done'"
+            " AND NOT EXISTS ("
+            "  SELECT 1 FROM coordination_requests cr"
+            "  WHERE cr.root_task_id = t.id"
+            "  AND cr.kind = 'origin_request'"
+            "  AND cr.status IN ('active', 'return_pending')"
+            " )"
             " AND COALESCE("
             "  (SELECT MAX(e.created_at) FROM task_events e"
             "   WHERE e.task_id = t.id),"
