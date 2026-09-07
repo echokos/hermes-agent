@@ -484,6 +484,68 @@ def test_execution_ledger_recovers_a_lost_append_and_requires_two_successes(
     assert next(iter(after_newer["ledger_cursors"].values()))["execution_id"] == "success-3"
 
 
+def test_scheduler_append_and_terminal_ledger_are_one_incident_event(tmp_path, monkeypatch):
+    from cron import executions, scheduler
+
+    organization, database, state, profile = _fixture(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", profile / "cron" / "executions.db")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: profile)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda *a, **kw: True)
+    monkeypatch.setattr(scheduler, "run_job", lambda *a, **kw: (False, "out", "", "timeout"))
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *a, **kw: "/tmp/out")
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *a, **kw: None)
+    job = {
+        "id": "job-1", "name": "Collector", "enabled": True,
+        "failure_ownership": {"technical_owner": "worker", "director": "aurora"},
+    }
+    (profile / "cron" / "jobs.json").write_text(json.dumps({"jobs": [job]}))
+    assert scheduler.run_one_job(job)
+    intake = json.loads((profile / "cron" / "operational-failures.jsonl").read_text())
+    terminal = executions.list_executions(job_id=job["id"])[0]
+    assert terminal["id"] == intake["execution_id"]
+    assert terminal["status"] == "failed"
+
+    result = run(organization=organization, database=database, state_path=state)
+    assert result["detected"] == 1
+    assert result["created"] == 1
+    assert result["attached"] == 0
+    assert run(organization=organization, database=database, state_path=state)["detected"] == 0
+
+
+def test_ledger_cursor_orders_dst_offsets_as_instants(tmp_path):
+    from scripts.workforce_health_monitor import _ledger_intake_events
+
+    _, _, _, profile = _fixture(tmp_path)
+    job = {
+        "id": "job-1",
+        "failure_ownership": {
+            "technical_owner": "worker", "director": "aurora",
+            "enabled_at": "2026-11-01T00:00:00-05:00",
+        },
+    }
+    with sqlite3.connect(profile / "cron" / "executions.db") as conn:
+        conn.execute(
+            "CREATE TABLE executions (id TEXT, job_id TEXT, status TEXT, finished_at TEXT, error TEXT)"
+        )
+        conn.execute("INSERT INTO executions VALUES (?,?,?,?,?)", (
+            "before-fallback", "job-1", "failed", "2026-11-01T01:59:00-05:00", "timeout",
+        ))
+    cursor = {}
+    assert len(_ledger_intake_events(profile, job, cursor)) == 1
+    with sqlite3.connect(profile / "cron" / "executions.db") as conn:
+        conn.executemany("INSERT INTO executions VALUES (?,?,?,?,?)", [
+            ("after-fallback", "job-1", "completed", "2026-11-01T01:01:00-06:00", None),
+            ("utc-later", "job-1", "completed", "2026-11-01T07:02:00+00:00", None),
+        ])
+    events = _ledger_intake_events(profile, job, cursor)
+    assert [event["execution_id"] for event in events] == ["after-fallback", "utc-later"]
+    assert _ledger_intake_events(profile, job, cursor) == []
+    assert [event["execution_id"] for event in _ledger_intake_events(profile, job, {})] == [
+        "before-fallback", "after-fallback", "utc-later",
+    ]
+
+
 def test_first_opt_in_bootstraps_healthy_without_reopening_old_failure(
     tmp_path: Path, monkeypatch,
 ):

@@ -175,8 +175,9 @@ def _ledger_intake_events(
                 "SELECT * FROM executions WHERE job_id = ? "
                 "AND status IN ('completed','failed','unknown') "
                 "AND finished_at IS NOT NULL "
-                "AND (finished_at > ? OR (finished_at = ? AND id > ?)) "
-                "ORDER BY finished_at, id LIMIT 256",
+                "AND (julianday(finished_at) > julianday(?) "
+                "OR (julianday(finished_at) = julianday(?) AND id > ?)) "
+                "ORDER BY julianday(finished_at), id LIMIT 256",
                 (job_id, finished_at, finished_at, execution_id),
             ).fetchall()
         else:
@@ -186,7 +187,7 @@ def _ledger_intake_events(
                     "AND status IN ('completed','failed','unknown') "
                     "AND finished_at IS NOT NULL "
                     "AND julianday(finished_at) >= julianday(?) "
-                    "ORDER BY finished_at, id LIMIT 256",
+                    "ORDER BY julianday(finished_at), id LIMIT 256",
                     (job_id, enabled_at),
                 ).fetchall()
             else:
@@ -194,7 +195,7 @@ def _ledger_intake_events(
                     "SELECT * FROM executions WHERE job_id = ? "
                     "AND status IN ('completed','failed','unknown') "
                     "AND finished_at IS NOT NULL "
-                    "ORDER BY finished_at DESC, id DESC LIMIT 1",
+                    "ORDER BY julianday(finished_at) DESC, id DESC LIMIT 1",
                     (job_id,),
                 ).fetchall()
     except sqlite3.Error:
@@ -350,15 +351,25 @@ def _event_already_processed(
     row: dict[str, Any], source_order: int, event_id: str,
 ) -> bool:
     watermark = int(row.get("last_processed_order") or -1)
-    return source_order < watermark or (
-        source_order == watermark
-        and event_id in row.get("last_processed_event_ids", [])
+    return (
+        source_order < watermark
+        or event_id in row.get("last_processed_event_ids", [])
+        or event_id in row.get("recent_processed_event_ids", [])
+        or event_id == row.get("episode_event_id")
+        or event_id in row.get("recovery_success_event_ids", [])
     )
 
 
 def _mark_event_processed(
     row: dict[str, Any], source_order: int, event_id: str,
 ) -> None:
+    # JSONL precedes ledger finalization, so the same stable ID can arrive
+    # later with a different timestamp. Retain a bounded overlap window across
+    # the ledger's 256-row pages, as well as the active episode IDs above.
+    recent_ids = row.setdefault("recent_processed_event_ids", [])
+    if event_id not in recent_ids:
+        recent_ids.append(event_id)
+    del recent_ids[:-512]
     watermark = int(row.get("last_processed_order") or -1)
     if source_order > watermark:
         row["last_processed_order"] = source_order

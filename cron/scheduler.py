@@ -7061,38 +7061,37 @@ def _run_one_job_body(
                 )
 
             operational_failure_event = None
-            if not success:
-                from cron.operational_failures import append_profile_failure
+            if isinstance(job.get("failure_ownership"), dict):
+                with _side_effect_fence() as owns_intake:
+                    if not owns_intake:
+                        raise _FireClaimLostDuringSideEffect
+                    if not success:
+                        from cron.operational_failures import append_profile_failure
 
-                try:
-                    operational_failure_event = append_profile_failure(
-                        _get_hermes_home(), job, error,
-                        execution_id=execution_id,
-                    )
-                except Exception:
-                    logger.error(
-                        "Job '%s': operational failure intake persistence failed",
-                        job["id"],
-                        exc_info=True,
-                    )
-                    # An opted-in operational job must never bypass its durable
-                    # intake with a direct chat alert.
-                    if isinstance(job.get("failure_ownership"), dict):
-                        operational_failure_event = {"intake_unavailable": True}
-            elif isinstance(job.get("failure_ownership"), dict):
-                # A recovery is its own ordered control-plane event. The
-                # monitor never infers recovery from an older failure plus
-                # current mutable job state.
-                from cron.operational_failures import append_profile_recovery
-                try:
-                    append_profile_recovery(
-                        _get_hermes_home(), job, execution_id=execution_id
-                    )
-                except Exception:
-                    logger.error(
-                        "Job '%s': operational recovery intake persistence failed",
-                        job["id"], exc_info=True,
-                    )
+                        try:
+                            operational_failure_event = append_profile_failure(
+                                _get_hermes_home(), job, error,
+                                execution_id=execution_id,
+                            )
+                        except Exception:
+                            logger.error(
+                                "Job '%s': operational failure intake persistence failed",
+                                job["id"], exc_info=True,
+                            )
+                            # Never bypass owned intake with a direct chat alert.
+                            operational_failure_event = {"intake_unavailable": True}
+                    else:
+                        from cron.operational_failures import append_profile_recovery
+
+                        try:
+                            append_profile_recovery(
+                                _get_hermes_home(), job, execution_id=execution_id
+                            )
+                        except Exception:
+                            logger.error(
+                                "Job '%s': operational recovery intake persistence failed",
+                                job["id"], exc_info=True,
+                            )
 
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
@@ -7348,12 +7347,14 @@ def _run_one_job_body(
             try:
                 from cron.operational_failures import append_profile_failure
 
-                append_profile_failure(
-                    _get_hermes_home(),
-                    job,
-                    _err_text,
-                    execution_id=execution_id,
-                )
+                with _side_effect_fence() as owns_intake:
+                    if owns_intake:
+                        append_profile_failure(
+                            _get_hermes_home(),
+                            job,
+                            _err_text,
+                            execution_id=execution_id,
+                        )
             except Exception:
                 # The terminal execution row below is the recovery source for
                 # the deterministic monitor. JSONL and SQLite are separate

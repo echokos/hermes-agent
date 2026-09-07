@@ -10,7 +10,10 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+import contextlib
 import json
+
+import pytest
 
 import cron.scheduler as s
 
@@ -549,6 +552,36 @@ def test_owned_exception_is_persisted_and_not_delivered(monkeypatch, tmp_path):
     intake = (tmp_path / "cron" / "operational-failures.jsonl").read_text().splitlines()
     assert len(intake) == 1
     assert "raised failure" in json.loads(intake[0])["sanitized_error"]
+
+
+@pytest.mark.parametrize("success,save_raises", [(True, False), (False, False), (True, True)])
+def test_owned_intake_is_fenced_after_fire_claim_takeover(
+    monkeypatch, tmp_path, success, save_raises,
+):
+    calls = _patch_pipeline(monkeypatch, success=success, error="timeout")
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(s, "heartbeat_fire_claim", lambda *a, **kw: True)
+    owns_claim = True
+
+    def save_after_takeover(*args):
+        nonlocal owns_claim
+        owns_claim = False
+        if save_raises:
+            raise RuntimeError("output failed after takeover")
+        return "/tmp/output"
+
+    monkeypatch.setattr(s, "save_job_output", save_after_takeover)
+    monkeypatch.setattr(
+        s, "fire_claim_fence", lambda *a, **kw: contextlib.nullcontext(owns_claim),
+    )
+    s.run_one_job({
+        "id": "owned-takeover", "name": "owned takeover",
+        "fire_claim": {"by": "old-worker"},
+        "failure_ownership": {"technical_owner": "root", "director": "aurora"},
+    })
+
+    assert not (tmp_path / "cron" / "operational-failures.jsonl").exists()
+    assert "deliver" not in [call[0] for call in calls]
 
 
 def test_run_one_job_operator_only_script_failure_skips_delivery(monkeypatch):
