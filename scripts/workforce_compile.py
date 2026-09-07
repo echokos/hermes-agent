@@ -16,6 +16,7 @@ from hermes_cli.workforce_org import WorkforceAgent, load_organization
 
 BEGIN = "<!-- BEGIN MANAGED WORKFORCE CONTRACT -->"
 END = "<!-- END MANAGED WORKFORCE CONTRACT -->"
+EXTERNALIZED = "<!-- MANAGED WORKFORCE CONTRACT: EXTERNALIZED -->"
 BLOCK_RE = re.compile(rf"{re.escape(BEGIN)}.*?{re.escape(END)}", re.DOTALL)
 PROTECTED = ("SOUL.md", "identity.md", "user.md")
 
@@ -95,6 +96,10 @@ def render_block(agent: WorkforceAgent, template: str, version: str) -> str:
 
 
 def insert_block(original: str, block: str) -> tuple[str, str]:
+    # A profile may retain the detailed generated contract as an on-demand
+    # reference while keeping its startup instructions compact.
+    if EXTERNALIZED in original:
+        return original, "preserve-externalized"
     if BLOCK_RE.search(original):
         return BLOCK_RE.sub(block, original), "replace"
     # First installation is purely additive: preserving the complete original
@@ -198,6 +203,11 @@ def compile_profiles(
             "source_sha256": source_hash,
             "candidate": str(candidate_path), "candidate_sha256": sha(candidate_path),
             "operation": operation,
+            "managed_contract_mode": (
+                "externalized-reference" if operation == "preserve-externalized"
+                else "embedded"
+            ),
+            "template_reconciliation_required": operation == "preserve-externalized",
             "original_instruction_preserved_as_exact_suffix": (
                 candidate.endswith(original)
                 if operation == "insert"
