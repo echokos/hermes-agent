@@ -1275,6 +1275,174 @@ def test_concurrent_origin_turns_inherit_only_their_own_coordination_root(
             assert child_task.request_root_id == root["request_root_id"]
 
 
+def test_same_origin_coordination_retry_returns_existing_root(
+    monkeypatch, worker_env,
+):
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "aurora")
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    set_session_vars(
+        platform="buzz",
+        chat_id="elliott-dm",
+        session_id="retry-session",
+        message_id="retry-message",
+        profile="aurora",
+    )
+    try:
+        first = json.loads(kt._handle_create({
+            "title": "original root",
+            "assignee": "aurora",
+            "report_to_origin": True,
+            "coordination": {},
+        }))
+        retry = json.loads(kt._handle_create({
+            "title": "model retried after uncertain reply",
+            "assignee": "aurora",
+            "report_to_origin": True,
+            "coordination": {},
+        }))
+    finally:
+        reset_session_vars()
+
+    assert retry["ok"] is True
+    assert retry["task_id"] == first["task_id"]
+    assert retry["request_root_id"] == first["request_root_id"]
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM coordination_requests"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE request_root_id = ?",
+            (first["request_root_id"],),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?",
+            (first["task_id"],),
+        ).fetchone()[0] == 1
+
+
+def test_concurrent_child_committed_before_root_is_adopted_by_origin_message(
+    monkeypatch, worker_env,
+):
+    import time
+    from threading import Barrier
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "aurora")
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    barrier = Barrier(2)
+
+    def invoke(payload: dict, delay: float) -> dict:
+        tokens = set_session_vars(
+            platform="buzz",
+            chat_id="shared-origin",
+            chat_type="dm",
+            user_id="elliott",
+            session_id="shared-session",
+            message_id="shared-message",
+            profile="aurora",
+        )
+        try:
+            barrier.wait(timeout=10)
+            time.sleep(delay)
+            return json.loads(kt._handle_create(payload))
+        finally:
+            clear_session_vars(tokens)
+
+    child_payload = {"title": "parallel child", "assignee": "sage"}
+    root_payload = {
+        "title": "parallel root",
+        "assignee": "aurora",
+        "report_to_origin": True,
+        "coordination": {},
+    }
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        child_future = pool.submit(invoke, child_payload, 0.0)
+        root_future = pool.submit(invoke, root_payload, 0.1)
+        child = child_future.result(timeout=20)
+        root = root_future.result(timeout=20)
+
+    with kb.connect() as conn:
+        adopted = kb.get_task(conn, child["task_id"])
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+            (child["task_id"],),
+        ).fetchall()
+    assert adopted.request_root_id == root["request_root_id"]
+    assert "coordination_request_adopted" in {row["kind"] for row in events}
+
+
+def test_coordinated_worker_cannot_escape_budget_on_another_board(
+    monkeypatch, worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.workforce_org import load_organization
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "aurora")
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    organization = load_organization()
+    with kb.connect_closing() as conn:
+        source = kb.create_task(
+            conn,
+            title="coordinated source",
+            assignee="aurora",
+            session_id="source-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=source,
+            platform="buzz",
+            chat_id="elliott-dm",
+            delivery_mode="wake",
+        )
+        kb.create_coordination_request(
+            conn,
+            root_task_id=source,
+            origin_session_id="source-session",
+            origin_message_id="source-message",
+            organization=organization,
+        )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", source)
+
+    rejected = json.loads(kt._handle_create({
+        "title": "cross-board escape",
+        "assignee": "sage",
+        "board": "other",
+    }))
+    assert "cannot create on another board" in rejected["error"]
+
+    with kb.connect_closing() as conn:
+        ordinary = kb.create_task(conn, title="ordinary source", assignee="sage")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", ordinary)
+    allowed = json.loads(kt._handle_create({
+        "title": "ordinary cross-board child",
+        "assignee": "sage",
+        "board": "other",
+    }))
+    assert allowed["ok"] is True
+    with kb.connect_closing(board="other") as conn:
+        assert kb.get_task(conn, allowed["task_id"]).request_root_id is None
+
+
 def test_create_subscribes_gateway_session_when_opted_in(
     monkeypatch, worker_env, tmp_path,
 ):

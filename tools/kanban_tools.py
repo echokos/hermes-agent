@@ -1550,6 +1550,10 @@ def _handle_create(args: dict, **kw) -> str:
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
     board = args.get("board")
+    if coordination is not None and board:
+        return tool_error(
+            "coordination roots must use the current canonical board"
+        )
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1571,68 +1575,37 @@ def _handle_create(args: dict, **kw) -> str:
                 coordination_source_task_id
                 and kb.get_task(conn, coordination_source_task_id) is None
             ):
-                # A worker may deliberately create on another board. Its task
-                # id is authoritative only inside the board that owns it.
+                # A worker may deliberately create on another board, but an
+                # accepted coordination root cannot be dropped at that board
+                # boundary. The originating board remains authoritative.
+                if board:
+                    with kb.connect_closing() as source_conn:
+                        source_task = kb.get_task(
+                            source_conn, coordination_source_task_id
+                        )
+                    if source_task is not None and source_task.request_root_id:
+                        raise ValueError(
+                            "coordinated workers cannot create on another board"
+                        )
                 coordination_source_task_id = None
-            if (
-                coordination is None
-                and not coordination_source_task_id
-                and authoritative_session_id
-                and message_id
-            ):
-                same_turn_request = kb.get_coordination_request(
-                    conn,
-                    kb.coordination_request_id(authoritative_session_id, message_id),
-                )
-                if same_turn_request is not None:
-                    coordination_source_task_id = same_turn_request.root_task_id
             request = None
             with kb.write_txn(conn):
-                new_tid = kb.create_task(
-                    conn,
-                    title=str(title).strip(),
-                    body=body,
-                    assignee=str(assignee),
-                    parents=tuple(parents),
-                    tenant=tenant,
-                    priority=int(priority) if priority is not None else 0,
-                    workspace_kind=str(workspace_kind),
-                    workspace_path=workspace_path,
-                    project_id=project_id,
-                    project_source_task_id=project_source_task_id,
-                    coordination_source_task_id=(
-                        None if coordination is not None
-                        else coordination_source_task_id
-                    ),
-                    triage=triage,
-                    idempotency_key=idempotency_key,
-                    max_runtime_seconds=(
-                        int(max_runtime_seconds)
-                        if max_runtime_seconds is not None else None
-                    ),
-                    skills=skills,
-                    model_override=model_override,
-                    provider_override=provider_override,
-                    goal_mode=goal_mode,
-                    goal_max_turns=(
-                        int(goal_max_turns) if goal_max_turns is not None else None
-                    ),
-                    initial_status=str(initial_status),
-                    created_by=os.environ.get("HERMES_PROFILE") or "worker",
-                    session_id=session_id,
-                )
-                new_task = kb.get_task(conn, new_tid)
-                subscribed = _maybe_auto_subscribe(
-                    conn,
-                    new_tid,
-                    explicit=report_to_origin,
-                    delivery_mode="wake" if report_to_origin else None,
-                )
-                if coordination is not None:
-                    if not subscribed:
-                        raise ValueError(
-                            "coordination root requires a persistent origin route"
+                same_turn_request = None
+                if authoritative_session_id and message_id:
+                    same_turn_request = kb.get_coordination_request(
+                        conn,
+                        kb.coordination_request_id(
+                            authoritative_session_id, message_id
+                        ),
+                    )
+                if coordination is None and not coordination_source_task_id:
+                    if same_turn_request is not None:
+                        coordination_source_task_id = (
+                            same_turn_request.root_task_id
                         )
+
+                org = None
+                if coordination is not None:
                     if not message_id:
                         raise ValueError(
                             "coordination root requires the origin message_id"
@@ -1652,14 +1625,87 @@ def _handle_create(args: dict, **kw) -> str:
                             "coordination root must be accepted and owned by the "
                             "current workforce manager"
                         )
-                    request = kb.create_coordination_request(
+
+                if coordination is not None and same_turn_request is not None:
+                    if same_turn_request.kind != "origin_request":
+                        raise ValueError(
+                            "origin is already scoped to a non-user request"
+                        )
+                    if same_turn_request.responsible_agent != target.agent:
+                        raise ValueError(
+                            "origin request already has a different responsible agent"
+                        )
+                    for name, requested_value in coordination.items():
+                        if getattr(same_turn_request, name) != requested_value:
+                            raise ValueError(
+                                f"origin request already has a different {name}"
+                            )
+                    request = same_turn_request
+                    new_tid = request.root_task_id
+                    new_task = kb.get_task(conn, new_tid)
+                    subscribed = conn.execute(
+                        "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? "
+                        "AND delivery_mode IN ('wake', 'notify+wake') LIMIT 1",
+                        (new_tid,),
+                    ).fetchone() is not None
+                else:
+                    new_tid = kb.create_task(
                         conn,
-                        root_task_id=new_tid,
-                        origin_session_id=str(session_id or ""),
-                        origin_message_id=str(message_id),
-                        organization=org,
-                        **coordination,
+                        title=str(title).strip(),
+                        body=body,
+                        assignee=str(assignee),
+                        parents=tuple(parents),
+                        tenant=tenant,
+                        priority=int(priority) if priority is not None else 0,
+                        workspace_kind=str(workspace_kind),
+                        workspace_path=workspace_path,
+                        project_id=project_id,
+                        project_source_task_id=project_source_task_id,
+                        coordination_source_task_id=(
+                            None if coordination is not None
+                            else coordination_source_task_id
+                        ),
+                        coordination_origin_message_id=(
+                            message_id if authoritative_session_id else None
+                        ),
+                        triage=triage,
+                        idempotency_key=idempotency_key,
+                        max_runtime_seconds=(
+                            int(max_runtime_seconds)
+                            if max_runtime_seconds is not None else None
+                        ),
+                        skills=skills,
+                        model_override=model_override,
+                        provider_override=provider_override,
+                        goal_mode=goal_mode,
+                        goal_max_turns=(
+                            int(goal_max_turns)
+                            if goal_max_turns is not None else None
+                        ),
+                        initial_status=str(initial_status),
+                        created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                        session_id=session_id,
                     )
+                    new_task = kb.get_task(conn, new_tid)
+                    subscribed = _maybe_auto_subscribe(
+                        conn,
+                        new_tid,
+                        explicit=report_to_origin,
+                        delivery_mode="wake" if report_to_origin else None,
+                    )
+                    if coordination is not None:
+                        if not subscribed:
+                            raise ValueError(
+                                "coordination root requires a persistent origin route"
+                            )
+                        request = kb.create_coordination_request(
+                            conn,
+                            root_task_id=new_tid,
+                            origin_session_id=str(session_id or ""),
+                            origin_message_id=str(message_id),
+                            organization=org,
+                            **coordination,
+                        )
             attached_session_id = new_task.session_id if new_task else session_id
             wake_attached = bool(subscribed and attached_session_id)
             if wake_attached:

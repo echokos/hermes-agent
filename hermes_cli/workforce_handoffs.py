@@ -148,6 +148,91 @@ def acknowledge_handoff(
     return {"task_id": task_id, **payload}
 
 
+def claim_owned_failure_handoff_pickup(
+    conn: sqlite3.Connection,
+    *,
+    target_agent: str,
+    organization: WorkforceOrganization | None = None,
+    now: int | None = None,
+) -> dict[str, Any] | None:
+    """Claim one typed owned-failure acknowledgment for a silent owner turn.
+
+    The task body deliberately remains ``pending_acknowledgment``. Only the
+    genuine target's later ``workforce_handoff(acknowledge)`` tool call may
+    accept it. The one-shot event is the durable pickup claim; failures after
+    this commit stay owned and are handled by the existing overdue sweep.
+    """
+    org = organization or load_organization()
+    target = org.validate_execution_profile(target_agent).agent
+    claimed_at = int(now if now is not None else time.time())
+    with kanban_db.write_txn(conn):
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'triage' "
+            "AND body LIKE ? ORDER BY created_at, id",
+            ('%"kind": "workforce_handoff"%',),
+        ).fetchall()
+        for row in rows:
+            task = kanban_db.get_task(conn, row["id"])
+            if task is None:
+                continue
+            try:
+                payload = _body(task)
+            except ValueError:
+                continue
+            context = payload.get("context")
+            try:
+                payload_target = org.validate_execution_profile(
+                    str(payload.get("target_agent") or "")
+                ).agent
+            except ValueError:
+                continue
+            if (
+                payload.get("state") != "pending_acknowledgment"
+                or not isinstance(context, dict)
+                or context.get("kind") != "owned_operational_failure"
+                or payload_target != target
+                or claimed_at > int(payload.get("acknowledgment_deadline") or 0)
+            ):
+                continue
+            already_claimed = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? "
+                "AND kind = 'workforce_handoff_pickup_claimed' LIMIT 1",
+                (task.id,),
+            ).fetchone()
+            if already_claimed is not None:
+                continue
+            request = kanban_db.create_owned_failure_coordination_request(
+                conn,
+                root_task_id=task.id,
+                organization=org,
+                now=claimed_at,
+            )
+            source = org.validate_execution_profile(
+                str(payload.get("source_agent") or "")
+            ).agent
+            kanban_db._append_event(
+                conn,
+                task.id,
+                "workforce_handoff_pickup_claimed",
+                {
+                    "actor": target,
+                    "target_agent": target,
+                    "source_agent": source,
+                    "request_root_id": request.id,
+                    "claim_kind": "owned_operational_failure",
+                    "claimed_at": claimed_at,
+                },
+            )
+            return {
+                "task_id": task.id,
+                "target_agent": target,
+                "source_agent": source,
+                "request_root_id": request.id,
+                "claimed_at": claimed_at,
+            }
+    return None
+
+
 def record_checkpoint(
     conn: sqlite3.Connection,
     task_id: str,

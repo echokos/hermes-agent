@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -378,3 +379,138 @@ def test_retry_and_elapsed_limits_survive_reopen(kanban_home, organization):
             kb.reserve_coordination_launch(
                 conn, task_id, organization=organization, now=1300,
             )
+
+
+def _owned_failure_task(conn):
+    body = {
+        "kind": "workforce_handoff",
+        "state": "pending_acknowledgment",
+        "source_agent": "director",
+        "target_agent": "builder",
+        "requires_source_acceptance": True,
+        "context": {
+            "kind": "owned_operational_failure",
+            "technical_owner": "builder",
+            "director": "director",
+            "workflow_id": "scheduled-repair",
+            "event_id": "failure-1",
+        },
+    }
+    return kb.create_task(
+        conn,
+        title="Repair scheduled failure",
+        body=json.dumps(body),
+        assignee="builder",
+        triage=True,
+    )
+
+
+def test_owned_failure_factory_has_fixed_internal_caps_and_no_user_route(
+    kanban_home, organization,
+):
+    with kb.connect_closing() as conn:
+        task_id = _owned_failure_task(conn)
+        request = kb.create_owned_failure_coordination_request(
+            conn, root_task_id=task_id, organization=organization, now=100,
+        )
+        again = kb.create_owned_failure_coordination_request(
+            conn, root_task_id=task_id, organization=organization, now=999,
+        )
+
+        assert again == request
+        assert request.kind == "owned_operational_failure"
+        assert request.origin_session_id == "internal:owned_operational_failure"
+        assert request.origin_message_id == task_id
+        assert request.responsible_agent == "builder"
+        assert request.max_leaf_launches == 2
+        assert request.max_concurrent_leaf == 1
+        assert request.max_model_calls == 20
+        assert request.final_model_call_reserve == 3
+        assert request.max_transient_retries == 1
+        assert request.checkpoint_at == 1300
+        assert kb.get_task(conn, task_id).request_root_id == request.id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+        for ordinal in range(1, 18):
+            assert kb.charge_coordination_model_call(
+                conn, request.id, purpose="work", task_id=task_id, now=101,
+            ) == ordinal
+        with pytest.raises(kb.CoordinationBudgetExceeded, match="reserve preserved"):
+            kb.charge_coordination_model_call(
+                conn, request.id, purpose="work", task_id=task_id, now=101,
+            )
+        for ordinal in range(18, 21):
+            assert kb.charge_coordination_model_call(
+                conn,
+                request.id,
+                purpose="terminal_review",
+                task_id=task_id,
+                now=86_500,
+            ) == ordinal
+        with pytest.raises(kb.CoordinationBudgetExceeded, match="no user"):
+            kb.charge_coordination_model_call(
+                conn, request.id, purpose="final_return", task_id=task_id,
+            )
+
+
+def test_owned_failure_review_waits_for_recovery_then_launches_after_checkpoint(
+    kanban_home, organization,
+):
+    with kb.connect_closing() as conn:
+        task_id = _owned_failure_task(conn)
+        request = kb.create_owned_failure_coordination_request(
+            conn, root_task_id=task_id, organization=organization, now=100,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'review', assignee = 'director' "
+                "WHERE id = ?",
+                (task_id,),
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "workforce_handoff_recovery_required",
+                {
+                    "failure_event_id": "failure-1",
+                    "failure_order": 10,
+                    "required_successes": 2,
+                },
+            )
+        with pytest.raises(kb.CoordinationLaunchDeferred, match="awaits"):
+            kb.reserve_coordination_launch(
+                conn, task_id, organization=organization, now=86_500,
+            )
+
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                task_id,
+                "workforce_handoff_recovery_verified",
+                {
+                    "failure_event_id": "failure-1",
+                    "failure_order": 10,
+                    "success_event_ids": ["success-1", "success-2"],
+                    "success_orders": [11, 12],
+                    "required_successes": 2,
+                },
+            )
+        reservation = kb.reserve_coordination_launch(
+            conn, task_id, organization=organization, now=86_500,
+        )
+        assert reservation.request_root_id == request.id
+        assert reservation.role == "manager"
+        assert reservation.leaf_launch_ordinal is None
+
+
+def test_trusted_origin_factory_allows_zero_transient_retries(
+    kanban_home, organization,
+):
+    with kb.connect_closing() as conn:
+        _, request = _accept_request(
+            conn, organization, max_transient_retries=0,
+        )
+        assert request.max_transient_retries == 0

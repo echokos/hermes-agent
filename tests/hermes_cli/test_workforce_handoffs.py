@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import time
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 from hermes_cli import kanban_db
 from hermes_cli.workforce_handoffs import (
     acknowledge_handoff,
+    claim_owned_failure_handoff_pickup,
     create_handoff,
     record_checkpoint,
     sweep_overdue_handoffs,
@@ -127,6 +129,106 @@ def test_checkpoint_moves_deadline_without_changing_authority(conn):
     )
     assert result["state"] == "active"
     assert result["checkpoint_at"] == now + 240
+
+
+def test_owned_failure_pickup_is_one_shot_bounded_and_keeps_ack_pending(conn):
+    now = int(time.time())
+    created = create_handoff(
+        conn,
+        source_agent="aurora",
+        target_agent="alina",
+        expected_outcome="Repair scheduled integration",
+        acceptance_test="Two later executions succeed",
+        evidence_references=["execution:failure-1"],
+        acknowledgment_deadline=_iso(now + 60),
+        checkpoint_at=_iso(now + 3600),
+        organization=ORG,
+        context={
+            "kind": "owned_operational_failure",
+            "technical_owner": "alina",
+            "director": "aurora",
+            "workflow_id": "scheduled-integration",
+            "event_id": "failure-1",
+        },
+        requires_source_acceptance=True,
+    )
+    task_id = created["task_id"]
+
+    pickup = claim_owned_failure_handoff_pickup(
+        conn, target_agent="alina", organization=ORG, now=now + 1,
+    )
+    duplicate = claim_owned_failure_handoff_pickup(
+        conn, target_agent="alina", organization=ORG, now=now + 2,
+    )
+
+    assert pickup == {
+        "task_id": task_id,
+        "target_agent": "alina",
+        "source_agent": "aurora",
+        "request_root_id": pickup["request_root_id"],
+        "claimed_at": now + 1,
+    }
+    assert duplicate is None
+    task = kanban_db.get_task(conn, task_id)
+    assert task.status == "triage"
+    assert task.request_root_id == pickup["request_root_id"]
+    assert json.loads(task.body)["state"] == "pending_acknowledgment"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (task_id,)
+    ).fetchone()[0] == 0
+    request = kanban_db.get_coordination_request(
+        conn, pickup["request_root_id"]
+    )
+    assert request.kind == "owned_operational_failure"
+    assert request.max_model_calls == 20
+    assert request.final_model_call_reserve == 3
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+        "AND kind = 'workforce_handoff_pickup_claimed'",
+        (task_id,),
+    ).fetchone()[0] == 1
+
+    accepted = acknowledge_handoff(
+        conn, task_id, actor="alina", organization=ORG, now=now + 3,
+    )
+    assert accepted["state"] == "accepted"
+    assert kanban_db.get_task(conn, task_id).status == "ready"
+
+
+def test_pickup_ignores_generic_and_expired_handoffs(conn):
+    now = int(time.time())
+    create_handoff(
+        conn,
+        source_agent="aurora",
+        target_agent="alina",
+        expected_outcome="Ordinary handoff",
+        acceptance_test="Done",
+        evidence_references=[],
+        acknowledgment_deadline=_iso(now + 60),
+        checkpoint_at=_iso(now + 120),
+        organization=ORG,
+    )
+    create_handoff(
+        conn,
+        source_agent="aurora",
+        target_agent="alina",
+        expected_outcome="Expired operational failure",
+        acceptance_test="Recovered",
+        evidence_references=[],
+        acknowledgment_deadline=_iso(now - 10),
+        checkpoint_at=_iso(now + 120),
+        organization=ORG,
+        context={
+            "kind": "owned_operational_failure",
+            "technical_owner": "alina",
+            "director": "aurora",
+        },
+        requires_source_acceptance=True,
+        allow_overdue=True,
+    )
+    assert claim_owned_failure_handoff_pickup(
+        conn, target_agent="alina", organization=ORG, now=now,
+    ) is None
 
 
 def test_source_acceptance_requires_target_ack_and_source_review_run(conn):
