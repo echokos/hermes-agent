@@ -238,6 +238,7 @@ def _canonical_tool_approval_binding(
     session_id: str,
     tool_call_id: str,
     turn_id: str,
+    subject: Any = None,
 ) -> bytes:
     """Return the strict canonical identity of one executor tool call."""
     if not all(
@@ -253,6 +254,7 @@ def _canonical_tool_approval_binding(
                 "session_id": session_id,
                 "tool_call_id": tool_call_id,
                 "turn_id": turn_id,
+                "subject": subject,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -345,6 +347,7 @@ def _issue_tool_approval_provenance(
     session_id: str,
     tool_call_id: str,
     turn_id: str,
+    subject: Any = None,
 ) -> _ToolApprovalProvenance:
     """Issue provenance after the human gate approves exactly one call."""
     binding = _canonical_tool_approval_binding(
@@ -353,6 +356,7 @@ def _issue_tool_approval_provenance(
         session_id=session_id,
         tool_call_id=tool_call_id,
         turn_id=turn_id,
+        subject=subject,
     )
     provenance = _ToolApprovalProvenance(
         constructor_key=_TOOL_APPROVAL_PROVENANCE_KEY
@@ -374,6 +378,7 @@ def consume_tool_approval_provenance(
     session_id: str,
     tool_call_id: str,
     turn_id: str,
+    subject: Any = None,
 ) -> bool:
     """Atomically consume valid provenance for this exact handler invocation."""
     if type(provenance) is not _ToolApprovalProvenance:
@@ -385,6 +390,7 @@ def consume_tool_approval_provenance(
             session_id=session_id,
             tool_call_id=tool_call_id,
             turn_id=turn_id,
+            subject=subject,
         )
     except ValueError:
         return False
@@ -3608,6 +3614,7 @@ def _run_approval_gate(
     allow_permanent: bool = True,
     allow_yolo: bool = True,
     allow_cron: bool = True,
+    allow_single_query: bool = True,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3655,6 +3662,8 @@ def _run_approval_gate(
         allow_yolo: Whether process/session yolo mode may bypass the gate.
         allow_cron: Whether ``approvals.cron_mode: approve`` may bypass the
             absence of an interactive user.
+        allow_single_query: Whether ``approvals.single_query_mode: approve``
+            may bypass the absence of an interactive user.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
@@ -3689,6 +3698,16 @@ def _run_approval_gate(
     if not is_cli and not is_gateway:
         # Single-query (-q) sessions: respect single_query_mode config
         if _is_single_query_approval_context():
+            if not allow_single_query:
+                return {
+                    "approved": False,
+                    "message": (
+                        f"BLOCKED: {display_target} requires fresh interactive "
+                        "approval and cannot run in single-query mode (-q)."
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                }
             if _get_single_query_approval_mode() == "deny":
                 return {
                     "approved": False,
@@ -4048,6 +4067,7 @@ def request_tool_approval(
     allow_permanent: bool = True,
     allow_yolo: bool = True,
     allow_cron: bool = True,
+    allow_single_query: bool = True,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -4079,6 +4099,7 @@ def request_tool_approval(
         allow_permanent: Allow permanent approval and cached approval reuse.
         allow_yolo: Allow yolo mode to bypass this approval.
         allow_cron: Allow cron auto-approval when configured.
+        allow_single_query: Allow single-query auto-approval when configured.
 
     Returns:
         ``{"approved": True, "message": None}`` when allowed, or
@@ -4141,6 +4162,7 @@ def request_tool_approval(
         allow_permanent=allow_permanent,
         allow_yolo=allow_yolo,
         allow_cron=allow_cron,
+        allow_single_query=allow_single_query,
     )
 
 

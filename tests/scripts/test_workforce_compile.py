@@ -28,6 +28,29 @@ def test_insert_is_idempotent_and_preserves_unmanaged_content():
     assert first.count(module.BEGIN) == 1
 
 
+def test_insert_preserves_externalized_contract():
+    original = "# Agent\n" + module.EXTERNALIZED + "\n"
+    candidate, operation = module.insert_block(original, "generated")
+    assert candidate == original
+    assert operation == "preserve-externalized"
+
+
+def test_compile_reports_externalized_contract_reconciliation(tmp_path):
+    organization = materialize_test_organization(
+        ROOT / "workforce" / "organization.yaml", tmp_path
+    )
+    source = tmp_path / "workforce-profiles" / "aurora" / "AGENTS.md"
+    source.write_text("# Aurora\n" + module.EXTERNALIZED + "\n")
+    manifest = module.compile_profiles(
+        organization, ROOT / "workforce" / "templates" / "workforce-contract.md", tmp_path / "out"
+    )
+    entry = next(item for item in manifest["profiles"] if item["agent"] == "aurora")
+    assert entry["operation"] == "preserve-externalized"
+    assert entry["managed_contract_mode"] == "externalized-reference"
+    assert entry["template_reconciliation_required"] is True
+    assert (tmp_path / "out" / "aurora" / "AGENTS.md").read_text() == source.read_text()
+
+
 def test_canonical_compile_includes_active_chloe_and_emma(tmp_path):
     organization = materialize_test_organization(
         ROOT / "workforce" / "organization.yaml", tmp_path

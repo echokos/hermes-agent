@@ -2692,6 +2692,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "rejected_non_operational": [
+                {"task_id": tid, "assignee": who, "reason": reason}
+                for (tid, who, reason) in res.rejected_non_operational
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2734,6 +2738,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    for tid, who, reason in res.rejected_non_operational:
+        print(f"Rejected (non-operational assignee {who!r}): {tid} — {reason}")
     return 0
 
 

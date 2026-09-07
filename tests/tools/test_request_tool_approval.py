@@ -27,6 +27,7 @@ def _isolate_approval_state(monkeypatch):
     # Not a yolo session (the shared gate checks this first).
     monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: False)
     monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False, raising=False)
+    monkeypatch.setattr(approval, "_is_single_query_approval_context", lambda: False)
     # No thread-registered CLI callback by default.
     monkeypatch.setattr(
         "tools.terminal_tool._get_approval_callback", lambda: None, raising=False
@@ -55,6 +56,7 @@ class TestToolApprovalProvenance:
                     "allow_permanent": False,
                     "allow_yolo": False,
                     "allow_cron": False,
+                    "allow_single_query": False,
                 }
             ],
         )
@@ -93,6 +95,48 @@ class TestToolApprovalProvenance:
 
         assert self._consume(provenance, dict(args))
         assert not self._consume(provenance, dict(args))
+
+    def test_agent_photo_generate_uses_core_exact_once_policy(self, monkeypatch):
+        from hermes_cli import plugins
+        from tools import agent_photo_tool
+
+        calls = []
+        monkeypatch.setattr(plugins, "invoke_hook", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(
+            agent_photo_tool,
+            "agent_photo_approval_subject",
+            lambda _args: {"profile_name": "amy", "prompt_sha256": "a" * 64},
+        )
+        monkeypatch.setattr(
+            approval,
+            "request_tool_approval",
+            lambda *args, **kwargs: calls.append((args, kwargs))
+            or {"approved": True, "message": None},
+        )
+
+        result = plugins.resolve_pre_tool_call(
+            "agent_photo",
+            {"action": "generate", "prompt": "portrait", "model": "gemini"},
+            session_id="session-1",
+            tool_call_id="call-1",
+            turn_id="turn-1",
+        )
+
+        assert result.block_message is None
+        assert result.approval_provenance is not None
+        assert calls == [
+            (
+                ("agent_photo", "Approve this paid agent-photo generation for the active personal profile?"),
+                {
+                    "rule_key": "agent_photo_generation",
+                    "allow_session": False,
+                    "allow_permanent": False,
+                    "allow_yolo": False,
+                    "allow_cron": False,
+                    "allow_single_query": False,
+                },
+            )
+        ]
 
     @pytest.mark.parametrize(
         ("tool", "args_patch", "call"),
@@ -264,6 +308,27 @@ class TestRequestToolApproval:
         monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "approve")
         res = request_tool_approval("terminal", "smtp send")
         assert res["approved"] is True
+
+    def test_explicitly_disallowed_single_query_auto_approval_blocks(self, monkeypatch):
+        """A fresh-consent action cannot inherit global -q auto-approval."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "_is_single_query_approval_context", lambda: True)
+        monkeypatch.setattr(approval, "_get_single_query_approval_mode", lambda: "approve")
+
+        res = request_tool_approval(
+            "agent_photo",
+            "fresh human approval required",
+            allow_session=False,
+            allow_permanent=False,
+            allow_yolo=False,
+            allow_cron=False,
+            allow_single_query=False,
+        )
+
+        assert res["approved"] is False
+        assert "single-query" in res["message"].lower()
 
 
     def test_distinct_reasons_get_distinct_keys(self, monkeypatch):

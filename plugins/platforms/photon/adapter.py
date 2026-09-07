@@ -1992,7 +1992,11 @@ class PhotonAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        return await self._sidecar_send(chat_id, self.format_message(content))
+        return await self._sidecar_send(
+            chat_id,
+            self.format_message(content),
+            delivery_id=(metadata or {}).get("delivery_id"),
+        )
 
     # -- Clarify (native iMessage poll) ------------------------------------
     #
@@ -2513,6 +2517,7 @@ class PhotonAdapter(BasePlatformAdapter):
         *,
         richlink: bool = True,
         markdown: bool = True,
+        delivery_id: Optional[str] = None,
     ) -> SendResult:
         rich_url = _richlink_candidate(text) if richlink else None
         if rich_url:
@@ -2535,6 +2540,8 @@ class PhotonAdapter(BasePlatformAdapter):
         # keeps accepting the body during a half-upgraded restart.
         if markdown and _markdown_enabled():
             body["format"] = "markdown"
+        if delivery_id:
+            body["deliveryId"] = delivery_id
         try:
             data = await self._sidecar_call("/send", body)
         except PhotonSidecarError as e:
@@ -2542,6 +2549,7 @@ class PhotonAdapter(BasePlatformAdapter):
                 success=False,
                 error=str(e),
                 raw_response={
+                    "http_status": e.status_code,
                     "error_class": e.error_class,
                     "retryable": e.retryable,
                 },

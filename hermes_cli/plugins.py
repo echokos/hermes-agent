@@ -6016,6 +6016,7 @@ class _PreToolCallDirective:
     allow_permanent: bool = True
     allow_yolo: bool = True
     allow_cron: bool = True
+    allow_single_query: bool = True
     modified_args: Optional[Dict[str, Any]] = None
 
 
@@ -6084,6 +6085,18 @@ def _get_pre_tool_call_directive_details(
             message=fmt.format(tool_name=tool_name),
         )
 
+    if tool_name == "agent_photo" and isinstance(args, dict) and args.get("action") == "generate":
+        return _PreToolCallDirective(
+            action="approve",
+            message="Approve this paid agent-photo generation for the active personal profile?",
+            rule_key="agent_photo_generation",
+            allow_session=False,
+            allow_permanent=False,
+            allow_yolo=False,
+            allow_cron=False,
+            allow_single_query=False,
+        )
+
     from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
 
     hook_results = invoke_lifecycle_hook(
@@ -6136,6 +6149,7 @@ def _get_pre_tool_call_directive_details(
                 "allow_permanent",
                 "allow_yolo",
                 "allow_cron",
+                "allow_single_query",
             ):
                 value = result.get(flag, True)
                 approval_flags[flag] = value if isinstance(value, bool) else True
@@ -6258,6 +6272,17 @@ def _resolve_block_from_details(
             modified_args=details.modified_args,
         )
     if details.action == "approve":
+        approval_subject = None
+        if tool_name == "agent_photo" and isinstance(args, dict) and args.get("action") == "generate":
+            try:
+                from tools.agent_photo_tool import agent_photo_approval_subject
+
+                approval_subject = agent_photo_approval_subject(args)
+            except Exception:
+                return _PreToolCallResolution(
+                    block_message="BLOCKED: agent-photo approval subject could not be prepared",
+                    modified_args=details.modified_args,
+                )
         try:
             from tools.approval import (
                 request_tool_approval,
@@ -6283,6 +6308,7 @@ def _resolve_block_from_details(
                     allow_permanent=details.allow_permanent,
                     allow_yolo=details.allow_yolo,
                     allow_cron=details.allow_cron,
+                    allow_single_query=details.allow_single_query,
                 )
             finally:
                 if approval_tokens is not None:
@@ -6311,6 +6337,7 @@ def _resolve_block_from_details(
                 details.allow_permanent,
                 details.allow_yolo,
                 details.allow_cron,
+                details.allow_single_query,
             )
         )
         if exact_once:
@@ -6323,6 +6350,7 @@ def _resolve_block_from_details(
                     session_id=session_id,
                     tool_call_id=tool_call_id,
                     turn_id=turn_id,
+                    subject=approval_subject,
                 )
             except Exception:
                 return _PreToolCallResolution(

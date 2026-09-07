@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -510,9 +511,11 @@ from cron.jobs import (
 from cron.executions import (
     _PrivateStatePermissionError,
     _open_private_cron_lock,
+    claim_delivery,
     create_execution,
     finish_execution,
     mark_execution_running,
+    resolve_delivery,
 )
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -2650,6 +2653,35 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+def _photon_delivery_identity(job: dict, chat_id: Any, thread_id: Any, content: str) -> tuple[str, str]:
+    """Return opaque, stable identifiers for one cron delivery target.
+
+    The ledger intentionally stores only hashes: phone numbers, thread IDs, and
+    final-response text do not belong in a scheduler database or routine logs.
+    """
+    execution_id = str(job.get("execution_id") or "")
+    if not execution_id:
+        execution_id = "direct:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+    target_fingerprint = hashlib.sha256(
+        f"photon\0{chat_id}\0{thread_id or ''}".encode("utf-8")
+    ).hexdigest()
+    identity = hashlib.sha256(
+        f"{job.get('id', '')}\0{execution_id}\0{target_fingerprint}".encode("utf-8")
+    ).hexdigest()
+    return f"photon:{identity}", target_fingerprint
+
+
+def _photon_failure_state(raw_response: Any) -> str:
+    """Classify only provable pre-acceptance failures as safe for fallback."""
+    raw = raw_response if isinstance(raw_response, dict) else {}
+    status = raw.get("http_status")
+    if isinstance(status, int) and 400 <= status < 500 and status not in {408, 429}:
+        return "confirmed_absent"
+    if raw.get("error_class") == "target_not_allowed":
+        return "confirmed_absent"
+    return "unknown"
+
+
 def _is_channel_dm_topic(
     runtime_adapter: Any,
     chat_id: Any,
@@ -2989,6 +3021,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 thread_id = new_thread_id
                 opened_thread_id = new_thread_id
 
+        photon_identity = None
+        photon_state = None
         if live_adapter_ready:
             # Telegram topic routing (#22773, regression fixed #52060): a
             # ``telegram:<positive_chat_id>:<numeric_thread_id>`` cron target is
@@ -3042,6 +3076,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
+            if platform.value == "photon":
+                photon_identity, target_fingerprint = _photon_delivery_identity(
+                    job, chat_id, thread_id, cleaned_delivery_content,
+                )
+                reservation = claim_delivery(
+                    photon_identity,
+                    execution_id=str(job.get("execution_id") or ""),
+                    job_id=str(job["id"]),
+                    platform="photon",
+                    target_fingerprint=target_fingerprint,
+                )
+                if not reservation["claimed"]:
+                    msg = f"Photon delivery already has durable state {reservation['state']}; resend suppressed"
+                    logger.warning("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+                    continue
+                route_metadata["delivery_id"] = photon_identity
+                route_metadata["_preserve_failed_send_result"] = True
+
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
@@ -3079,6 +3132,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     if future is None:
                         adapter_ok = False
                         target_errors.append("live adapter event loop scheduling failed")
+                        # safe_schedule_threadsafe only returns None before the
+                        # coroutine reaches the gateway loop. No provider request
+                        # can have been issued, so Photon may use its one
+                        # standalone fallback instead of treating this as an
+                        # ambiguous on-wire outcome.
+                        if photon_identity:
+                            photon_state = "confirmed_absent"
+                            resolve_delivery(photon_identity, photon_state)
                     else:
                         send_result = None
                         timeout_handled = False
@@ -3114,6 +3175,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 )
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
+                                if photon_identity:
+                                    photon_state = "confirmed_absent"
+                                    resolve_delivery(photon_identity, photon_state)
                                 timeout_handled = True
                             else:
                                 timed_out = True
@@ -3176,6 +3240,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                         job["id"], msg,
                                     )
                                 target_errors.append(msg)
+                                if photon_identity:
+                                    photon_state = _photon_failure_state(send_raw_response)
+                                    resolve_delivery(photon_identity, photon_state)
                                 adapter_ok = False  # fall through to standalone path
                             elif (
                                 send_raw_response
@@ -3228,6 +3295,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
+                    if photon_identity:
+                        resolve_delivery(photon_identity, "confirmed_sent")
                     delivered = True
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
@@ -3267,6 +3336,38 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
         if not delivered:
+            if platform.value == "photon":
+                if photon_identity is None:
+                    photon_identity, target_fingerprint = _photon_delivery_identity(
+                        job, chat_id, thread_id, cleaned_delivery_content,
+                    )
+                    reservation = claim_delivery(
+                        photon_identity,
+                        execution_id=str(job.get("execution_id") or ""),
+                        job_id=str(job["id"]),
+                        platform="photon",
+                        target_fingerprint=target_fingerprint,
+                    )
+                elif photon_state == "confirmed_absent":
+                    reservation = claim_delivery(
+                        photon_identity,
+                        execution_id=str(job.get("execution_id") or ""),
+                        job_id=str(job["id"]),
+                        platform="photon",
+                        target_fingerprint="",
+                        fallback=True,
+                    )
+                else:
+                    resolve_delivery(photon_identity, "unknown")
+                    msg = "Photon delivery outcome is unknown; standalone fallback suppressed"
+                    logger.error("Job '%s': %s", job["id"], msg)
+                    delivery_errors.extend(target_errors + [msg])
+                    continue
+                if not reservation["claimed"]:
+                    msg = f"Photon standalone delivery already has durable state {reservation['state']}; resend suppressed"
+                    logger.warning("Job '%s': %s", job["id"], msg)
+                    delivery_errors.extend(target_errors + [msg])
+                    continue
             if transport is not None and transport.is_relay:
                 # Relay owns the logical destination and its connector owns the
                 # platform credential. A native retry could duplicate delivery
@@ -3351,11 +3452,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # result dict, so there is no traceback to attach.
                 msg = f"delivery error: {result['error']} (target {platform_name}:{chat_id})"
                 logger.error("Job '%s': %s", job["id"], msg)
+                if photon_identity:
+                    resolve_delivery(photon_identity, "unknown")
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            if photon_identity:
+                resolve_delivery(photon_identity, "confirmed_sent")
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
@@ -6721,6 +6826,11 @@ def _run_one_job_body(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    # ``job`` is the persisted definition/claimed snapshot and intentionally
+    # does not retain the per-fire execution row created above. Delivery needs
+    # that durable row's ID, though: Photon uses it as the stable retry key and
+    # the delivery ledger retains its record only while this execution exists.
+    delivery_job = {**job, "execution_id": str(execution_id)}
     delivery_attempted = False
     delivery_error = None
     try:
@@ -7000,7 +7110,7 @@ def _run_one_job_body(
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
                         delivery_error = _deliver_result(
-                            job,
+                            delivery_job,
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
@@ -7171,7 +7281,7 @@ def _run_one_job_body(
             try:
                 delivery_attempted = True
                 delivery_error = _deliver_result(
-                    job,
+                    delivery_job,
                     _summarize_cron_failure_for_delivery(job, _err_text),
                     adapters=adapters,
                     loop=loop,

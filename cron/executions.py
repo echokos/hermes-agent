@@ -377,6 +377,24 @@ def _initialize_schema(
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS deliveries (
+             identity TEXT PRIMARY KEY,
+             execution_id TEXT NOT NULL,
+             job_id TEXT NOT NULL,
+             platform TEXT NOT NULL,
+             target_fingerprint TEXT NOT NULL,
+             state TEXT NOT NULL CHECK(state IN
+               ('pending','confirmed_sent','confirmed_absent','unknown')),
+             fallback_used INTEGER NOT NULL DEFAULT 0 CHECK(fallback_used IN (0, 1)),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_deliveries_execution "
+        "ON deliveries(execution_id, created_at DESC)"
+    )
     _normalize_execution_store_permissions(
         executions_file,
         require_database=True,
@@ -456,6 +474,93 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
            )""",
         (limit,),
     )
+    # Delivery identities are only useful while their owning execution remains
+    # in the durable execution history. Keeping the same retention boundary
+    # prevents an unbounded second ledger while preserving restart/retry safety
+    # for every retained execution.
+    conn.execute(
+        "DELETE FROM deliveries WHERE execution_id NOT IN (SELECT id FROM executions)"
+    )
+
+
+_DELIVERY_TERMINAL_STATES = {
+    "confirmed_sent",
+    "confirmed_absent",
+    "unknown",
+}
+
+
+def claim_delivery(
+    identity: str,
+    *,
+    execution_id: str,
+    job_id: str,
+    platform: str,
+    target_fingerprint: str,
+    fallback: bool = False,
+) -> Dict[str, Any]:
+    """Atomically reserve one logical delivery or reject a replay.
+
+    A reservation is written *before* the transport is touched.  A second
+    process, a retry after restart, or a fallback can therefore only proceed
+    when the preceding send was durably proven absent.  The one permitted
+    fallback consumes ``fallback_used`` atomically, so an absent primary cannot
+    fan out into multiple native retries.
+    """
+    identity = str(identity)
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        if not fallback:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO deliveries
+                   (identity, execution_id, job_id, platform, target_fingerprint,
+                    state, fallback_used, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)""",
+                (
+                    identity,
+                    str(execution_id),
+                    str(job_id),
+                    str(platform),
+                    str(target_fingerprint),
+                    now,
+                    now,
+                ),
+            )
+            if cur.rowcount == 1:
+                return {"claimed": True, "state": "pending"}
+        else:
+            cur = conn.execute(
+                """UPDATE deliveries
+                   SET state='pending', fallback_used=1, updated_at=?
+                   WHERE identity=? AND state='confirmed_absent' AND fallback_used=0""",
+                (now, identity),
+            )
+            if cur.rowcount == 1:
+                return {"claimed": True, "state": "pending"}
+
+        row = conn.execute(
+            "SELECT state FROM deliveries WHERE identity=?", (identity,)
+        ).fetchone()
+    # A missing row is only possible if a caller races a retention prune.  Do
+    # not infer safety from that exceptional shape; fail closed as unknown.
+    return {"claimed": False, "state": str(row["state"]) if row else "unknown"}
+
+
+def resolve_delivery(identity: str, state: str) -> Optional[Dict[str, Any]]:
+    """Commit one terminal outcome without rewriting an earlier conclusion."""
+    if state not in _DELIVERY_TERMINAL_STATES:
+        raise ValueError(f"unsupported delivery state: {state!r}")
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        conn.execute(
+            """UPDATE deliveries SET state=?, updated_at=?
+               WHERE identity=? AND state='pending'""",
+            (state, now, str(identity)),
+        )
+        row = conn.execute(
+            "SELECT * FROM deliveries WHERE identity=?", (str(identity),)
+        ).fetchone()
+    return _record(row)
 
 
 def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
