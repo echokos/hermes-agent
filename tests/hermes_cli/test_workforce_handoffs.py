@@ -127,3 +127,62 @@ def test_checkpoint_moves_deadline_without_changing_authority(conn):
     )
     assert result["state"] == "active"
     assert result["checkpoint_at"] == now + 240
+
+
+def test_source_acceptance_requires_target_ack_and_source_review_run(conn):
+    now = int(time.time())
+    created = create_handoff(
+        conn,
+        source_agent="emily",
+        target_agent="sage",
+        expected_outcome="Repair the scheduled product workflow",
+        acceptance_test="Two distinct scheduled executions succeed",
+        evidence_references=["cron:job-1"],
+        acknowledgment_deadline=_iso(now + 60),
+        checkpoint_at=_iso(now + 240),
+        organization=ORG,
+        requires_source_acceptance=True,
+    )
+    task_id = created["task_id"]
+
+    # A target cannot close its own work without returning it to the source.
+    acknowledge_handoff(
+        conn, task_id, actor="sage", organization=ORG, now=now + 1
+    )
+    owner_run = kanban_db.claim_task(conn, task_id, claimer="sage:test")
+    assert owner_run is not None
+    assert kanban_db.complete_task(
+        conn,
+        task_id,
+        summary="Implementation finished without review",
+        expected_run_id=owner_run.current_run_id,
+    ) is False
+
+    ok, reason = kanban_db.request_review(
+        conn,
+        task_id,
+        summary="Repair evidence attached",
+        reviewer="xenia",
+        expected_run_id=owner_run.current_run_id,
+        with_reason=True,
+    )
+    assert ok is False
+    assert reason == "handoff review must return to its source"
+
+    assert kanban_db.request_review(
+        conn,
+        task_id,
+        summary="Repair evidence attached",
+        expected_run_id=owner_run.current_run_id,
+    )
+    assert kanban_db.get_task(conn, task_id).assignee == "emily"
+    review_run = kanban_db.claim_review_task(
+        conn, task_id, claimer="emily:test"
+    )
+    assert review_run is not None
+    assert kanban_db.complete_task(
+        conn,
+        task_id,
+        summary="Accepted after source-owned verification",
+        expected_run_id=review_run.current_run_id,
+    )

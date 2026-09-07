@@ -4,6 +4,7 @@ from pathlib import Path
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli import kanban_db
 from tools import workforce_signal_tool as signal
+from tools.workforce_signal_runtime import activate, reset
 
 
 SOURCE = Path(__file__).parents[2] / "workforce" / "organization.yaml"
@@ -99,6 +100,42 @@ def test_chloe_can_only_make_mechanical_record_under_aurora_assignment(tmp_path,
     assert packet["source_agent"] == "chloe"
     assert packet["aurora_assignment_id"] == "task-aurora-1"
     assert packet["launch_authorized"] is False
+
+
+def test_chloe_offline_write_failure_is_observed_and_a_later_retry_can_recover(tmp_path, monkeypatch):
+    """Each Cron attempt gets fresh host state; a prior outage cannot go green."""
+    profiles = tmp_path / "profiles"
+    (profiles / "chloe").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profiles / "chloe"))
+    monkeypatch.setenv("HERMES_WORKFORCE_ORG", str(SOURCE))
+    payload = {
+        **_payload(),
+        "department_recommendation": "",
+        "aurora_assignment_id": "t_aurora-1",
+    }
+    token, failed_attempt = activate(True)
+    try:
+        monkeypatch.setattr(signal, "record_signal", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("offline")))
+        failure = json.loads(signal._handle(payload))
+    finally:
+        reset(token)
+    assert failure.get("success") is not True
+    assert failed_attempt.failure == "offline"
+    assert failed_attempt.completed is False
+
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setattr(kanban_db, "kanban_db_path", lambda **_kwargs: db_path)
+    monkeypatch.undo()
+    monkeypatch.setenv("HERMES_HOME", str(profiles / "chloe"))
+    monkeypatch.setenv("HERMES_WORKFORCE_ORG", str(SOURCE))
+    token, recovered_attempt = activate(True)
+    try:
+        recovery = json.loads(signal._handle(payload))
+    finally:
+        reset(token)
+    assert recovery["success"] is True
+    assert recovered_attempt.failure is None
+    assert recovered_attempt.completed is True
 
 
 def test_mel_cannot_route_a_signal(tmp_path, monkeypatch):

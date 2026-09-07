@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import runbook_store
 from hermes_cli import workflow_registry as reg
 from hermes_cli.workflow_runtime import (
@@ -89,10 +91,31 @@ def test_build_runbook_agent_prompt_contains_protocol() -> None:
 
     assert "Run Hermes workflow `daily-brief`." in prompt
     assert "Execute step `collect`: Collect context" in prompt
+    assert "Standing assignment reference: `workflow:wf-daily-brief:step:collect`." in prompt
     assert "[WORKFLOW_STATUS:completed]" in prompt
     assert "[WORKFLOW_STATUS:blocked]" in prompt
     assert "[WORKFLOW_STATUS:failed]" in prompt
     assert "## Procedure" in prompt
+
+
+@pytest.mark.parametrize(
+    ("owner", "executor", "directed"),
+    [("aurora", "chloe", True), ("default", "chloe", False), ("aurora", "default", False)],
+)
+def test_prompt_binds_chloe_intake_to_canonical_aurora_step(owner, executor, directed) -> None:
+    _save_runbook()
+    metadata = _metadata()
+    metadata["owner_profile"] = owner
+    metadata["steps"][0]["executor_profile"] = executor
+    runbook_store.save_runbook(metadata, "# Assigned observation\n", approved_by="dashboard")
+
+    prompt = build_runbook_agent_prompt("daily-brief", step_key="collect")
+
+    assert ("aurora_assignment_id: `workflow:wf-daily-brief:step:collect`" in prompt) is directed
+    if directed:
+        assert "omit department_recommendation and estimated_effort" in prompt
+        assert "does not authorize recommendations, execution, or a signal on a quiet run" in prompt
+    assert "aurora_assignment_id" not in build_runbook_agent_prompt("daily-brief")
 
 
 def test_sync_runbook_cron_jobs_creates_profile_job_and_registry_link() -> None:

@@ -60,6 +60,11 @@ def create_handoff(
     acknowledgment_deadline: str,
     checkpoint_at: str,
     organization: WorkforceOrganization | None = None,
+    context: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
+    requires_source_acceptance: bool = False,
+    allow_overdue: bool = False,
+    max_runtime_seconds: int | None = None,
 ) -> dict[str, Any]:
     org = organization or load_organization()
     _authorized_route(org, source_agent, target_agent)
@@ -70,7 +75,7 @@ def create_handoff(
     if checkpoint <= ack_at:
         raise ValueError("checkpoint must be after the acknowledgment deadline")
     now = int(time.time())
-    if ack_at <= now:
+    if ack_at <= now and not allow_overdue:
         raise ValueError("acknowledgment deadline must be in the future")
     payload = {
         "kind": HANDOFF_KIND,
@@ -84,7 +89,12 @@ def create_handoff(
         "checkpoint_at": checkpoint,
         "created_at": now,
         "notification_targets": ["aurora", "chloe"],
+        "requires_source_acceptance": bool(requires_source_acceptance),
     }
+    if context is not None:
+        if not isinstance(context, dict):
+            raise ValueError("context must be an object")
+        payload["context"] = context
     if not payload["expected_outcome"] or not payload["acceptance_test"]:
         raise ValueError("expected_outcome and acceptance_test are required")
     task_id = kanban_db.create_task(
@@ -95,10 +105,11 @@ def create_handoff(
         created_by=source,
         workspace_kind="scratch",
         triage=True,
-        idempotency_key=(
+        idempotency_key=idempotency_key or (
             f"workforce-handoff:{source}:{target}:"
             f"{ack_at}:{payload['expected_outcome']}"
         ),
+        max_runtime_seconds=max_runtime_seconds,
     )
     return {"task_id": task_id, **payload}
 

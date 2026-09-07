@@ -109,11 +109,11 @@ def reset_runtime_tool_budget(token: Token) -> None:
     _ACTIVE_BUDGET.reset(token)
 
 
-def enforce_runtime_tool_budget(name: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Authorize one tool call and clamp bounded list arguments."""
+def charge_runtime_tool_attempt(name: str) -> bool:
+    """Charge one allowed invocation before tool-specific input preflight."""
     budget = _ACTIVE_BUDGET.get()
     if budget is None:
-        return args
+        return False
     with budget._lock:
         if name not in budget.allowed_tools:
             budget.denied += 1
@@ -123,6 +123,23 @@ def enforce_runtime_tool_budget(name: str, args: dict[str, Any]) -> dict[str, An
             raise RuntimeToolBudgetError(
                 f"tool-call budget exhausted ({budget.max_calls} calls)"
             )
+        budget.calls += 1
+    return True
+
+
+def enforce_runtime_tool_budget(
+    name: str,
+    args: dict[str, Any],
+    *,
+    attempt_charged: bool = False,
+) -> dict[str, Any]:
+    """Reserve post-preflight sub-budgets and clamp bounded list arguments."""
+    budget = _ACTIVE_BUDGET.get()
+    if budget is None:
+        return args
+    if not attempt_charged:
+        charge_runtime_tool_attempt(name)
+    with budget._lock:
         action_name = f"{name}:{str(args.get('action') or '').strip()}"
         is_write = name in _WRITE_TOOLS or action_name in _WRITE_TOOLS
         is_detail = name in _DETAIL_READ_TOOLS
@@ -136,7 +153,6 @@ def enforce_runtime_tool_budget(name: str, args: dict[str, Any]) -> dict[str, An
             raise RuntimeToolBudgetError(
                 f"detail-read budget exhausted ({budget.max_detail_reads} reads)"
             )
-        budget.calls += 1
         if is_write:
             budget.writes += 1
         if is_detail:
