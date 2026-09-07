@@ -110,19 +110,24 @@ def _validate_fixed_directory(descriptor: int, resource: str) -> None:
         raise ValueError(f"agent-photo {resource} path is unsafe")
 
 
-def _validate_cooperative_profiles_directory(descriptor: int) -> None:
-    """Validate the one shared parent allowed to be group-writable.
-
-    Personal profile roots are private, but the canonical ``profiles``
-    directory is deliberately cooperative so profile management can create
-    siblings.  It remains owned by the active user and must never be writable
-    by everyone else.  Every other handler-controlled path stays strict.
-    """
+def _validate_profile_root_directory(descriptor: int) -> None:
+    """Require the scoped runner's exact shared profile-root policy."""
     metadata = os.fstat(descriptor)
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.getuid()
-        or metadata.st_mode & 0o002
+        or stat.S_IMODE(metadata.st_mode) != 0o775
+    ):
+        raise ValueError("agent-photo profile path is unsafe")
+
+
+def _validate_personal_profile_directory(descriptor: int) -> None:
+    """Keep each authorized personal profile private to its owner."""
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
     ):
         raise ValueError("agent-photo profile path is unsafe")
 
@@ -167,9 +172,9 @@ def _open_personal_profile_directory(root: Path, profile_name: str) -> int:
     try:
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         profiles_fd = os.open("profiles", directory_flags, dir_fd=root_fd)
-        _validate_cooperative_profiles_directory(profiles_fd)
+        _validate_profile_root_directory(profiles_fd)
         profile_fd = os.open(profile_name, directory_flags, dir_fd=profiles_fd)
-        _validate_fixed_directory(profile_fd, "profile")
+        _validate_personal_profile_directory(profile_fd)
         return profile_fd
     except OSError as exc:
         if profile_fd is not None:

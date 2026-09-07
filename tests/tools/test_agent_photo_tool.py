@@ -22,8 +22,11 @@ ORG_PATH = REPO_ROOT / "workforce" / "organization.yaml"
 def personal_profile(monkeypatch, tmp_path):
     """Configure one personal-only profile and a trusted shared skill root."""
     def configure(name: str) -> Path:
+        tmp_path.chmod(0o700)
         profile = tmp_path / "profiles" / name
         profile.mkdir(parents=True)
+        profile.parent.chmod(0o775)
+        profile.chmod(0o700)
         organization = yaml.safe_load(ORG_PATH.read_text(encoding="utf-8"))
         for agent in organization["agents"]:
             if agent["agent"] == name:
@@ -31,17 +34,92 @@ def personal_profile(monkeypatch, tmp_path):
         organization_path = tmp_path / "organization" / "organization.yaml"
         organization_path.parent.mkdir(parents=True, exist_ok=True)
         organization_path.write_text(yaml.safe_dump(organization), encoding="utf-8")
+        organization_path.parent.chmod(0o755)
+        organization_path.chmod(0o644)
         shared = tmp_path / "shared-skills" / "agent-photo"
         shared.mkdir(parents=True, exist_ok=True)
         (shared / "SKILL.md").write_text(
             "# Agent Photo\n\nUse only the fixed wrapper.\n", encoding="utf-8"
         )
+        shared.parent.chmod(0o755)
+        shared.chmod(0o755)
+        (shared / "SKILL.md").chmod(0o644)
         monkeypatch.setenv("HERMES_HOME", str(profile))
         monkeypatch.delenv("HERMES_WORKFORCE_ORG", raising=False)
         monkeypatch.delenv("HERMES_SHARED_SKILLS_DIR", raising=False)
         return profile
 
     return configure
+
+
+def test_personal_profile_directory_matches_runner_mode_contract(tmp_path):
+    from tools import agent_photo_tool
+
+    root = tmp_path / "hermes"
+    profiles = root / "profiles"
+    profile = profiles / "amy"
+    profile.mkdir(parents=True)
+    root.chmod(0o700)
+    profiles.chmod(0o775)
+    profile.chmod(0o700)
+
+    descriptor = agent_photo_tool._open_personal_profile_directory(root, "amy")
+    try:
+        assert os.fstat(descriptor).st_mode & 0o777 == 0o700
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    ("root_mode", "profiles_mode", "profile_mode"),
+    [
+        (0o775, 0o775, 0o700),
+        (0o700, 0o755, 0o700),
+        (0o700, 0o775, 0o750),
+        (0o700, 0o775, 0o775),
+    ],
+)
+def test_personal_profile_directory_refuses_unsafe_or_incompatible_modes(
+    tmp_path, root_mode, profiles_mode, profile_mode
+):
+    from tools import agent_photo_tool
+
+    root = tmp_path / "hermes"
+    profiles = root / "profiles"
+    profile = profiles / "amy"
+    profile.mkdir(parents=True)
+    root.chmod(root_mode)
+    profiles.chmod(profiles_mode)
+    profile.chmod(profile_mode)
+
+    with pytest.raises(ValueError, match="agent-photo profile path is unsafe"):
+        agent_photo_tool._open_personal_profile_directory(root, "amy")
+
+
+def test_personal_profile_directory_refuses_symlinked_profile(tmp_path):
+    from tools import agent_photo_tool
+
+    root = tmp_path / "hermes"
+    profiles = root / "profiles"
+    target = root / "target"
+    profile = profiles / "amy"
+    target.mkdir(parents=True)
+    profiles.mkdir(parents=True)
+    root.chmod(0o700)
+    profiles.chmod(0o775)
+    target.chmod(0o700)
+    profile.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="agent-photo profile path is unsafe"):
+        agent_photo_tool._open_personal_profile_directory(root, "amy")
+
+
+@pytest.mark.parametrize("profile_name", ["", ".", "..", "amy/other"])
+def test_personal_profile_directory_refuses_non_profile_names(tmp_path, profile_name):
+    from tools import agent_photo_tool
+
+    with pytest.raises(ValueError, match="agent-photo profile path is unsafe"):
+        agent_photo_tool._open_personal_profile_directory(tmp_path, profile_name)
 
 
 @pytest.mark.parametrize("profile_name", ["amy", "kourtnie"])
