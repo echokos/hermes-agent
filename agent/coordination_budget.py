@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -18,8 +19,12 @@ class CoordinationScope:
     purpose: str = "work"
     origin_session_id: str = ""
     origin_message_id: str = ""
+    provisional_model_calls: int = 0
+    settled_provisional_model_calls: int = 0
+    acceptance_scope_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    unbudgeted_delegation_started: bool = False
     closed: threading.Event = field(default_factory=threading.Event)
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    lock: threading.RLock = field(default_factory=threading.RLock)
 
 
 _scope: ContextVar[CoordinationScope | None] = ContextVar(
@@ -57,6 +62,66 @@ def current_coordination_origin() -> tuple[str, str]:
     return scope.origin_session_id, scope.origin_message_id
 
 
+@dataclass
+class CoordinationAcceptanceBinding:
+    model_calls: int
+    scope_id: str = ""
+    existing_request_root_id: str = ""
+    request_root_id: str = ""
+    task_id: str = ""
+
+    def accept(self, request) -> None:
+        if self.existing_request_root_id and self.existing_request_root_id != request.id:
+            raise ValueError("a running turn cannot replace its coordination root")
+        self.request_root_id = request.id
+        self.task_id = request.root_task_id
+
+
+@contextmanager
+def coordination_acceptance_binding():
+    """Serialize provisional admission with the accepting SQLite transaction.
+
+    Enter this context BEFORE the DB write transaction and call binding.accept
+    inside it. Pass binding.model_calls to the trusted DB factory, which checks
+    the requested caps and debits that already-observed usage atomically. The
+    runtime binding is published only after the DB transaction commits.
+    """
+    scope = _scope.get()
+    if scope is None:
+        yield CoordinationAcceptanceBinding(model_calls=0)
+        return
+    with scope.lock:
+        if scope.closed.is_set():
+            raise ValueError("coordination turn already ended")
+        if scope.unbudgeted_delegation_started:
+            raise ValueError("cannot accept a request after unbudgeted delegation started")
+        binding = CoordinationAcceptanceBinding(
+            model_calls=scope.provisional_model_calls,
+            scope_id=scope.acceptance_scope_id,
+            existing_request_root_id=scope.request_root_id,
+        )
+        yield binding
+        if binding.request_root_id:
+            if scope.request_root_id and scope.request_root_id != binding.request_root_id:
+                raise ValueError("a running turn cannot replace its coordination root")
+            scope.request_root_id = binding.request_root_id
+            scope.task_id = binding.task_id
+            scope.settled_provisional_model_calls = binding.model_calls
+
+
+def admit_delegate_spawn() -> None:
+    """Fence generic delegation against acceptance of a bounded workforce root."""
+    scope = _current_scope()
+    if scope is None:
+        return
+    with scope.lock:
+        if scope.closed.is_set():
+            raise ValueError("coordination turn already ended")
+        if _resolve_request_root(scope):
+            raise ValueError("coordinated child work must use budgeted Kanban dispatch")
+        scope.unbudgeted_delegation_started = True
+
+
 @contextmanager
 def scoped_coordination_budget(
     *, session_id: str = "", request_root_id: str | None = None,
@@ -84,8 +149,14 @@ def scoped_coordination_budget(
     try:
         yield scope
     finally:
-        scope.closed.set()
-        _scope.reset(token)
+        try:
+            # Another turn may accept the origin while this turn is finishing.
+            with scope.lock:
+                if scope.provisional_model_calls > scope.settled_provisional_model_calls:
+                    _resolve_request_root(scope)
+        finally:
+            scope.closed.set()
+            _scope.reset(token)
 
 
 def _current_scope() -> CoordinationScope | None:
@@ -107,6 +178,7 @@ def _resolve_request_root(scope: CoordinationScope) -> str:
     from hermes_cli import kanban_db
 
     if scope.request_root_id:
+        _settle_provisional_calls(scope)
         return scope.request_root_id
     if not (scope.origin_session_id and scope.origin_message_id):
         return ""
@@ -121,7 +193,21 @@ def _resolve_request_root(scope: CoordinationScope) -> str:
             return ""
     scope.request_root_id = candidate
     scope.task_id = request.root_task_id
+    _settle_provisional_calls(scope)
     return candidate
+
+
+def _settle_provisional_calls(scope: CoordinationScope) -> None:
+    from hermes_cli import kanban_db
+
+    if scope.provisional_model_calls <= scope.settled_provisional_model_calls:
+        return
+    with kanban_db.connect_closing(scope.db_path) as conn:
+        kanban_db.settle_coordination_acceptance_calls(
+            conn, scope.request_root_id, scope.acceptance_scope_id,
+            scope.provisional_model_calls,
+        )
+    scope.settled_provisional_model_calls = scope.provisional_model_calls
 
 
 def current_coordination_request_id() -> str:
@@ -141,11 +227,12 @@ def charge_provider_attempt() -> int | None:
     if scope is None:
         return None
     with scope.lock:
+        if scope.closed.is_set():
+            raise kanban_db.CoordinationBudgetExceeded(scope.request_root_id, "owning turn ended")
         root_id = _resolve_request_root(scope)
         if not root_id:
+            scope.provisional_model_calls += 1
             return None
-        if scope.closed.is_set():
-            raise kanban_db.CoordinationBudgetExceeded(root_id, "owning turn ended")
         with kanban_db.connect_closing(scope.db_path) as conn:
             return kanban_db.charge_coordination_model_call(
                 conn, root_id, purpose=scope.purpose, task_id=scope.task_id or None,
