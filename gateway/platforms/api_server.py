@@ -2390,6 +2390,58 @@ class APIServerAdapter(BasePlatformAdapter):
             return None
         return self._model_routes.get(model_alias)
 
+    def _session_model_selection(
+        self,
+        session: Optional[Dict[str, Any]],
+        request_model: Any,
+    ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Resolve a persisted native-session model without treating our alias as raw.
+
+        ``_model_name`` is the API's advertised virtual model name, commonly
+        the active profile name.  Older create requests persisted that default
+        even when the client had selected no model, which later made the
+        session path try to instantiate it as a provider model.  A configured
+        route with the same name remains a real selection and wins first.
+        """
+        session = session if isinstance(session, dict) else {}
+        model = self._clean_runtime_id(session.get("model"))
+        stored_route = self._resolve_route(model)
+        if stored_route is not None:
+            return stored_route, None
+        if model == self._model_name:
+            # The old create path persisted the virtual alias even when the
+            # caller supplied no selection.  The one distinguishable raw
+            # selection is an explicit model+provider request, which the
+            # create handler already recorded in model_config.  Confirmed
+            # Browser locks never reach here: _effective_session_runtime_request
+            # resolves those first and the caller uses its lock branch.
+            lock = self._parse_session_model_config(session.get("model_config")).get(
+                "browser_model_lock"
+            )
+            if isinstance(lock, dict) and not _coerce_request_bool(lock.get("confirmed"), default=False):
+                locked_model = self._clean_runtime_id(lock.get("model"))
+                locked_provider = self._clean_runtime_id(lock.get("provider"), max_len=80)
+                route_source = self._clean_runtime_id(lock.get("route_source"), max_len=64)
+                if (
+                    locked_model == model
+                    and locked_provider
+                    and route_source == "raw_request"
+                ):
+                    return {"model": locked_model, "provider": locked_provider}, None
+            model = ""
+        return self._resolve_route(request_model), model or None
+
+    def _model_to_persist_for_new_session(self, runtime_request: Dict[str, Any]) -> Optional[str]:
+        """Persist only an explicit session model or configured route alias."""
+        requested = runtime_request.get("requested") or {}
+        model = self._clean_runtime_id(requested.get("model"))
+        provider = self._clean_runtime_id(requested.get("provider"), max_len=80)
+        if not model:
+            return self._model_name if self._resolve_route(self._model_name) is not None else None
+        if model != self._model_name or self._resolve_route(model) is not None or provider:
+            return model
+        return None
+
     @staticmethod
     def _clean_runtime_id(value: Any, *, max_len: int = 200) -> str:
         if value is None:
@@ -3495,7 +3547,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if len(session_id) > self._MAX_SESSION_HEADER_LEN:
             return web.json_response(_openai_error("Session ID too long", code="invalid_session_id"), status=400)
 
-        model = body.get("model") or self._model_name
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
@@ -3505,7 +3556,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if lock_error is not None:
             return lock_error
         requested = runtime_request.get("requested") or {}
-        model_name = self._clean_runtime_id(requested.get("model")) or (str(model) if model else None)
+        model_name = self._model_to_persist_for_new_session(runtime_request)
         model_config = None
         if requested.get("model") or requested.get("provider"):
             model_config = {
@@ -3810,10 +3861,10 @@ class APIServerAdapter(BasePlatformAdapter):
             if runtime_request.get("model_options"):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
-            stored_model = session.get("model") if isinstance(session, dict) else None
-            stored_route = self._resolve_route(stored_model)
-            route = stored_route or self._resolve_route(body.get("model"))
-            session_model = stored_model if (stored_model and stored_route is None) else None
+            route, session_model = self._session_model_selection(
+                session,
+                body.get("model"),
+            )
             agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
             selection_error = self._request_route_conflict_error(
                 session_id=session_id,
@@ -3920,10 +3971,10 @@ class APIServerAdapter(BasePlatformAdapter):
             if runtime_request.get("model_options"):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
-            stored_model = session.get("model") if isinstance(session, dict) else None
-            stored_route = self._resolve_route(stored_model)
-            route = stored_route or self._resolve_route(body.get("model"))
-            session_model = stored_model if (stored_model and stored_route is None) else None
+            route, session_model = self._session_model_selection(
+                session,
+                body.get("model"),
+            )
             agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
             selection_error = self._request_route_conflict_error(
                 session_id=session_id,
