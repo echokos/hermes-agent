@@ -576,6 +576,7 @@ def test_owned_intake_is_fenced_after_fire_claim_takeover(
     )
     s.run_one_job({
         "id": "owned-takeover", "name": "owned takeover",
+        "workflow_id": "collector-workflow",
         "fire_claim": {"by": "old-worker"},
         "failure_ownership": {"technical_owner": "root", "director": "aurora"},
     })

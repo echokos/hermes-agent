@@ -497,11 +497,13 @@ def test_scheduler_append_and_terminal_ledger_are_one_incident_event(tmp_path, m
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *a, **kw: None)
     job = {
         "id": "job-1", "name": "Collector", "enabled": True,
+        "workflow_id": "collector-workflow",
         "failure_ownership": {"technical_owner": "worker", "director": "aurora"},
     }
     (profile / "cron" / "jobs.json").write_text(json.dumps({"jobs": [job]}))
     assert scheduler.run_one_job(job)
     intake = json.loads((profile / "cron" / "operational-failures.jsonl").read_text())
+    assert intake["status"] == "failure"
     terminal = executions.list_executions(job_id=job["id"])[0]
     assert terminal["id"] == intake["execution_id"]
     assert terminal["status"] == "failed"
@@ -510,6 +512,13 @@ def test_scheduler_append_and_terminal_ledger_are_one_incident_event(tmp_path, m
     assert result["detected"] == 1
     assert result["created"] == 1
     assert result["attached"] == 0
+    with kanban_db.connect_closing(database) as conn:
+        task = conn.execute("SELECT assignee, body FROM tasks").fetchone()
+        assert task["assignee"] == "worker"
+        context = json.loads(task["body"])["context"]
+        assert context["kind"] == "owned_operational_failure"
+        assert context["technical_owner"] == "worker"
+        assert context["director"] == "aurora"
     assert run(organization=organization, database=database, state_path=state)["detected"] == 0
 
 
