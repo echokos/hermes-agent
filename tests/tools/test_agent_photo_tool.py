@@ -19,7 +19,22 @@ ORG_PATH = REPO_ROOT / "workforce" / "organization.yaml"
 
 
 @pytest.fixture
-def personal_profile(monkeypatch, tmp_path):
+def trusted_wrapper(monkeypatch, tmp_path):
+    """Provide the pinned, owner-only wrapper without relying on the host install."""
+    from tools import agent_photo_tool
+
+    tmp_path.chmod(0o700)
+    wrapper = tmp_path / "operator-bin" / "hermes-agent-photo"
+    wrapper.parent.mkdir()
+    wrapper.parent.chmod(0o700)
+    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o700)
+    monkeypatch.setattr(agent_photo_tool, "WRAPPER_PATH", wrapper)
+    return wrapper
+
+
+@pytest.fixture
+def personal_profile(monkeypatch, tmp_path, trusted_wrapper):
     """Configure one personal-only profile and a trusted shared skill root."""
     def configure(name: str) -> Path:
         tmp_path.chmod(0o700)
@@ -50,6 +65,18 @@ def personal_profile(monkeypatch, tmp_path):
         return profile
 
     return configure
+
+
+@pytest.mark.windows_only
+def test_agent_photo_imports_but_is_unavailable_without_posix_descriptor_security():
+    from tools import agent_photo_tool
+
+    assert agent_photo_tool._secure_descriptor_capability_available() is False
+    assert agent_photo_tool.WRAPPER_PATH is None
+    assert agent_photo_tool.check_personal_agent_photo_requirements() is False
+    assert json.loads(agent_photo_tool.agent_photo_tool({"action": "instructions"})) == {
+        "error": "agent-photo is unavailable on this platform"
+    }
 
 
 def test_personal_profile_directory_matches_runner_mode_contract(tmp_path):

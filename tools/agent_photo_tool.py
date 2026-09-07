@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import pwd
 import stat
 import subprocess
 from pathlib import Path
@@ -21,7 +20,6 @@ from tools.registry import registry, tool_error, tool_result
 
 
 TOOLSET = "agent_photo"
-WRAPPER_PATH = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local" / "bin" / "hermes-agent-photo"
 _MAX_PROMPT_CHARS = 4_000
 _MAX_OUTPUT_CHARS = 12_000
 
@@ -66,8 +64,44 @@ AGENT_PHOTO_SCHEMA = {
 }
 
 
+def _secure_descriptor_capability_available() -> bool:
+    """Return whether this host can enforce the wrapper's POSIX trust model."""
+    if os.name != "posix":
+        return False
+    try:
+        import pwd
+    except ImportError:
+        return False
+    return all(hasattr(os, attribute) for attribute in ("getuid", "O_DIRECTORY", "O_NOFOLLOW"))
+
+
+def _require_secure_descriptor_capability() -> None:
+    if not _secure_descriptor_capability_available():
+        raise ValueError("agent-photo is unavailable on this platform")
+
+
+def _current_uid() -> int:
+    _require_secure_descriptor_capability()
+    get_uid = getattr(os, "getuid", None)
+    if not callable(get_uid):
+        raise ValueError("agent-photo is unavailable on this platform")
+    return get_uid()
+
+
+def _default_wrapper_path() -> Path | None:
+    if not _secure_descriptor_capability_available():
+        return None
+    import pwd
+
+    return Path(pwd.getpwuid(_current_uid()).pw_dir) / ".local" / "bin" / "hermes-agent-photo"
+
+
+WRAPPER_PATH = _default_wrapper_path()
+
+
 def _active_personal_profile() -> Path:
     """Return the active profile only when it is an authorized personal profile."""
+    _require_secure_descriptor_capability()
     root = get_default_hermes_root().resolve(strict=True)
     home = get_hermes_home().expanduser().resolve(strict=True)
     if home.parent != root / "profiles" or not home.is_dir():
@@ -104,7 +138,7 @@ def _validate_fixed_directory(descriptor: int, resource: str) -> None:
     metadata = os.fstat(descriptor)
     if (
         not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
+        or metadata.st_uid != _current_uid()
         or metadata.st_mode & 0o022
     ):
         raise ValueError(f"agent-photo {resource} path is unsafe")
@@ -115,7 +149,7 @@ def _validate_profile_root_directory(descriptor: int) -> None:
     metadata = os.fstat(descriptor)
     if (
         not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
+        or metadata.st_uid != _current_uid()
         or stat.S_IMODE(metadata.st_mode) != 0o775
     ):
         raise ValueError("agent-photo profile path is unsafe")
@@ -126,7 +160,7 @@ def _validate_personal_profile_directory(descriptor: int) -> None:
     metadata = os.fstat(descriptor)
     if (
         not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
+        or metadata.st_uid != _current_uid()
         or stat.S_IMODE(metadata.st_mode) != 0o700
     ):
         raise ValueError("agent-photo profile path is unsafe")
@@ -134,8 +168,7 @@ def _validate_personal_profile_directory(descriptor: int) -> None:
 
 def _open_fixed_directory(root: Path, parts: tuple[str, ...], *, resource: str) -> int:
     """Open a fixed directory beneath a held no-follow directory-FD chain."""
-    if not hasattr(os, "O_NOFOLLOW"):
-        raise ValueError("agent-photo requires secure wrapper file descriptors")
+    _require_secure_descriptor_capability()
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
         current_fd = os.open(root, directory_flags)
@@ -204,7 +237,7 @@ def _open_fixed_file(root: Path, parts: tuple[str, ...], *, resource: str) -> in
     metadata = os.fstat(file_fd)
     if (
         not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
+        or metadata.st_uid != _current_uid()
         or metadata.st_mode & 0o022
     ):
         os.close(file_fd)
@@ -277,6 +310,9 @@ def agent_photo_approval_subject(args: dict[str, Any]) -> dict[str, Any]:
 
 def _trusted_wrapper_fd() -> int:
     """Open the fixed wrapper once so a later path swap cannot redirect it."""
+    _require_secure_descriptor_capability()
+    if WRAPPER_PATH is None:
+        raise ValueError("agent-photo is unavailable on this platform")
     try:
         if (
             WRAPPER_PATH.parent.name == "bin"
