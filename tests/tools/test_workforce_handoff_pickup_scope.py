@@ -26,6 +26,11 @@ def _clear_scope(monkeypatch) -> None:
 
 
 def _install_scope(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    monkeypatch.setenv("HERMES_PROFILE", "alina")
     monkeypatch.setenv("HERMES_COORDINATION_REQUEST_ROOT", "cr_pickup_123")
     monkeypatch.setenv("HERMES_COORDINATION_TASK_ID", "t_pickup_123")
     monkeypatch.setenv("HERMES_COORDINATION_PURPOSE", "work")
@@ -56,6 +61,10 @@ def test_pickup_scope_allows_only_the_exact_claimed_acknowledgment(monkeypatch):
     monkeypatch.setattr(
         "tools.workforce_handoff_pickup_scope._durable_claim_matches",
         lambda _scope: True,
+    )
+    monkeypatch.setattr(
+        "tools.workforce_handoff_pickup_scope._active_profile_matches",
+        lambda _target: True,
     )
     registry, calls = _registry()
 
@@ -90,13 +99,52 @@ def test_partial_pickup_metadata_fails_closed_for_every_tool(monkeypatch):
 
 def test_normal_sessions_are_unchanged_without_pickup_metadata(monkeypatch):
     _clear_scope(monkeypatch)
-    # A gateway commonly pins its board DB; that alone must not enable this
-    # pickup-only scope guard.
+    # Ordinary repair/review workers inherit all coordination fields.  They
+    # must remain unrestricted unless a pickup-only field is also present.
+    monkeypatch.setenv("HERMES_COORDINATION_REQUEST_ROOT", "cr_normal_123")
+    monkeypatch.setenv("HERMES_COORDINATION_TASK_ID", "t_normal_123")
+    monkeypatch.setenv("HERMES_COORDINATION_PURPOSE", "work")
     monkeypatch.setenv("HERMES_KANBAN_DB", "/tmp/shared-kanban.db")
     registry, calls = _registry()
 
     assert json.loads(registry.dispatch("terminal", {})) == {"ok": True}
     assert calls == [("terminal", {})]
+
+
+def test_pickup_scope_rejects_a_process_running_as_another_profile(monkeypatch):
+    _clear_scope(monkeypatch)
+    _install_scope(monkeypatch)
+    monkeypatch.setattr(
+        "tools.workforce_handoff_pickup_scope._durable_claim_matches",
+        lambda _scope: True,
+    )
+    monkeypatch.setattr(
+        "tools.workforce_handoff_pickup_scope._active_profile_matches",
+        lambda _target: False,
+    )
+    registry, calls = _registry()
+
+    denied = json.loads(registry.dispatch(
+        "workforce_handoff", {"action": "acknowledge", "task_id": "t_pickup_123"}
+    ))
+
+    assert denied["error_type"] == "workforce_handoff_pickup_scope_denied"
+    assert calls == []
+
+
+def test_active_pickup_profile_requires_both_profile_env_and_active_home(monkeypatch):
+    from tools.workforce_handoff_pickup_scope import _active_profile_matches
+
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    monkeypatch.setenv("HERMES_PROFILE", "alina")
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "alina")
+    assert _active_profile_matches("alina") is True
+
+    monkeypatch.setenv("HERMES_PROFILE", "aurora")
+    assert _active_profile_matches("alina") is False
 
 
 def test_only_a_validated_pickup_envelope_eagerly_exposes_the_handoff_tool(monkeypatch):
@@ -169,6 +217,7 @@ def test_real_registry_acknowledges_only_a_durably_claimed_pickup(monkeypatch, t
     monkeypatch.setenv("HERMES_COORDINATION_TASK_ID", created["task_id"])
     monkeypatch.setenv("HERMES_WORKFORCE_HANDOFF_PICKUP_TASK", created["task_id"])
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_PROFILE", "alina")
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     token = set_hermes_home_override(home / "profiles" / "alina")

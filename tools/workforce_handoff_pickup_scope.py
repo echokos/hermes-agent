@@ -18,15 +18,18 @@ _ENV_KEYS = (
     "HERMES_KANBAN_DB",
 )
 
+_PICKUP_ENV_KEYS = (
+    "HERMES_WORKFORCE_HANDOFF_PICKUP_TASK",
+    "HERMES_WORKFORCE_HANDOFF_PICKUP_TARGET",
+    "HERMES_WORKFORCE_HANDOFF_PICKUP_SOURCE",
+)
+
 
 def _scope_env() -> dict[str, str] | None:
     values = {key: os.environ.get(key, "") for key in _ENV_KEYS}
-    # HERMES_KANBAN_DB is a normal gateway/dispatcher pin.  It cannot opt a
-    # session into this narrowly-scoped control by itself.
-    pickup_present = [
-        key for key in _ENV_KEYS
-        if key != "HERMES_KANBAN_DB" and values[key]
-    ]
+    # Coordination roots are inherited by ordinary repair and review workers.
+    # Only the three pickup-only fields opt a turn into this capability clamp.
+    pickup_present = [key for key in _PICKUP_ENV_KEYS if values[key]]
     if not pickup_present:
         return None
     if any(not values[key] for key in _ENV_KEYS):
@@ -41,6 +44,19 @@ def _canonical_agent(value: str) -> str:
     if not candidate or candidate != str(value or "").strip():
         raise ValueError("pickup agent is not canonical")
     return load_organization().validate_execution_profile(candidate).agent
+
+
+def _active_profile_matches(target: str) -> bool:
+    """Require the running profile, not only child-controlled scope fields."""
+    from hermes_cli.profiles import get_active_profile_name
+
+    try:
+        return (
+            os.environ.get("HERMES_PROFILE", "").strip() == target
+            and _canonical_agent(get_active_profile_name()) == target
+        )
+    except Exception:
+        return False
 
 
 def _valid_identifier(value: str, prefix: str) -> bool:
@@ -115,6 +131,9 @@ def pickup_scope_denial(name: str, args: dict[str, Any]) -> str | None:
             or scope["HERMES_WORKFORCE_HANDOFF_PICKUP_TASK"] != task_id
             or not _valid_identifier(task_id, "t_")
             or not _valid_identifier(root_id, "cr_")
+            or not _active_profile_matches(
+                _canonical_agent(scope["HERMES_WORKFORCE_HANDOFF_PICKUP_TARGET"])
+            )
             or not _durable_claim_matches(scope)
         ):
             return "workforce handoff pickup scope is invalid"

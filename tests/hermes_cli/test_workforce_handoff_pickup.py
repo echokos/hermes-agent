@@ -13,6 +13,52 @@ import time
 from hermes_cli.workforce_handoff_pickup import _pickup_command, _pickup_env
 
 
+def _claimed_pickup(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db
+    from hermes_cli.workforce_handoffs import (
+        claim_owned_failure_handoff_pickup,
+        create_handoff,
+    )
+    from hermes_cli.workforce_org import load_organization
+
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "alina").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    organization = load_organization()
+    now = int(time.time())
+    iso = lambda offset: datetime.fromtimestamp(now + offset, timezone.utc).isoformat()
+    db_path = root / "kanban.db"
+    with kanban_db.connect_closing(db_path) as conn:
+        created = create_handoff(
+            conn,
+            source_agent="aurora",
+            target_agent="alina",
+            expected_outcome="Repair the owned operational failure",
+            acceptance_test="A later probe succeeds",
+            evidence_references=["execution:failure-1"],
+            acknowledgment_deadline=iso(120),
+            checkpoint_at=iso(3600),
+            organization=organization,
+            context={
+                "kind": "owned_operational_failure",
+                "technical_owner": "alina",
+                "director": "aurora",
+                "workflow_id": "owned-failure-test",
+                "event_id": "failure-1",
+            },
+            requires_source_acceptance=True,
+        )
+        pickup = claim_owned_failure_handoff_pickup(
+            conn, target_agent="alina", organization=organization, now=now + 1
+        )
+    assert pickup is not None
+    return db_path, created, pickup, organization, now
+
+
 def test_pickup_command_is_one_turn_tool_sourced_workforce_session(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.workforce_handoff_pickup._resolve_hermes_argv",
@@ -53,6 +99,75 @@ def test_pickup_env_scrubs_worker_identity_and_sets_exact_scope(monkeypatch, tmp
     assert env["HERMES_SESSION_SOURCE"] == "tool"
     assert env["HERMES_COORDINATION_REQUEST_ROOT"] == "cr_pickup_123"
     assert env["HERMES_WORKFORCE_HANDOFF_PICKUP_TARGET"] == "alina"
+
+
+def test_fresh_acknowledgment_survives_immediate_task_state_advance(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db
+    from hermes_cli.workforce_handoff_pickup import _fresh_acknowledgment
+    from hermes_cli.workforce_handoffs import acknowledge_handoff, record_checkpoint
+
+    db_path, created, pickup, organization, now = _claimed_pickup(monkeypatch, tmp_path)
+    with kanban_db.connect_closing(db_path) as conn:
+        acknowledge_handoff(
+            conn, created["task_id"], actor="alina", organization=organization, now=now + 2
+        )
+        record_checkpoint(
+            conn,
+            created["task_id"],
+            actor="alina",
+            evidence_references=["execution:repair-started"],
+            organization=organization,
+            now=now + 3,
+        )
+
+    assert _fresh_acknowledgment(
+        database_path=db_path,
+        task_id=created["task_id"],
+        request_root_id=pickup["request_root_id"],
+        target_agent="alina",
+        source_agent="aurora",
+    ) is True
+
+
+def test_pickup_reports_committed_ack_when_child_finalization_exits_nonzero(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db
+    from hermes_cli.workforce_handoff_pickup import run_workforce_handoff_pickup
+    from hermes_cli.workforce_handoffs import acknowledge_handoff
+
+    db_path, created, pickup, organization, now = _claimed_pickup(monkeypatch, tmp_path)
+
+    class FinalizationFailure:
+        returncode = 23
+
+        def wait(self):
+            with kanban_db.connect_closing(db_path) as conn:
+                acknowledge_handoff(
+                    conn,
+                    created["task_id"],
+                    actor="alina",
+                    organization=organization,
+                    now=now + 2,
+                )
+            return self.returncode
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_handoff_pickup.subprocess.Popen",
+        lambda *_args, **_kwargs: FinalizationFailure(),
+    )
+    result = asyncio.run(run_workforce_handoff_pickup(
+        task_id=created["task_id"],
+        request_root_id=pickup["request_root_id"],
+        target_agent="alina",
+        source_agent="aurora",
+        database_path=db_path,
+    ))
+
+    assert result.acknowledged is True
+    assert result.returncode == 23
+    assert result.timed_out is False
+    assert result.reason == "pickup exited with 23 after durable acknowledgment"
 
 
 def test_pickup_runs_actual_cli_and_real_registry_with_loopback_provider(monkeypatch, tmp_path):

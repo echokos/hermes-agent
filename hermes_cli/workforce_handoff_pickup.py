@@ -112,9 +112,19 @@ def _pickup_command(*, target_agent: str, request_root_id: str, task_id: str) ->
 
 
 def _fresh_acknowledgment(
-    *, database_path: Path, task_id: str, target_agent: str
+    *,
+    database_path: Path,
+    task_id: str,
+    request_root_id: str,
+    target_agent: str,
+    source_agent: str,
 ) -> bool:
-    """Require the child to have changed this exact handoff through its tool."""
+    """Require an acknowledgment after this exact pickup claim.
+
+    The dispatcher can advance the task from ``accepted`` immediately after
+    the tool commits, so event ordering is authoritative rather than its
+    current body state or the child's eventual exit code.
+    """
     from hermes_cli import kanban_db
 
     try:
@@ -123,18 +133,29 @@ def _fresh_acknowledgment(
             if task is None:
                 return False
             payload = json.loads(task.body or "{}")
-            if not isinstance(payload, dict) or (
-                payload.get("kind") != "workforce_handoff"
-                or payload.get("state") != "accepted"
-                or payload.get("target_agent") != target_agent
-            ):
+            if not isinstance(payload, dict) or payload.get("kind") != "workforce_handoff":
                 return False
-            return any(
-                event.kind == "workforce_handoff_acknowledged"
-                and isinstance(event.payload, dict)
-                and event.payload.get("actor") == target_agent
-                for event in kanban_db.list_events(conn, task_id)
-            )
+            claim_seen = False
+            for event in kanban_db.list_events(conn, task_id):
+                if event.kind == "workforce_handoff_pickup_claimed":
+                    claim = event.payload
+                    claim_seen = bool(
+                        isinstance(claim, dict)
+                        and claim.get("actor") == target_agent
+                        and claim.get("target_agent") == target_agent
+                        and claim.get("source_agent") == source_agent
+                        and claim.get("request_root_id") == request_root_id
+                        and claim.get("claim_kind") == "owned_operational_failure"
+                    )
+                    continue
+                if (
+                    claim_seen
+                    and event.kind == "workforce_handoff_acknowledged"
+                    and isinstance(event.payload, dict)
+                    and event.payload.get("actor") == target_agent
+                ):
+                    return True
+            return False
     except Exception:
         return False
 
@@ -195,25 +216,45 @@ async def run_workforce_handoff_pickup(
             )
         except TimeoutError:
             kill_process_tree(proc)
+            returncode = None
             try:
-                await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=1)
+                returncode = await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=1)
             except Exception:
                 pass
+            acknowledged = _fresh_acknowledgment(
+                database_path=db_path,
+                task_id=task_id,
+                request_root_id=request_root_id,
+                target_agent=target_agent,
+                source_agent=source_agent,
+            )
             return WorkforceHandoffPickupResult(
-                acknowledged=False,
+                acknowledged=acknowledged,
                 timed_out=True,
-                returncode=None,
+                returncode=returncode,
                 log_path=log_path,
-                reason="pickup timed out",
+                reason=(
+                    "pickup timed out after durable acknowledgment"
+                    if acknowledged else "pickup timed out"
+                ),
             )
 
-    acknowledged = returncode == 0 and _fresh_acknowledgment(
-        database_path=db_path, task_id=task_id, target_agent=target_agent
+    acknowledged = _fresh_acknowledgment(
+        database_path=db_path,
+        task_id=task_id,
+        request_root_id=request_root_id,
+        target_agent=target_agent,
+        source_agent=source_agent,
     )
     return WorkforceHandoffPickupResult(
         acknowledged=acknowledged,
         timed_out=False,
         returncode=returncode,
         log_path=log_path,
-        reason=None if acknowledged else "pickup exited without a durable acknowledgment",
+        reason=(
+            None if returncode == 0 and acknowledged
+            else f"pickup exited with {returncode} after durable acknowledgment"
+            if acknowledged
+            else "pickup exited without a durable acknowledgment"
+        ),
     )
