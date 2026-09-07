@@ -983,6 +983,158 @@ class TestChatCompletionsEndpoint:
             data = await resp.json()
             assert "messages" in data["error"]["message"]
 
+    @pytest.mark.asyncio
+    async def test_authenticated_loopback_final_return_header_reconstructs_turn_context(
+        self, tmp_path
+    ):
+        """The privileged context is header-only and reaches the actual turn.
+
+        This exercises the HTTP parser rather than directly calling the
+        helper, so a public OpenAI-shaped JSON body cannot accidentally gain
+        final-return budget authority.
+        """
+        from gateway.wake import (
+            FINAL_RETURN_CLAIM_HEADER,
+            FINAL_RETURN_CONTEXT_HEADER,
+            INTERNAL_WAKE_HEADER,
+            encode_final_return_context,
+        )
+
+        adapter = _make_adapter(api_key="test-api-key")
+        board = tmp_path / "board.db"
+        board.touch()
+        context = {
+            "request_root_id": "cr_final_1",
+            "task_id": "task_final_1",
+            "event_id": "42",
+            "responsible_agent": "default",
+            "db_path": str(board),
+        }
+
+        async def _mock_run_agent(**kwargs):
+            assert kwargs["final_return_context"] == context
+            return (
+                {"final_response": "final", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async def _mock_persist_receipt(**kwargs):
+            kwargs["delivery_state"].record_receipt("session-message:api-session:9")
+            return True
+
+        from types import SimpleNamespace
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                patch(
+                    "gateway.run._record_final_return_persisted_receipt",
+                    side_effect=_mock_persist_receipt,
+                ),
+                patch(
+                    "gateway.delivery_ledger.claim_coordination_final_return_delivery",
+                    return_value=SimpleNamespace(state="sending", send_claimed=True),
+                ),
+            ):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer test-api-key",
+                        INTERNAL_WAKE_HEADER: "final-return-v1",
+                        FINAL_RETURN_CONTEXT_HEADER: encode_final_return_context(context),
+                        FINAL_RETURN_CLAIM_HEADER: "a" * 32,
+                    },
+                    json={
+                        "messages": [{"role": "user", "content": "final return"}],
+                        # A client body field must remain inert even on this
+                        # authenticated request.
+                        "coordination_context": {"request_root_id": "forged"},
+                    },
+                )
+                assert response.status == 200
+                assert response.headers["X-Hermes-Final-Return-Receipt"] == "session-message:api-session:9"
+
+    @pytest.mark.asyncio
+    async def test_client_body_cannot_create_final_return_context(self, adapter):
+        captured = {}
+
+        async def _mock_run_agent(**kwargs):
+            captured["context"] = kwargs["final_return_context"]
+            return (
+                {"final_response": "ordinary", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "messages": [{"role": "user", "content": "ordinary"}],
+                        "coordination_context": {
+                            "request_root_id": "cr_forged",
+                            "task_id": "task_forged",
+                            "event_id": "42",
+                            "responsible_agent": "aurora",
+                            "db_path": "/tmp/forged.db",
+                        },
+                    },
+                )
+                assert response.status == 200
+        assert captured["context"] is None
+
+    @pytest.mark.asyncio
+    async def test_api_final_return_scope_exists_only_during_actual_agent_turn(
+        self, tmp_path
+    ):
+        """The reserve starts in the executor at ``run_conversation`` only."""
+        from agent import coordination_budget as budget
+
+        adapter = _make_adapter()
+        board = tmp_path / "board.db"
+        board.touch()
+        context = {
+            "request_root_id": "cr_final_1",
+            "task_id": "task_final_1",
+            "event_id": "42",
+            "responsible_agent": "aurora",
+            "db_path": str(board),
+        }
+        seen = {}
+
+        class _Agent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+
+            def run_conversation(self, **kwargs):
+                scope = budget._scope.get()  # noqa: SLF001 - boundary assertion
+                assert scope is not None
+                seen["scope"] = (
+                    scope.request_root_id,
+                    scope.task_id,
+                    scope.purpose,
+                    scope.db_path,
+                )
+                return {"final_response": "final", "messages": []}
+
+        agent = _Agent()
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            result, _usage = await adapter._run_agent(
+                user_message="final",
+                conversation_history=[],
+                session_id="api-session",
+                final_return_context=context,
+            )
+
+        assert result["final_response"] == "final"
+        assert seen["scope"] == (
+            "cr_final_1", "task_final_1", "final_return", board,
+        )
+        assert budget._scope.get() is None  # noqa: SLF001 - no next-turn leak
+
 
     @pytest.mark.asyncio
     async def test_chat_completions_stream_passes_request_model_provider_options(self, adapter):
@@ -2865,4 +3017,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

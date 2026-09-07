@@ -94,6 +94,50 @@ class TestStateMachine:
         assert _row("ob-1")["state"] == "pending"
 
 
+class TestCoordinationFinalReturnOutbox:
+    @staticmethod
+    def _claim():
+        with patch.object(dl, "_validate_coordination_final_return_authority"):
+            return dl.claim_coordination_final_return_delivery(
+                request_root_id="cr_return_1",
+                task_id="task_return_1",
+                event_id=42,
+                responsible_agent="aurora",
+                board_path="/tmp/board.db",
+                session_key="agent:aurora:telegram:dm:1",
+                platform="telegram",
+                chat_id="1",
+                thread_id=None,
+                content="finished",
+            )
+
+    def test_claim_is_stable_and_never_enters_generic_restart_sweep(self):
+        first = self._claim()
+        assert first.state == "sending"
+        assert first.obligation_id == "coordination:cr_return_1:final_return:42"
+        assert dl.sweep_recoverable() == []
+
+        # A duplicate watcher observation cannot turn this into a second send.
+        duplicate = self._claim()
+        assert duplicate.state == "sending"
+
+    def test_uncertain_requires_explicit_reconciliation(self):
+        self._claim()
+        uncertain = dl.mark_coordination_final_return_uncertain(
+            "cr_return_1", 42, error="timeout"
+        )
+        assert uncertain.state == "uncertain"
+        assert self._claim().state == "uncertain"
+        assert dl.reconcile_coordination_final_return("cr_return_1", 42) == uncertain
+
+        acknowledged = dl.reconcile_coordination_final_return(
+            "cr_return_1", 42, returned_message_id="session-message:sid:99"
+        )
+        assert acknowledged is not None
+        assert acknowledged.state == "acknowledged"
+        assert acknowledged.returned_message_id == "session-message:sid:99"
+
+
 class TestObligationId:
     def test_stable_and_distinct(self):
         a = dl.compute_obligation_id("sk1", "msg1", "hello")

@@ -41,6 +41,7 @@ Requires:
 """
 
 import asyncio
+import ipaddress
 import errno
 import hashlib
 import hmac
@@ -1835,6 +1836,73 @@ class APIServerAdapter(BasePlatformAdapter):
             {"error": {"message": "Invalid gateway API key (API_SERVER_KEY)", "type": "gateway_auth_error", "code": "gateway_auth_failed"}},
             status=401,
         )
+
+    @staticmethod
+    def _is_loopback_peer(request: "web.Request") -> bool:
+        """Accept a privileged wake bridge only from the local socket peer."""
+        try:
+            peer = request.transport.get_extra_info("peername") if request.transport else None
+            host = str(peer[0]) if isinstance(peer, (tuple, list)) and peer else ""
+            address = ipaddress.ip_address(host)
+            return bool(
+                address.is_loopback
+                or (
+                    getattr(address, "ipv4_mapped", None) is not None
+                    and address.ipv4_mapped.is_loopback
+                )
+            )
+        except (ValueError, TypeError, AttributeError):
+            return False
+
+    def _parse_internal_final_return_context(
+        self, request: "web.Request"
+    ) -> tuple[Optional[dict[str, str]], str, Optional["web.Response"]]:
+        """Decode a final-return wake context after host and API auth checks.
+
+        The public OpenAI-shaped request body is intentionally never read for
+        this privilege.  Only ``deliver_wake`` can produce the paired headers,
+        and the API handler independently requires its authenticated loopback
+        request before reconstructing the turn-local context.
+        """
+        from gateway.wake import (
+            FINAL_RETURN_CLAIM_HEADER,
+            FINAL_RETURN_CONTEXT_HEADER,
+            INTERNAL_WAKE_HEADER,
+            _coordination_claim_header,
+            decode_final_return_context,
+        )
+
+        marker = request.headers.get(INTERNAL_WAKE_HEADER)
+        encoded = request.headers.get(FINAL_RETURN_CONTEXT_HEADER)
+        claim_token = request.headers.get(FINAL_RETURN_CLAIM_HEADER)
+        if marker is None and encoded is None and claim_token is None:
+            return None, "", None
+        if marker != "final-return-v1" or not encoded or not claim_token:
+            return None, "", web.json_response(
+                _openai_error("Invalid internal wake context"), status=400
+            )
+        expected_key = self._expected_api_key()
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+        if (
+            not expected_key
+            or not self._is_loopback_peer(request)
+            or not hmac.compare_digest(token.encode(), expected_key.encode())
+        ):
+            logger.warning("Rejected privileged final-return wake: %s", self._request_audit_log_suffix(request))
+            return None, "", web.json_response(
+                _openai_error("Invalid internal wake provenance"), status=403
+            )
+        try:
+            return (
+                decode_final_return_context(encoded),
+                _coordination_claim_header(claim_token),
+                None,
+            )
+        except ValueError:
+            return None, "", web.json_response(
+                _openai_error("Invalid internal wake context"), status=400
+            )
 
     @staticmethod
     def _normalize_callback_platform(value: str) -> str:
@@ -4140,6 +4208,32 @@ class APIServerAdapter(BasePlatformAdapter):
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
+        final_return_context, final_return_claim_token, context_error = self._parse_internal_final_return_context(
+            request
+        )
+        if context_error is not None:
+            return context_error
+        if final_return_context is not None:
+            from gateway.wake import final_return_context_matches_profile
+            from hermes_cli.profiles import get_active_profile_name
+
+            actual_profile = (
+                _api_request_profile.get()
+                or get_active_profile_name()
+                or "default"
+            )
+            if not final_return_context_matches_profile(
+                final_return_context, actual_profile
+            ):
+                logger.warning(
+                    "Rejected final-return API wake for responsible=%s on profile=%s",
+                    final_return_context["responsible_agent"], actual_profile,
+                )
+                return web.json_response(
+                    _openai_error("Final-return wake is routed to the wrong profile"),
+                    status=403,
+                )
+
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             return web.json_response(
@@ -4148,6 +4242,13 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        if final_return_context is not None and stream:
+            # Final returns cannot expose an SSE delta before the complete
+            # response has a durable transcript receipt and outbox claim.
+            return web.json_response(
+                _openai_error("Final-return wakes do not support streaming"),
+                status=400,
+            )
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -4251,6 +4352,32 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
+
+        final_return_receipt_state = None
+        final_return_receipt_watermark = -1
+        if final_return_context is not None:
+            try:
+                from gateway.wake import FinalReturnDeliveryState
+
+                receipt_db = await self._ensure_session_db_async()
+                if receipt_db is None:
+                    raise RuntimeError("session database unavailable")
+                prior_rows = await asyncio.to_thread(
+                    receipt_db.get_messages, session_id, latest=True, limit=1
+                )
+                final_return_receipt_watermark = int(
+                    prior_rows[-1]["id"]
+                ) if prior_rows else 0
+                final_return_receipt_state = FinalReturnDeliveryState(
+                    context=final_return_context,
+                    completion=asyncio.get_running_loop().create_future(),
+                )
+            except Exception:
+                logger.warning("Final-return API wake cannot establish transcript watermark", exc_info=True)
+                return web.json_response(
+                    _openai_error("Final-return wake cannot establish a durable receipt"),
+                    status=503,
+                )
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -4358,6 +4485,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                final_return_context=final_return_context,
+                final_return_claim_token=final_return_claim_token,
                 **agent_overrides,
                 route=route,
             ))
@@ -4379,6 +4508,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                final_return_context=final_return_context,
+                final_return_claim_token=final_return_claim_token,
                 **agent_overrides,
                 route=route,
             )
@@ -4414,6 +4545,58 @@ class APIServerAdapter(BasePlatformAdapter):
         raw_err_msg = result.get("error")
         err_msg = _redact_api_error_text(raw_err_msg) if raw_err_msg else raw_err_msg
 
+        if final_return_context is not None:
+            from gateway.run import _record_final_return_persisted_receipt
+
+            effective_session_id = str(result.get("session_id") or session_id)
+            receipt_ok = (
+                effective_session_id == session_id
+                and await _record_final_return_persisted_receipt(
+                    delivery_state=final_return_receipt_state,
+                    session_db=receipt_db,
+                    session_id=session_id,
+                    watermark=final_return_receipt_watermark,
+                    expected_user_content=user_message,
+                    final_response=final_response,
+                )
+            )
+            if not receipt_ok:
+                return web.json_response(
+                    _openai_error("Final-return wake lacks a durable receipt"),
+                    status=503,
+                )
+            try:
+                from gateway.delivery_ledger import claim_coordination_final_return_delivery
+
+                claimed = await asyncio.to_thread(
+                    claim_coordination_final_return_delivery,
+                    request_root_id=final_return_context["request_root_id"],
+                    task_id=final_return_context["task_id"],
+                    event_id=int(final_return_context["event_id"]),
+                    responsible_agent=final_return_context["responsible_agent"],
+                    board_path=final_return_context["db_path"],
+                    session_key=gateway_session_key or session_id,
+                    platform="api_server",
+                    chat_id=session_id,
+                    thread_id=None,
+                    content=final_response,
+                    claim_token=final_return_claim_token,
+                )
+            except Exception:
+                logger.warning("Final-return API delivery admission failed", exc_info=True)
+                return web.json_response(
+                    _openai_error("Final-return delivery was not admitted"), status=409,
+                )
+            if claimed.state == "acknowledged":
+                final_return_receipt_state.record_receipt(
+                    claimed.returned_message_id
+                )
+            elif not claimed.send_claimed:
+                return web.json_response(
+                    _openai_error("Final-return delivery requires reconciliation"),
+                    status=409,
+                )
+
         # Decide finish_reason. OpenAI uses "length" for truncation, "stop"
         # for normal completion, and downstream SDKs accept "error" / custom
         # codes. See issue #22496.
@@ -4427,6 +4610,10 @@ class APIServerAdapter(BasePlatformAdapter):
         response_headers = {
             "X-Hermes-Session-Id": result.get("session_id", session_id),
         }
+        if final_return_context is not None:
+            response_headers["X-Hermes-Final-Return-Receipt"] = (
+                final_return_receipt_state.returned_message_id
+            )
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
 
@@ -6305,6 +6492,8 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        final_return_context: Optional[dict[str, str]] = None,
+        final_return_claim_token: str = "",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6385,11 +6574,29 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
+                    if final_return_context is None:
+                        result = agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=conversation_history,
+                            task_id=effective_task_id,
+                        )
+                    else:
+                        # API wakes execute outside GatewayRunner. Bind the
+                        # same budget at the physical AIAgent turn boundary,
+                        # rather than at HTTP parsing/enqueue time.
+                        from agent.coordination_budget import scoped_coordination_budget
+
+                        with scoped_coordination_budget(
+                            request_root_id=final_return_context["request_root_id"],
+                            task_id=final_return_context["task_id"],
+                            purpose="final_return",
+                            db_path=Path(final_return_context["db_path"]),
+                        ):
+                            result = agent.run_conversation(
+                                user_message=user_message,
+                                conversation_history=conversation_history,
+                                task_id=effective_task_id,
+                            )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
