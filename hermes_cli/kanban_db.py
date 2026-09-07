@@ -5588,6 +5588,80 @@ def _handoff_source_review_is_current(
     )
 
 
+def _handoff_recovery_verification_is_current(
+    conn: sqlite3.Connection,
+    task_id: str,
+    payload: dict,
+) -> bool:
+    """Prove the latest owned-failure episode passed its recovery gate."""
+    context = payload.get("context")
+    if (
+        not isinstance(context, dict)
+        or context.get("kind") != "owned_operational_failure"
+    ):
+        return True
+
+    rows = conn.execute(
+        "SELECT id, kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN (?, ?) ORDER BY id",
+        (
+            task_id,
+            "workforce_handoff_recovery_required",
+            "workforce_handoff_recovery_verified",
+        ),
+    ).fetchall()
+    latest_required: tuple[int, str, int, int] | None = None
+    verified = False
+    for event in rows:
+        try:
+            event_payload = json.loads(event["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            event_payload = {}
+        if not isinstance(event_payload, dict):
+            continue
+        if event["kind"] == "workforce_handoff_recovery_required":
+            failure_event_id = str(event_payload.get("failure_event_id") or "")
+            if not failure_event_id:
+                latest_required = None
+                verified = False
+                continue
+            try:
+                required = max(1, int(event_payload.get("required_successes") or 2))
+                failure_order = int(event_payload.get("failure_order") or 0)
+            except (TypeError, ValueError):
+                latest_required = None
+                verified = False
+                continue
+            latest_required = (
+                int(event["id"]), failure_event_id, failure_order, required,
+            )
+            verified = False
+            continue
+        if latest_required is None or int(event["id"]) <= latest_required[0]:
+            continue
+        _, failure_event_id, failure_order, required = latest_required
+        if str(event_payload.get("failure_event_id") or "") != failure_event_id:
+            continue
+        success_ids = event_payload.get("success_event_ids")
+        success_orders = event_payload.get("success_orders")
+        if not isinstance(success_ids, list) or not isinstance(success_orders, list):
+            continue
+        normalized_ids = [str(value).strip() for value in success_ids]
+        try:
+            orders = [int(value) for value in success_orders]
+        except (TypeError, ValueError):
+            continue
+        verified = (
+            len(normalized_ids) == len(orders)
+            and len(normalized_ids) >= required
+            and all(normalized_ids)
+            and len(set(normalized_ids)) == len(normalized_ids)
+            and len(set(orders)) == len(orders)
+            and all(order > failure_order for order in orders)
+        )
+    return verified
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5649,6 +5723,17 @@ def complete_task(
                 {"reason": "target acknowledgment and source-owned review are required"},
             )
         return False
+    if handoff is not None and not _handoff_recovery_verification_is_current(
+        conn, task_id, handoff
+    ):
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_recovery_verification",
+                {"reason": "the latest owned failure has not passed its recovery gate"},
+            )
+        return False
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5692,6 +5777,10 @@ def complete_task(
             return False
         if handoff is not None and not _handoff_source_review_is_current(
             conn, task_id, handoff, expected_run_id
+        ):
+            return False
+        if handoff is not None and not _handoff_recovery_verification_is_current(
+            conn, task_id, handoff
         ):
             return False
         prior = conn.execute(

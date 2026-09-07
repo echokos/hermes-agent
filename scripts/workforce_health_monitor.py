@@ -29,6 +29,7 @@ from hermes_cli.workforce_handoffs import (
     sweep_overdue_handoffs,
 )
 from hermes_cli.workforce_org import load_organization
+from hermes_constants import get_hermes_home
 
 
 FAILURE_STATUSES = {"error", "failed", "unknown"}
@@ -522,7 +523,11 @@ def _record_intake_failure(
         "checkpoint_at": event.get("checkpoint_at"),
         "execution_id": str(event.get("execution_id") or ""),
         "event_id": str(event.get("event_id") or ""),
+        "failure_order": int(event.get("source_order") or 0),
         "ownership_key": str(event.get("ownership_key") or ""),
+        "recovery_successes_required": int(
+            event.get("recovery_successes_required") or 2
+        ),
         "required_outcome": (
             "Restore the integration and attach bounded verification evidence. "
             "The technical owner must acknowledge the incident; the director "
@@ -593,6 +598,71 @@ def _record_intake_failure(
             f"sanitized_error={_safe_error(event.get('sanitized_error'))}",
         )
     return task_id, created, invalid, owner, director
+
+
+def _record_recovery_requirement(
+    conn: sqlite3.Connection,
+    task_id: str,
+    event: dict[str, Any],
+) -> None:
+    """Persist the latest failure episode on the task's durable event stream."""
+    failure_event_id = str(event.get("event_id") or "")
+    if not failure_event_id:
+        return
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'workforce_handoff_recovery_required' ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and str(payload.get("failure_event_id") or "") == failure_event_id
+        ):
+            return
+    with kanban_db.write_txn(conn):
+        kanban_db._append_event(
+            conn,
+            task_id,
+            "workforce_handoff_recovery_required",
+            {
+                "failure_event_id": failure_event_id,
+                "failure_order": int(event.get("source_order") or 0),
+                "required_successes": int(
+                    event.get("recovery_successes_required") or 2
+                ),
+            },
+        )
+
+
+def _record_recovery_verification(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    failure_event_id: str,
+    failure_order: int,
+    success_event_ids: list[str],
+    success_orders: list[int],
+    required: int,
+) -> None:
+    """Attach exact post-failure execution evidence to the incident task."""
+    with kanban_db.write_txn(conn):
+        kanban_db._append_event(
+            conn,
+            task_id,
+            "workforce_handoff_recovery_verified",
+            {
+                "failure_event_id": failure_event_id,
+                "failure_order": int(failure_order),
+                "success_event_ids": list(success_event_ids),
+                "success_orders": [int(value) for value in success_orders],
+                "required_successes": int(required),
+            },
+        )
 
 
 def _sync_intake_lifecycle(
@@ -740,8 +810,11 @@ def run(*, organization: Path, database: Path, state_path: Path) -> dict[str, An
     now = int(time.time())
     detected = attached = created = recovered = invalid_ownership = 0
 
+    # Host producers write under the canonical Hermes state directory. The
+    # monitor's own cursor file may intentionally live elsewhere (the shipped
+    # unit uses ``workforce-control/``), so it cannot define the intake path.
     intake: list[dict[str, Any]] = _new_intake_events(
-        state_path.parent / INTAKE_FILENAME, cursors,
+        get_hermes_home() / "state" / INTAKE_FILENAME, cursors,
     )
     for agent in org.operational_agents(include_planned=False):
         profile = Path(str(agent.profile_path))
@@ -780,12 +853,30 @@ def run(*, organization: Path, database: Path, state_path: Path) -> dict[str, An
                     and source_order > int(row.get("last_failure_order") or -1)
                 ):
                     successes = row.setdefault("recovery_success_event_ids", [])
+                    success_orders = row.setdefault("recovery_success_orders", {})
                     if event_id not in successes:
                         successes.append(event_id)
+                    success_orders[event_id] = source_order
                     required = int(row.get("recovery_successes_required") or 2)
                     if len(successes) >= required and not row.get("recovery_verified"):
                         task_id = str(row.get("task_id") or "")
                         if task_id:
+                            _record_recovery_verification(
+                                conn,
+                                task_id,
+                                failure_event_id=str(
+                                    row.get("episode_event_id") or ""
+                                ),
+                                failure_order=int(
+                                    row.get("last_failure_order") or 0
+                                ),
+                                success_event_ids=list(successes),
+                                success_orders=[
+                                    int(success_orders.get(value) or 0)
+                                    for value in successes
+                                ],
+                                required=required,
+                            )
                             kanban_db.add_comment(
                                 conn,
                                 task_id,
@@ -807,6 +898,7 @@ def run(*, organization: Path, database: Path, state_path: Path) -> dict[str, An
             task_id, was_created, was_invalid, owner, director = _record_intake_failure(
                 conn, org=org, event=event, state_row=row
             )
+            _record_recovery_requirement(conn, task_id, event)
             row.update({
                 "status": "active",
                 "task_id": task_id,
@@ -824,6 +916,7 @@ def run(*, organization: Path, database: Path, state_path: Path) -> dict[str, An
                     event.get("recovery_successes_required") or 2
                 ),
                 "recovery_success_event_ids": [],
+                "recovery_success_orders": {},
                 "recovery_verified": False,
             })
             _mark_event_processed(row, source_order, event_id)

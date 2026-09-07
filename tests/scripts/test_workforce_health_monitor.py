@@ -189,9 +189,12 @@ def test_opted_in_profile_failure_is_owned_deduplicated_and_recovery_cannot_comp
     assert idle["recovered"] == 0
 
 
-def test_missing_host_ownership_creates_internal_aurora_configuration_incident(tmp_path: Path):
+def test_missing_host_ownership_creates_internal_aurora_configuration_incident(
+    tmp_path: Path, monkeypatch,
+):
     organization, database, _state, _profile = _fixture(tmp_path)
-    state = tmp_path / "state" / "workforce-health.json"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state = tmp_path / "workforce-control" / "health-monitor-state.json"
     append_host_failure(tmp_path, {
         "workflow_id": "op-onecli-sync",
         "source_id": "op-onecli-sync",
@@ -207,9 +210,12 @@ def test_missing_host_ownership_creates_internal_aurora_configuration_incident(t
         assert "failure_ownership_configuration" in (task["body"] or "")
 
 
-def test_host_recovery_event_is_ordered_and_does_not_complete_owner_incident(tmp_path: Path):
+def test_host_recovery_event_is_ordered_and_does_not_complete_owner_incident(
+    tmp_path: Path, monkeypatch,
+):
     organization, database, _state, _profile = _fixture(tmp_path)
-    state = tmp_path / "state" / "workforce-health.json"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state = tmp_path / "workforce-control" / "health-monitor-state.json"
     failure = {
         "workflow_id": "op-onecli-sync", "source_id": "op-onecli-sync",
         "technical_owner": "worker", "director": "aurora", "error": "exit 1",
@@ -232,6 +238,111 @@ def test_host_recovery_event_is_ordered_and_does_not_complete_owner_incident(tmp
     with kanban_db.connect_closing(database) as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
         assert conn.execute("SELECT status FROM tasks").fetchone()[0] != "done"
+
+
+def test_owned_repair_requires_two_actual_successes_before_director_completion(
+    tmp_path: Path, monkeypatch,
+):
+    organization, database, state, profile = _fixture(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    job = {
+        "id": "job-1",
+        "name": "Collector",
+        "workflow_id": "collector-workflow",
+        "failure_ownership": {
+            "technical_owner": "worker",
+            "director": "aurora",
+        },
+    }
+    append_profile_failure(profile, job, "timeout", execution_id="failure-1")
+    assert run(
+        organization=organization, database=database, state_path=state,
+    )["created"] == 1
+
+    with kanban_db.connect_closing(database) as conn:
+        task_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
+        acknowledge_handoff(
+            conn,
+            task_id,
+            actor="worker",
+            organization=load_organization(organization),
+        )
+        owner_run = kanban_db.claim_task(conn, task_id, claimer="worker:test")
+        assert owner_run is not None
+        assert kanban_db.request_review(
+            conn,
+            task_id,
+            summary="Repair ready for scheduler-path verification.",
+            expected_run_id=owner_run.current_run_id,
+        )
+        review_run = kanban_db.claim_review_task(
+            conn, task_id, claimer="aurora:test"
+        )
+        assert review_run is not None
+        assert not kanban_db.complete_task(
+            conn,
+            task_id,
+            summary="Premature acceptance before the recovery gate.",
+            expected_run_id=review_run.current_run_id,
+        )
+        assert kanban_db.get_task(conn, task_id).status == "running"
+
+    append_profile_recovery(profile, job, execution_id="success-1")
+    assert run(
+        organization=organization, database=database, state_path=state,
+    )["recovered"] == 0
+    append_profile_recovery(profile, job, execution_id="success-2")
+    assert run(
+        organization=organization, database=database, state_path=state,
+    )["recovered"] == 1
+
+    with kanban_db.connect_closing(database) as conn:
+        evidence = [
+            event
+            for event in kanban_db.list_events(conn, task_id)
+            if event.kind == "workforce_handoff_recovery_verified"
+        ]
+        assert len(evidence) == 1
+        assert len(set(evidence[0].payload["success_event_ids"])) == 2
+        assert len(set(evidence[0].payload["success_orders"])) == 2
+        first_recovery_order = max(evidence[0].payload["success_orders"])
+
+    append_profile_failure(profile, job, "timeout again", execution_id="failure-2")
+    assert run(
+        organization=organization, database=database, state_path=state,
+    )["created"] == 0
+
+    with kanban_db.connect_closing(database) as conn:
+        assert not kanban_db.complete_task(
+            conn,
+            task_id,
+            summary="Stale recovery evidence cannot satisfy the new failure.",
+            expected_run_id=review_run.current_run_id,
+        )
+
+    append_profile_recovery(profile, job, execution_id="success-3")
+    assert run(
+        organization=organization, database=database, state_path=state,
+    )["recovered"] == 0
+    append_profile_recovery(profile, job, execution_id="success-4")
+    assert run(
+        organization=organization, database=database, state_path=state,
+    )["recovered"] == 1
+
+    with kanban_db.connect_closing(database) as conn:
+        evidence = [
+            event
+            for event in kanban_db.list_events(conn, task_id)
+            if event.kind == "workforce_handoff_recovery_verified"
+        ]
+        assert len(evidence) == 2
+        assert min(evidence[-1].payload["success_orders"]) > first_recovery_order
+        assert kanban_db.complete_task(
+            conn,
+            task_id,
+            summary="Director accepted after two scheduler executions.",
+            expected_run_id=review_run.current_run_id,
+        )
 
 
 def _accept_owner_repair(database: Path, task_id: str, organization: Path):
