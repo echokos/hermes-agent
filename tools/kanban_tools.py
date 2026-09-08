@@ -733,10 +733,17 @@ def _handle_list(args: dict, **kw) -> str:
                         limit=limit + 1,
                     )
                     signal_ids = {task.id for task in signals}
-                    # One shared candidate budget, not twelve outcomes plus
-                    # twelve signals. Ownership classes remain explicit below.
-                    by_id = {task.id: task for task in [*rows, *signals]}
-                    rows = sorted(by_id.values(), key=lambda task: (-task.priority, task.created_at, task.id))
+                    # Alternate intake and outcomes within one candidate budget
+                    # so either backlog cannot hide the other. Signal ordering
+                    # reflects canonical reobservations, not only creation age.
+                    outcomes = rows
+                    rows = []
+                    seen_ids: set[str] = set()
+                    for index in range(max(len(signals), len(outcomes))):
+                        for group in (signals, outcomes):
+                            if index < len(group) and group[index].id not in seen_ids:
+                                rows.append(group[index])
+                                seen_ids.add(group[index].id)
             else:
                 rows = kb.list_tasks(
                     conn,
@@ -2243,6 +2250,8 @@ KANBAN_LIST_SCHEMA = {
                     "unresolved workforce signals for the current actor's decision, explicitly "
                     "marked triage_only and launch_authorized=false; visibility does not "
                     "authorize execution. One shared limit covers both record classes. "
+                    "Portfolio results alternate signals and outcomes; signals use priority "
+                    "then newest canonical observation, and unused slots flow to the other class. "
                     "Mutually exclusive with assignee."
                 ),
             },

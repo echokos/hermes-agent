@@ -5905,7 +5905,7 @@ def list_unresolved_workforce_signal_tasks(
     rows = conn.execute(
         "SELECT t.* FROM tasks t JOIN wc_items i ON i.task_id = t.id "
         f"WHERE {' AND '.join(clauses)} "
-        "ORDER BY t.priority DESC, t.created_at ASC, t.id ASC LIMIT ?", tuple(params),
+        "ORDER BY t.priority DESC, i.updated_at DESC, t.created_at DESC, t.id ASC LIMIT ?", tuple(params),
     ).fetchall()
     return [Task.from_row(row) for row in rows]
 

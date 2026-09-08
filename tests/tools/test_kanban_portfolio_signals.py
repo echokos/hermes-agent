@@ -80,6 +80,37 @@ def test_signals_and_outcomes_share_one_sorted_candidate_limit(portfolio):
         assert ordinary not in {row["id"] for row in result["tasks"]}
 
 
+def test_bounded_portfolio_keeps_new_and_reobserved_old_signals_visible_among_many_roots(portfolio):
+    with kb.connect_closing() as conn:
+        old = signal(conn, "Old signal with a fresh canonical observation")
+        recent = signal(conn, "New qualified signal")
+        roots = []
+        for index in range(14):
+            root = kb.create_task(conn, title=f"Owned outcome {index}", assignee="builder", priority=10, triage=True)
+            assert kb.decompose_triage_task(
+                conn, root, root_assignee="aurora", author="test", auto_promote=False,
+                children=[{"title": f"Execution {index}", "assignee": "qa", "parents": []}],
+            )
+            roots.append(root)
+        for index in range(14):
+            stale = signal(conn, f"Unchanged older signal {index}")
+            with kb.write_txn(conn):
+                conn.execute("UPDATE wc_items SET updated_at = 100 WHERE task_id = ?", (stale,))
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET created_at = 1 WHERE id = ?", (old,))
+            conn.execute("UPDATE wc_items SET updated_at = 200 WHERE task_id = ?", (old,))
+            conn.execute("UPDATE wc_items SET updated_at = 300 WHERE task_id = ?", (recent,))
+        before = list(conn.iterdump())
+        result = listed(limit=12)
+        ids = [row["id"] for row in result["tasks"]]
+        assert len(ids) == 12 and result["truncated"]
+        assert ids[0] == recent and ids[2] == old
+        assert sum(task_id in roots for task_id in ids) == 6
+        assert sum(row.get("triage_only", False) for row in result["tasks"]) == 6
+        assert all(row["launch_authorized"] is False for row in result["tasks"] if row.get("triage_only"))
+        assert list(conn.iterdump()) == before
+
+
 @pytest.mark.parametrize("damage", [
     "resolved", "archived", "running", "malformed_body", "wrong_owner", "wrong_identity",
     "wrong_source", "authorized", "unclassified",
