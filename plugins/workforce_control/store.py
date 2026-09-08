@@ -850,6 +850,7 @@ def materialize_plan(
         coordination = _validated_materialization_coordination(
             conn, actor=actor, context=coordination_context, organization=org,
         )
+        acceptance_pending = coordination is None and coordination_origin is not None
         origin_session_id, origin_message_id = coordination_origin or ("", "")
         if coordination is not None:
             if (origin_session_id, origin_message_id) not in {
@@ -880,6 +881,10 @@ def materialize_plan(
                         "acceptance_test": node["acceptance_test"],
                         "current_state_evidence": current_state_evidence,
                         "current_state_evidence_at": evidence_at,
+                        **(
+                            {"coordination_acceptance_pending": True}
+                            if acceptance_pending else {}
+                        ),
                     }, indent=2, sort_keys=True),
                     assignee=str(node["assignee"]), created_by="aurora",
                     tenant=str(node.get("tenant") or "company"),
@@ -906,7 +911,15 @@ def materialize_plan(
                 raise RuntimeError("plan graph could not be topologically materialized")
         root_id = kanban_db.create_task(
             conn, title=f"Outcome: {plan['title']}",
-            body=json.dumps({"kind": "workforce_outcome", "plan_id": plan_id, "desired_outcome": plan["desired_outcome"], "acceptance_test": plan["acceptance_test"]}, indent=2, sort_keys=True),
+            body=json.dumps({
+                "kind": "workforce_outcome", "plan_id": plan_id,
+                "desired_outcome": plan["desired_outcome"],
+                "acceptance_test": plan["acceptance_test"],
+                **(
+                    {"coordination_acceptance_pending": True}
+                    if acceptance_pending else {}
+                ),
+            }, indent=2, sort_keys=True),
             assignee="aurora", created_by="aurora", tenant="company", parents=list(by_key.values()),
             idempotency_key=f"workforce-outcome:{plan['stable_key']}", workspace_kind="scratch", goal_mode=False,
             **task_context,

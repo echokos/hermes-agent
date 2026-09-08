@@ -999,7 +999,11 @@ def test_concurrent_executor_binds_same_batch_materialization_to_accepted_reques
     board, organization, monkeypatch, tmp_path, winner,
 ):
     from agent import coordination_budget
-    from gateway.session_context import clear_session_vars, set_session_vars
+    from gateway.session_context import (
+        clear_session_vars,
+        reset_session_vars,
+        set_session_vars,
+    )
     from tools import kanban_tools
 
     database_path = Path(board.execute("PRAGMA database_list").fetchone()["file"])
@@ -1025,6 +1029,7 @@ def test_concurrent_executor_binds_same_batch_materialization_to_accepted_reques
     message_id = f"same-batch-{winner}-message"
     materialization_started = threading.Event()
     acceptance_started = threading.Event()
+    gap_dispatch: dict[str, object] = {}
 
     if winner == "acceptance":
         real_factory = kanban_db.create_coordination_request
@@ -1057,7 +1062,26 @@ def test_concurrent_executor_binds_same_batch_materialization_to_accepted_reques
         def controlled_materialize(*args, **kwargs):
             materialization_started.set()
             assert acceptance_started.wait(timeout=5)
-            return real_materialize(*args, **kwargs)
+            result = real_materialize(*args, **kwargs)
+            execution_task_id = result["execution_tasks"]["implementation"]
+            spawned_in_gap: list[str] = []
+            with kanban_db.connect_closing(database_path) as dispatch_conn:
+                dispatch = kanban_db.dispatch_once(
+                    dispatch_conn,
+                    spawn_fn=lambda task, _workspace: spawned_in_gap.append(task.id),
+                    reconcile_orphans=False,
+                )
+                gap_dispatch.update(
+                    result=dispatch,
+                    spawned=spawned_in_gap,
+                    task_id=execution_task_id,
+                    status=kanban_db.get_task(dispatch_conn, execution_task_id).status,
+                    run_count=dispatch_conn.execute(
+                        "SELECT COUNT(*) FROM task_runs WHERE task_id=?",
+                        (execution_task_id,),
+                    ).fetchone()[0],
+                )
+            return result
 
         def observed_request_lookup():
             acceptance_started.set()
@@ -1069,6 +1093,10 @@ def test_concurrent_executor_binds_same_batch_materialization_to_accepted_reques
             "current_coordination_request_id",
             observed_request_lookup,
         )
+        monkeypatch.setattr(
+            kanban_db, "_resolve_dispatch_profile", lambda assignee: assignee,
+        )
+        monkeypatch.setattr(kanban_db, "_memory_pressure_level", lambda: "normal")
         call_order = ("workforce_materialize", "kanban_create")
 
     arguments = {
@@ -1123,6 +1151,7 @@ def test_concurrent_executor_binds_same_batch_materialization_to_accepted_reques
             )
     finally:
         clear_session_vars(tokens)
+        reset_session_vars()
 
     results = {message["name"]: json.loads(message["content"]) for message in messages}
     assert results["kanban_create"]["ok"] is True
@@ -1141,6 +1170,18 @@ def test_concurrent_executor_binds_same_batch_materialization_to_accepted_reques
         json.loads(row["payload"])["coordination_origin_message_id"]
         for row in materialized
     } == {message_id}
+    if winner == "materialization":
+        dispatch = gap_dispatch["result"]
+        assert gap_dispatch["spawned"] == []
+        assert dispatch.spawned == []
+        assert dispatch.coordination_deferred == [
+            (
+                gap_dispatch["task_id"],
+                "workforce task is pending coordination acceptance",
+            )
+        ]
+        assert gap_dispatch["status"] == "ready"
+        assert gap_dispatch["run_count"] == 0
 
     execution_task_id = board.execute(
         "SELECT t.id FROM tasks t JOIN wc_items w ON w.task_id=t.id "
