@@ -703,11 +703,11 @@ def _resolved_materialization_context(
             raise ValueError("invalid current coordination origin") from exc
         origin_session_id = str(origin_session_id or "").strip()
         origin_message_id = str(origin_message_id or "").strip()
-        if bool(origin_session_id) != bool(origin_message_id):
+        if origin_message_id and not origin_session_id:
             raise ValueError("current coordination origin is incomplete")
         if origin_session_id:
             normalized_origin = (origin_session_id, origin_message_id)
-    if context is None and normalized_origin is not None:
+    if context is None and normalized_origin is not None and normalized_origin[1]:
         request = kanban_db.get_coordination_request(
             conn,
             kanban_db.coordination_request_id(*normalized_origin),
@@ -888,10 +888,13 @@ def materialize_plan(
         )
         origin_session_id, origin_message_id = coordination_origin or ("", "")
         if coordination is not None:
-            if (origin_session_id, origin_message_id) not in {
-                ("", ""),
-                (coordination["origin_session_id"], coordination["origin_message_id"]),
-            }:
+            if (
+                origin_session_id
+                and origin_session_id != coordination["origin_session_id"]
+            ) or (
+                origin_message_id
+                and origin_message_id != coordination["origin_message_id"]
+            ):
                 raise ValueError("current coordination origin does not match the accepted request")
             origin_session_id = coordination["origin_session_id"]
             origin_message_id = coordination["origin_message_id"]

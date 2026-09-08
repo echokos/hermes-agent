@@ -702,6 +702,7 @@ def test_materialization_inherits_active_coordination_budget_and_origin(board, o
         confirmed_execution_ready=True,
         organization=organization,
         coordination_context=(request.id, request_root_id, "work"),
+        coordination_origin=(request.origin_session_id, ""),
     )
 
     assert materialized["request_root_id"] == request.id
@@ -752,6 +753,67 @@ def test_materialization_resolves_a_committed_same_origin_request_after_runtime_
     assert {
         kanban_db.get_task(board, task_id).request_root_id for task_id in task_ids
     } == {request.id}
+
+
+def test_session_only_origin_stays_uncoordinated_without_request_fallback(
+    board, organization,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += " with classic session-only provenance"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    session_id = "classic-session-only-origin"
+    source_id = kanban_db.create_task(
+        board,
+        title="Unrelated request from the same session",
+        assignee="aurora",
+        session_id=session_id,
+    )
+    kanban_db.add_notify_sub(
+        board,
+        task_id=source_id,
+        platform="buzz",
+        chat_id="unrelated-request-origin",
+        notifier_profile="aurora",
+        delivery_mode="wake",
+    )
+    unrelated_request = kanban_db.create_coordination_request(
+        board,
+        root_task_id=source_id,
+        origin_session_id=session_id,
+        origin_message_id="another-message",
+        organization=organization,
+    )
+
+    materialized = materialize_plan(
+        board,
+        actor="aurora",
+        plan_id=plan["plan_id"],
+        current_state_evidence=["kanban:current"],
+        current_state_evidence_at=int(time.time()),
+        confirmed_execution_ready=True,
+        organization=organization,
+        coordination_origin=(session_id, ""),
+    )
+
+    assert materialized.get("request_root_id") is None
+    rows = board.execute(
+        "SELECT t.session_id,t.request_root_id,e.payload FROM tasks t "
+        "JOIN wc_items w ON w.task_id=t.id "
+        "JOIN task_events e ON e.task_id=t.id AND e.kind='created' "
+        "WHERE w.item_kind IN ('execution','outcome')"
+    ).fetchall()
+    assert len(rows) == 2
+    assert {row["session_id"] for row in rows} == {session_id}
+    assert {row["request_root_id"] for row in rows} == {None}
+    assert {
+        json.loads(row["payload"])["coordination_origin_message_id"] for row in rows
+    } == {None}
+    assert kanban_db.get_coordination_request(
+        board, unrelated_request.id
+    ).status == "active"
 
 
 def test_uncoordinated_materialized_plan_is_idempotent_across_origins(
@@ -892,6 +954,42 @@ def test_active_coordination_rejects_non_work_purpose_before_mutation(
             confirmed_execution_ready=True,
             organization=organization,
             coordination_context=(request.id, source_id, "terminal_review"),
+        )
+
+    assert_plan_remains_draft_without_materialization(
+        board, plan["plan_id"], task_count,
+    )
+
+
+@pytest.mark.parametrize(
+    "coordination_origin",
+    [("wrong-session", ""), ("aurora-buzz-session-origin-mismatch", "wrong-message")],
+)
+def test_active_coordination_rejects_mismatched_partial_origin_before_mutation(
+    board, organization, coordination_origin,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += f" with mismatched origin {coordination_origin}"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    request, source_id = accepted_coordination_request(
+        board, organization, suffix="origin-mismatch",
+    )
+    task_count = board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    with pytest.raises(ValueError, match="origin does not match"):
+        materialize_plan(
+            board,
+            actor="aurora",
+            plan_id=plan["plan_id"],
+            current_state_evidence=["kanban:current"],
+            current_state_evidence_at=int(time.time()),
+            confirmed_execution_ready=True,
+            organization=organization,
+            coordination_context=(request.id, source_id, "work"),
+            coordination_origin=coordination_origin,
         )
 
     assert_plan_remains_draft_without_materialization(
@@ -1324,6 +1422,63 @@ def test_native_executor_dispatches_ordinary_uncoordinated_materialization(
         task_id for task_id, _assignee, _workspace in dispatched.spawned
     }
     assert dispatched.coordination_deferred == []
+
+
+def test_materialize_tool_accepts_classic_session_only_provenance(
+    board, organization, monkeypatch, tmp_path,
+):
+    from agent import coordination_budget
+    from gateway import session_context
+
+    database_path = Path(board.execute("PRAGMA database_list").fetchone()["file"])
+    profile_home = tmp_path / "profiles" / "aurora"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(database_path))
+    monkeypatch.setenv("HERMES_PROFILE", "aurora")
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(ROOT / "workforce" / "organization.yaml"),
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_MESSAGE_ID", raising=False)
+    monkeypatch.setattr(
+        session_context,
+        "get_session_env",
+        lambda _key, default="": default,
+    )
+    payload = plan_payload()
+    payload["desired_outcome"] += " through the classic session-only tool path"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+
+    with coordination_budget.scoped_coordination_budget(
+        session_id="classic-tool-session"
+    ):
+        result = json.loads(workforce_tools._materialize({
+            "plan_id": plan["plan_id"],
+            "current_state_evidence": ["kanban:current"],
+            "current_state_evidence_at": int(time.time()),
+            "confirmed_execution_ready": True,
+        }))
+
+    assert result["success"] is True
+    assert result["created"] is True
+    assert result.get("request_root_id") is None
+    rows = board.execute(
+        "SELECT t.session_id,t.request_root_id,e.payload FROM tasks t "
+        "JOIN wc_items w ON w.task_id=t.id "
+        "JOIN task_events e ON e.task_id=t.id AND e.kind='created' "
+        "WHERE w.item_kind IN ('execution','outcome')"
+    ).fetchall()
+    assert len(rows) == 2
+    assert {row["session_id"] for row in rows} == {"classic-tool-session"}
+    assert {row["request_root_id"] for row in rows} == {None}
+    assert {
+        json.loads(row["payload"])["coordination_origin_message_id"] for row in rows
+    } == {None}
 
 
 def test_later_round_acceptance_rejects_prior_uncoordinated_materialization(
