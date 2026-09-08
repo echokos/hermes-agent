@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from hermes_cli import kanban_db as kb
 
@@ -20,6 +21,7 @@ def canonical_root_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     home = tmp_path / ".hermes"
     (home / "profiles" / "main").mkdir(parents=True)
     (home / "profiles" / "root").mkdir(parents=True)
+    (home / "profiles" / "aurora").mkdir(parents=True)
     (home / "profiles" / "amy").mkdir(parents=True)
     (home / "profiles" / "legacy").mkdir(parents=True)
     organization = tmp_path / "organization.yaml"
@@ -133,6 +135,228 @@ def test_canonical_root_is_spawnable_in_ready_and_review_lanes(
     assert result.skipped_nonspawnable == []
     # The board remains canonical: dispatch does not rewrite ownership to main.
     assert {assignee for _task_id, assignee, _workspace in result.spawned} == {"root"}
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_per_profile_cap_combines_canonical_owner_and_runtime_alias(
+    canonical_root_home: Path,
+    dry_run: bool,
+) -> None:
+    """Canonical ``root`` and declared alias ``main`` share one worker cap."""
+    with kb.connect() as conn:
+        root_id = kb.create_task(
+            conn, title="canonical owner", assignee="root", priority=10
+        )
+        alias_id = kb.create_task(
+            conn, title="runtime alias", assignee="main", priority=0
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: 4242,
+            dry_run=dry_run,
+            max_in_progress_per_profile=1,
+        )
+
+        root = kb.get_task(conn, root_id)
+        alias = kb.get_task(conn, alias_id)
+
+    assert [item[:2] for item in result.spawned] == [(root_id, "root")]
+    assert result.skipped_per_profile_capped == [(alias_id, "main", 1)]
+    expected_root_status = "ready" if dry_run else "running"
+    assert root is not None
+    assert root.status == expected_root_status
+    assert root.assignee == "root"
+    assert alias is not None and alias.status == "ready" and alias.assignee == "main"
+
+
+def test_per_profile_cap_maps_existing_canonical_work_to_runtime_alias(
+    canonical_root_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        root_id = kb.create_task(conn, title="already running", assignee="root")
+        assert kb.claim_task(conn, root_id) is not None
+        alias_id = kb.create_task(conn, title="runtime alias", assignee="main")
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: pytest.fail(
+                "runtime alias exceeded the concrete profile cap"
+            ),
+            max_in_progress_per_profile=1,
+        )
+
+    assert result.spawned == []
+    assert result.skipped_per_profile_capped == [(alias_id, "main", 1)]
+
+
+def test_claim_time_profile_cap_uses_fresh_reassigned_runtime(
+    canonical_root_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reassignment cannot reserve request budget or claim past the cap."""
+    from hermes_cli.workforce_org import load_organization
+
+    with kb.connect() as conn:
+        running_id = kb.create_task(conn, title="already running", assignee="root")
+        assert kb.claim_task(conn, running_id) is not None
+        request_root_id = kb.create_task(
+            conn,
+            title="coordinate work",
+            assignee="aurora",
+            session_id="capacity-race-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=request_root_id,
+            platform="buzz",
+            chat_id="capacity-race-chat",
+            notifier_profile="aurora",
+            delivery_mode="wake",
+        )
+        request = kb.create_coordination_request(
+            conn,
+            root_task_id=request_root_id,
+            origin_session_id="capacity-race-session",
+            origin_message_id="capacity-race-message",
+            organization=load_organization(),
+            now=100,
+        )
+        candidate_id = kb.create_task(
+            conn,
+            title="raced candidate",
+            assignee="aurora",
+            coordination_source_task_id=request_root_id,
+        )
+        reserved_before = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'coordination_launch_reserved'",
+            (request_root_id,),
+        ).fetchone()[0]
+
+    original_resolve = kb._resolve_dispatch_profile
+    reassigned = False
+
+    def resolve_then_reassign(assignee, **kwargs):
+        nonlocal reassigned
+        profile = original_resolve(assignee, **kwargs)
+        if assignee == "aurora" and not reassigned:
+            with kb.connect() as writer:
+                with kb.write_txn(writer):
+                    writer.execute(
+                        "UPDATE tasks SET assignee = 'main' WHERE id = ?",
+                        (candidate_id,),
+                    )
+            reassigned = True
+        return profile
+
+    monkeypatch.setattr(kb, "_resolve_dispatch_profile", resolve_then_reassign)
+    with kb.connect() as conn:
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: pytest.fail(
+                "fresh cap refusal reached spawn"
+            ),
+            max_in_progress_per_profile=1,
+        )
+        candidate = kb.get_task(conn, candidate_id)
+        runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (candidate_id,)
+        ).fetchone()[0]
+        reserved_after = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'coordination_launch_reserved'",
+            (request_root_id,),
+        ).fetchone()[0]
+        current_request = kb.get_coordination_request(conn, request.id)
+
+    assert reassigned is True
+    assert result.spawned == []
+    assert result.skipped_per_profile_capped == [(candidate_id, "main", 1)]
+    assert candidate is not None
+    assert candidate.status == "ready"
+    assert candidate.assignee == "main"
+    assert candidate.claim_lock is None
+    assert candidate.current_run_id is None
+    assert runs == 0
+    assert reserved_after == reserved_before == 0
+    assert current_request is not None
+    assert current_request.leaf_launches_used == 0
+
+
+def test_per_profile_cap_keeps_colliding_canonical_profiles_independent(
+    canonical_root_home: Path,
+) -> None:
+    """Canonical ``main -> foo`` does not share ``root -> main`` capacity."""
+    organization_path = Path(os.environ["HERMES_WORKFORCE_ORG"])
+    organization = yaml.safe_load(organization_path.read_text(encoding="utf-8"))
+    root = next(
+        agent for agent in organization["agents"] if agent["agent"] == "root"
+    )
+    aurora = next(
+        agent for agent in organization["agents"] if agent["agent"] == "aurora"
+    )
+    aurora["direct_reports"].append("main")
+    organization["agents"].append({
+        **root,
+        "agent": "main",
+        "display_name": "Canonical Main",
+        "direct_reports": [],
+        "profile_path": str(canonical_root_home / "profiles" / "foo"),
+    })
+    organization_path.write_text(
+        yaml.safe_dump(organization, sort_keys=False),
+        encoding="utf-8",
+    )
+    (canonical_root_home / "profiles" / "foo").mkdir()
+
+    with kb.connect() as conn:
+        root_id = kb.create_task(conn, title="root runtime", assignee="root")
+        main_id = kb.create_task(conn, title="main runtime", assignee="main")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: 4242,
+            max_in_progress_per_profile=1,
+        )
+
+    assert kb._resolve_dispatch_profile("root") == "main"
+    assert kb._resolve_dispatch_profile("main") == "foo"
+    assert {item[:2] for item in result.spawned} == {
+        (root_id, "root"),
+        (main_id, "main"),
+    }
+    assert result.skipped_per_profile_capped == []
+
+
+def test_review_reservation_uses_real_canonical_runtime_alias(
+    canonical_root_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.config as cfgmod
+
+    monkeypatch.setattr(
+        cfgmod,
+        "load_config",
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+    )
+    with kb.connect() as conn:
+        alias_ready = kb.create_task(
+            conn, title="same runtime", assignee="main", priority=10
+        )
+        other_ready = kb.create_task(
+            conn, title="other runtime", assignee="legacy", priority=0
+        )
+        review_id = kb.create_task(conn, title="canonical review", assignee="root")
+        _park_in_review(conn, review_id)
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: 4242,
+            max_in_progress=2,
+            max_in_progress_per_profile=1,
+        )
+
+    spawned_ids = [item[0] for item in result.spawned]
+    assert alias_ready not in spawned_ids
+    assert spawned_ids == [other_ready, review_id]
 
 
 def test_default_spawn_resolves_canonical_root_only_for_worker_launch(

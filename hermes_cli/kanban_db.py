@@ -1434,6 +1434,20 @@ class CoordinationLaunchRefused(RuntimeError):
         super().__init__(f"task {task_id}: {reason}")
 
 
+class _DispatchProfileCapacityDeferred(RuntimeError):
+    """A concrete execution profile has no dispatch capacity this tick."""
+
+    def __init__(self, task_id: str, assignee: str, profile: str, current: int):
+        self.task_id = task_id
+        self.assignee = assignee
+        self.profile = profile
+        self.current = current
+        super().__init__(
+            f"task {task_id}: execution profile {profile!r} has "
+            f"{current} running tasks"
+        )
+
+
 @dataclass
 class Run:
     """In-memory view of a ``task_runs`` row.
@@ -5271,8 +5285,15 @@ def claim_task_for_dispatch(
     organization=None,
     now: Optional[int] = None,
     board: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
 ) -> tuple[Optional[Task], Optional[CoordinationLaunchReservation]]:
-    """Atomically reserve request capacity and claim one dispatchable task."""
+    """Atomically reserve request capacity and claim one dispatchable task.
+
+    When a concrete-profile cap is supplied, its final check shares this
+    transaction with the fresh status/assignee read and precedes every launch
+    reservation or claim write. This closes the reassignment window between a
+    dispatch loop's optimistic capacity check and the durable claim.
+    """
     claimed: Optional[Task] = None
     reservation: Optional[CoordinationLaunchReservation] = None
     with write_txn(conn):
@@ -5315,6 +5336,25 @@ def claim_task_for_dispatch(
                 _fire_lifecycle=False,
             )
             return None, None
+
+        profile_cap = max_in_progress_per_profile if (
+            isinstance(max_in_progress_per_profile, int)
+            and max_in_progress_per_profile > 0
+        ) else None
+        if profile_cap is not None:
+            profile = _resolve_dispatch_profile(task.assignee)
+            if profile is None:
+                raise CoordinationLaunchRefused(
+                    task.id, "assignee has no launchable Hermes profile"
+                )
+            current = _dispatch_profile_running_counts(conn).get(profile, 0)
+            if current >= profile_cap:
+                raise _DispatchProfileCapacityDeferred(
+                    task.id,
+                    task.assignee or "",
+                    profile,
+                    current,
+                )
 
         reservation = reserve_coordination_launch(
             conn,
@@ -7418,6 +7458,10 @@ def _verify_created_cards(
     * ``created_by`` matches the completing task's ``assignee`` profile
       (the common case: worker A spawns a card via ``kanban_create``,
       which stamps ``created_by=A``).
+    * In a valid workforce organization, mismatched labels resolve
+      canonical-first to the same agent. This accepts a legacy runtime alias
+      such as ``main`` completing a card stamped by canonical ``root``, while
+      a colliding canonical ``main`` that owns another profile stays distinct.
     * ``created_by`` matches the completing task's id (edge case where
       a worker passed its own task id as the ``created_by`` value).
     * The card is linked as a ``task_links.child`` of the completing
@@ -7427,7 +7471,7 @@ def _verify_created_cards(
       the completing task by the worker.
 
     ``phantom`` returns ids that either don't exist at all, or exist
-    but don't satisfy any of the three trust conditions. The caller
+    but don't satisfy any trust condition. The caller
     decides what to do with each bucket; this helper never mutates.
     """
     claimed = [str(x).strip() for x in (claimed_ids or []) if str(x).strip()]
@@ -7449,6 +7493,26 @@ def _verify_created_cards(
         return [], ordered
     completing_assignee = row["assignee"]
 
+    organization = None
+    completing_agent = None
+    if completing_assignee:
+        from hermes_cli.workforce_org import (
+            WorkforceOrganizationError,
+            load_organization,
+        )
+
+        try:
+            organization = load_organization()
+            completing_agent = organization.resolve_profile(
+                completing_assignee
+            ).agent
+        except (WorkforceOrganizationError, UnicodeError):
+            # Organization identity is an additional trust proof only. An
+            # absent, invalid, ambiguous, or partial installation must not
+            # widen the existing exact/task-id/link acceptance boundary.
+            organization = None
+            completing_agent = None
+
     # Batch-fetch existence + created_by in one query.
     placeholders = ",".join(["?"] * len(ordered))
     rows = conn.execute(
@@ -7468,13 +7532,26 @@ def _verify_created_cards(
         if created_by is None:
             phantom.append(cid)
             continue
-        # Accept if any of the three trust conditions holds.
+        # Preserve the historical exact/task-id/link proofs before consulting
+        # canonical workforce identity as a best-effort additional proof.
         if completing_assignee and created_by == completing_assignee:
             verified.append(cid)
         elif created_by == completing_task_id:
             verified.append(cid)
         elif cid in linked_children:
             verified.append(cid)
+        elif organization is not None and completing_agent is not None:
+            try:
+                same_agent = (
+                    organization.resolve_profile(created_by).agent
+                    == completing_agent
+                )
+            except WorkforceOrganizationError:
+                same_agent = False
+            if same_agent:
+                verified.append(cid)
+            else:
+                phantom.append(cid)
         else:
             phantom.append(cid)
     return verified, phantom
@@ -10814,9 +10891,9 @@ class DispatchResult:
     Unlike ``skipped_nonspawnable``, these assignments violate durable
     workforce policy and are surfaced as operator-actionable errors."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
-    """Tasks deferred this tick because their assignee is already at
+    """Tasks deferred because their resolved execution profile is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
-    ``(task_id, assignee, current_running_count)``. NOT an
+    ``(task_id, canonical_assignee, current_running_count)``. NOT an
     operator-actionable failure — the task will be picked up on a
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
@@ -12478,6 +12555,23 @@ def _resolve_dispatch_profile(
     return profile
 
 
+def _dispatch_profile_running_counts(
+    conn: sqlite3.Connection,
+) -> dict[str, int]:
+    """Aggregate running work by the concrete profile that executes it."""
+    counts: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks "
+        "WHERE status = 'running' AND assignee IS NOT NULL "
+        "GROUP BY assignee"
+    ):
+        profile = _resolve_dispatch_profile(row["assignee"])
+        if profile is None:
+            continue
+        counts[profile] = counts.get(profile, 0) + int(row["n"])
+    return counts
+
+
 def _record_non_operational_dispatch_rejection(
     conn: sqlite3.Connection,
     task_id: str,
@@ -13032,14 +13126,11 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
-    _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
+    _per_profile_running = (
+        _dispatch_profile_running_counts(conn)
+        if _per_profile_cap is not None
+        else {}
+    )
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.
     review_rows = []
@@ -13075,11 +13166,12 @@ def _dispatch_once_locked(
             launch_phase="review",
         ):
             return False
-        if _resolve_dispatch_profile(assignee) is None:
+        profile = _resolve_dispatch_profile(assignee)
+        if profile is None:
             return False
         if (
             _per_profile_cap is not None
-            and _per_profile_running.get(assignee, 0) >= _per_profile_cap
+            and _per_profile_running.get(profile, 0) >= _per_profile_cap
         ):
             return False
         if coordination_launch_deferral_reason(conn, row["id"]):
@@ -13088,6 +13180,11 @@ def _dispatch_once_locked(
 
     reserved_review = next(
         (row for row in review_rows if _spawnable_review(row)), None,
+    )
+    reserved_review_profile = (
+        _resolve_dispatch_profile(reserved_review["assignee"])
+        if reserved_review is not None
+        else None
     )
 
     ready_budget = spawn_budget
@@ -13120,8 +13217,14 @@ def _dispatch_once_locked(
                 review=review,
                 ttl_seconds=ttl_seconds,
                 board=board,
+                max_in_progress_per_profile=_per_profile_cap,
             )
             return claimed_task
+        except _DispatchProfileCapacityDeferred as exc:
+            result.skipped_per_profile_capped.append(
+                (exc.task_id, exc.assignee, exc.current)
+            )
+            return None
         except CoordinationLaunchDeferred as exc:
             result.coordination_deferred.append((task_id, exc.reason))
             return None
@@ -13226,7 +13329,8 @@ def _dispatch_once_locked(
                     conn, row["id"], row_assignee, policy_reason,
                 )
             continue
-        if _resolve_dispatch_profile(row_assignee) is None:
+        row_profile = _resolve_dispatch_profile(row_assignee)
+        if row_profile is None:
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -13242,10 +13346,10 @@ def _dispatch_once_locked(
         # while the global max_in_progress / max_spawn caps still allow
         # work on OTHER profiles.
         if _per_profile_cap is not None:
-            current = _per_profile_running.get(row_assignee, 0)
+            current = _per_profile_running.get(row_profile, 0)
             if (
-                reserved_review is not None
-                and row_assignee == reserved_review["assignee"]
+                reserved_review_profile is not None
+                and row_profile == reserved_review_profile
                 and current >= _per_profile_cap - 1
             ):
                 # Keep the final profile-local slot available for the review
@@ -13284,9 +13388,9 @@ def _dispatch_once_locked(
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
             # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
-                _per_profile_running[row_assignee] = (
-                    _per_profile_running.get(row_assignee, 0) + 1
+            if _per_profile_cap is not None:
+                _per_profile_running[row_profile] = (
+                    _per_profile_running.get(row_profile, 0) + 1
                 )
             continue
         claimed = _claim_with_coordination(row["id"], review=False)
@@ -13348,9 +13452,11 @@ def _dispatch_once_locked(
             # iterations in this same tick respect the per-profile cap
             # (#21582). Subsequent ticks re-query from the DB.
             if _per_profile_cap is not None and claimed.assignee:
-                _per_profile_running[claimed.assignee] = (
-                    _per_profile_running.get(claimed.assignee, 0) + 1
-                )
+                claimed_profile = _resolve_dispatch_profile(claimed.assignee)
+                if claimed_profile is not None:
+                    _per_profile_running[claimed_profile] = (
+                        _per_profile_running.get(claimed_profile, 0) + 1
+                    )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -13406,11 +13512,12 @@ def _dispatch_once_locked(
                     conn, row["id"], row["assignee"], policy_reason,
                 )
             continue
-        if _resolve_dispatch_profile(row["assignee"]) is None:
+        row_profile = _resolve_dispatch_profile(row["assignee"])
+        if row_profile is None:
             result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:
-            current = _per_profile_running.get(row["assignee"], 0)
+            current = _per_profile_running.get(row_profile, 0)
             if current >= _per_profile_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row["assignee"], current)
@@ -13430,8 +13537,8 @@ def _dispatch_once_locked(
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
             if _per_profile_cap is not None:
-                _per_profile_running[row["assignee"]] = (
-                    _per_profile_running.get(row["assignee"], 0) + 1
+                _per_profile_running[row_profile] = (
+                    _per_profile_running.get(row_profile, 0) + 1
                 )
             continue
         claimed = _claim_with_coordination(row["id"], review=True)
@@ -13494,9 +13601,11 @@ def _dispatch_once_locked(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
-                _per_profile_running[claimed.assignee] = (
-                    _per_profile_running.get(claimed.assignee, 0) + 1
-                )
+                claimed_profile = _resolve_dispatch_profile(claimed.assignee)
+                if claimed_profile is not None:
+                    _per_profile_running[claimed_profile] = (
+                        _per_profile_running.get(claimed_profile, 0) + 1
+                    )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),

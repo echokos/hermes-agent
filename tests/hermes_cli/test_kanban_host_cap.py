@@ -425,6 +425,79 @@ def test_review_reservation_preserves_reviewers_profile_slot(
     assert spawned_ids == [other_ready, review_id]
 
 
+def test_review_reservation_compares_resolved_runtime_profiles(
+    kanban_home, monkeypatch,
+):
+    """A runtime alias cannot consume the slot reserved for its owner."""
+    import hermes_cli.config as cfgmod
+
+    monkeypatch.setattr(
+        cfgmod,
+        "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    monkeypatch.setattr(
+        kb,
+        "_resolve_dispatch_profile",
+        lambda assignee, **_kwargs: (
+            "main" if assignee in {"root", "main"} else assignee
+        ),
+    )
+
+    spawns: list = []
+    with kb.connect() as conn:
+        alias_ready = kb.create_task(
+            conn, title="same runtime", assignee="main"
+        )
+        other_ready = kb.create_task(conn, title="other", assignee="alice")
+        review_id = _park_in_review(conn, "canonical review", "root")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=2,
+            max_in_progress_per_profile=1,
+        )
+
+    spawned_ids = [item[0] for item in result.spawned]
+    assert alias_ready not in spawned_ids
+    assert spawned_ids == [other_ready, review_id]
+
+
+def test_review_cap_counts_running_canonical_owner_for_runtime_alias(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.config as cfgmod
+
+    monkeypatch.setattr(
+        cfgmod,
+        "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    monkeypatch.setattr(
+        kb,
+        "_resolve_dispatch_profile",
+        lambda assignee, **_kwargs: (
+            "main" if assignee in {"root", "main"} else assignee
+        ),
+    )
+
+    spawns: list = []
+    with kb.connect() as conn:
+        running_id = kb.create_task(conn, title="busy owner", assignee="root")
+        assert kb.claim_task(conn, running_id) is not None
+        ready_id = kb.create_task(conn, title="other", assignee="alice")
+        review_id = _park_in_review(conn, "alias review", "main")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=3,
+            max_in_progress_per_profile=1,
+        )
+
+    assert [item[0] for item in result.spawned] == [ready_id]
+    assert result.skipped_per_profile_capped == [(review_id, "main", 1)]
+
+
 def test_review_budget_still_bounded_by_shared_cap(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
