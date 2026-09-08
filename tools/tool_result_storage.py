@@ -111,7 +111,16 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     the exec-arg ceiling.
     """
     storage_dir = os.path.dirname(remote_path)
-    cmd = f"mkdir -p {shlex.quote(storage_dir)} && cat > {shlex.quote(remote_path)}"
+    directory = shlex.quote(storage_dir)
+    destination = shlex.quote(remote_path)
+    # SDK backends append a heredoc to the final command, including one extra
+    # newline. Keep the reader last and retain exactly the original byte count.
+    byte_count = len(content.encode("utf-8", "surrogateescape"))
+    cmd = (
+        f"umask 077 && mkdir -p {directory} && chmod 700 {directory} "
+        f"&& touch {destination} && chmod 600 {destination} "
+        f"&& head -c {byte_count} > {destination}"
+    )
     result = env.execute(cmd, timeout=30, stdin_data=content)
     return result.get("returncode", 1) == 0
 
@@ -148,6 +157,7 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    task_id: str | None = None,
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -162,6 +172,8 @@ def maybe_persist_tool_result(
         env: The active BaseEnvironment instance, or None.
         config: BudgetConfig controlling thresholds and preview size.
         threshold: Explicit override; takes precedence over config resolution.
+        task_id: Current task whose configured environment may be initialized
+            lazily if persistence is needed and no active env was supplied.
 
     Returns:
         Original content if small, or <persisted-output> replacement.
@@ -173,6 +185,13 @@ def maybe_persist_tool_result(
 
     if len(content) <= effective_threshold:
         return content
+
+    if env is None and task_id is not None:
+        try:
+            from tools.terminal_tool import ensure_task_env
+            env = ensure_task_env(task_id, include_local=True)
+        except Exception as exc:
+            logger.warning("Persistence environment unavailable for %s: %s", tool_use_id, exc)
 
     storage_dir = _resolve_storage_dir(env)
     remote_path = f"{storage_dir}/{_safe_result_filename(tool_use_id)}"
@@ -204,6 +223,7 @@ def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
+    task_id: str | None = None,
 ) -> list[dict]:
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
@@ -241,6 +261,7 @@ def enforce_turn_budget(
             env=env,
             config=config,
             threshold=0,
+            task_id=task_id,
         )
         if replacement != content:
             total_size -= size

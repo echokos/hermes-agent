@@ -5,6 +5,8 @@ read without a prior terminal command (issue #62825)."""
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 import tools.terminal_tool as tt
 
 
@@ -20,6 +22,54 @@ def test_local_backend_is_noop(monkeypatch):
     with patch.object(tt, "_create_environment") as create:
         assert tt.ensure_task_env("t-local") is None
     create.assert_not_called()
+
+
+def test_local_backend_explicit_opt_in_reuses_configured_task(monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_LOCAL_PERSISTENT", "true")
+    task_id = "t-local-persist"
+    eff = tt._resolve_container_task_id(task_id)
+    _clear(eff, task_id)
+    fake = SimpleNamespace()
+    monkeypatch.setattr(tt, "resolve_task_overrides", lambda task: {"cwd": "/task-workspace"})
+    try:
+        with patch.object(tt, "_create_environment", return_value=fake) as create:
+            assert tt.ensure_task_env(task_id, include_local=True) is fake
+            assert tt.ensure_task_env(task_id, include_local=True) is fake
+            create.assert_called_once()
+            assert create.call_args.kwargs["cwd"] == "/task-workspace"
+            assert create.call_args.kwargs["local_config"] == {"persistent": True}
+    finally:
+        _clear(eff, task_id)
+
+
+@pytest.mark.parametrize("source", ["override", "recorded"])
+@pytest.mark.parametrize("backend,cwd,host_cwd,expected", [
+    ("docker", "/home/user/project", "/home/user/project", "/workspace"),
+    ("docker", "/home/user/project", None, "/workspace"),
+    ("docker", "/root/project", None, "/root/project"),
+    ("modal", "/home/user/project", None, "/workspace"),
+    ("ssh", "/home/user/project", None, "/home/user/project"),
+    ("local", "/home/user/project", None, "/home/user/project"),
+])
+def test_cold_creation_uses_container_aware_workspace_paths(
+    monkeypatch, source, backend, cwd, host_cwd, expected
+):
+    monkeypatch.setenv("TERMINAL_ENV", backend)
+    monkeypatch.setenv("TERMINAL_CWD", "/workspace")
+    monkeypatch.setattr(tt, "resolve_task_overrides", lambda task: {"cwd": cwd} if source == "override" else {})
+    monkeypatch.setattr(tt, "get_session_cwd", lambda task: cwd if source == "recorded" else None)
+    monkeypatch.setattr(tt, "_resolve_task_host_cwd", lambda config, task: host_cwd)
+    task_id = "cold-workspace"
+    effective = tt._resolve_container_task_id(task_id)
+    _clear(effective, task_id)
+    try:
+        with patch.object(tt, "_create_environment", return_value=SimpleNamespace()) as create:
+            assert tt.ensure_task_env(task_id, include_local=True) is create.return_value
+            assert create.call_args.kwargs["cwd"] == expected
+            assert create.call_args.kwargs["host_cwd"] == host_cwd
+    finally:
+        _clear(effective, task_id)
 
 
 def test_non_local_creates_and_reuses(monkeypatch):
