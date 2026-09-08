@@ -4583,7 +4583,11 @@ def coordination_launch_deferral_reason(
         handoff = json.loads(task.body or "{}")
     except (TypeError, json.JSONDecodeError):
         handoff = {}
-    if not _handoff_recovery_verification_is_current(conn, task.id, handoff):
+    if (
+        not _handoff_recovery_verification_is_current(conn, task.id, handoff)
+        and owned_failure_decision_review_snapshot(conn, task.id) is None
+        and owned_failure_incomplete_review_snapshot(conn, task.id) is None
+    ):
         return "terminal review awaits durable recovery verification"
     return None
 
@@ -4599,6 +4603,10 @@ def coordination_completion_blocker(
     request = get_coordination_request(conn, task.request_root_id)
     if request is None or request.root_task_id != task.id:
         return None
+    if owned_failure_decision_review_snapshot(conn, task.id) is not None:
+        return "reserved decision review must stop blocked, not complete the incident"
+    if owned_failure_incomplete_review_snapshot(conn, task.id) is not None:
+        return "incomplete investigation review must stop blocked, not complete the incident"
     if request.kind == "origin_request":
         if request.status == "active":
             return "coordination request has not entered final return"
@@ -5507,8 +5515,15 @@ def charge_coordination_model_call(
                     and _canonical_assignee(run["profile"]) == source
                     and isinstance(claimed_payload, dict)
                     and claimed_payload.get("source_status") == "review"
-                    and _handoff_recovery_verification_is_current(
-                        conn, task.id, handoff
+                    and (
+                        _handoff_recovery_verification_is_current(conn, task.id, handoff)
+                        or (
+                            not terminal_review_tail
+                            and (
+                                owned_failure_decision_review_snapshot(conn, task.id) is not None
+                                or owned_failure_incomplete_review_snapshot(conn, task.id) is not None
+                            )
+                        )
                     )
                     and (not terminal_review_tail or completed_event is not None)
                 )
@@ -5658,7 +5673,7 @@ def _mark_coordination_guardrail_in_txn(
         (timestamp, request_root_id),
     )
     if changed.rowcount != 1:
-        return False
+        return _prepare_owned_failure_incomplete_review_in_txn(conn, request_root_id, timestamp)
     _append_event(
         conn,
         request.root_task_id,
@@ -5674,6 +5689,7 @@ def _mark_coordination_guardrail_in_txn(
             "status": "return_pending",
         },
     )
+    _prepare_owned_failure_incomplete_review_in_txn(conn, request_root_id, timestamp)
     return True
 
 
@@ -7695,6 +7711,418 @@ def _handoff_source_review_is_current(
     )
 
 
+def _owned_failure_decision_authority(conn, task_id: str, *, require_active: bool = True) -> Optional[dict]:
+    """Resolve actors from the accepted internal request, never editable prose."""
+    task = get_task(conn, task_id)
+    if task is None or not task.request_root_id:
+        return None
+    request = get_coordination_request(conn, task.request_root_id)
+    handoff = _source_acceptance_handoff(task.body)
+    if (
+        request is None or request.kind != "owned_operational_failure"
+        or request.root_task_id != task_id
+        or (require_active and request.status not in {"active", "return_pending"})
+        or handoff is None or handoff.get("state") not in {"accepted", "active"}
+    ):
+        return None
+    accepted = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'coordination_internal_request_accepted' ORDER BY id LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    required = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'workforce_handoff_recovery_required' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        origin = json.loads(accepted["payload"]) if accepted else {}
+        failure = json.loads(required["payload"]) if required else {}
+        owner = _canonical_assignee(origin.get("responsible_agent"))
+        source = _canonical_assignee(origin.get("director"))
+        context = handoff.get("context")
+        if (
+            not owner or not source or owner == source
+            or origin.get("request_root_id") != request.id
+            or owner != _canonical_assignee(request.responsible_agent)
+            or owner != _canonical_assignee(handoff.get("target_agent"))
+            or source != _canonical_assignee(handoff.get("source_agent"))
+            or not isinstance(context, dict) or context.get("kind") != "owned_operational_failure"
+            or _canonical_assignee(context.get("technical_owner")) != owner
+            or _canonical_assignee(context.get("director")) != source
+            or context.get("workflow_id") != origin.get("workflow_id")
+            or not isinstance(failure.get("failure_event_id"), str)
+            or not failure["failure_event_id"].strip()
+        ):
+            return None
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return {
+        "request_root_id": request.id, "technical_owner": owner, "director": source,
+        "failure_event_id": failure["failure_event_id"],
+        "failure_requirement_event_id": int(required["id"]),
+    }
+
+
+def _prepare_owned_failure_incomplete_review_in_txn(conn, request_root_id: str, now: int) -> bool:
+    """Host-only timeout disposition; never turn missing evidence into a user ask."""
+    request = get_coordination_request(conn, request_root_id)
+    if request is None or request.kind != "owned_operational_failure" or request.status != "return_pending":
+        return False
+    task = get_task(conn, request.root_task_id)
+    authority = _owned_failure_decision_authority(conn, request.root_task_id)
+    if task is None or authority is None or task.status in {"done", "archived"}:
+        return False
+    if (
+        now < request.checkpoint_at
+        and request.model_calls_used < request.max_model_calls - request.final_model_call_reserve
+    ):
+        return False
+    if (
+        _current_handoff_recovery_snapshot(conn, task.id, _source_acceptance_handoff(task.body)) is not None
+        or owned_failure_decision_review_snapshot(conn, task.id) is not None
+        or owned_failure_decision_outcome_snapshot(conn, task.id) is not None
+        or owned_failure_incomplete_review_snapshot(conn, task.id) is not None
+        or owned_failure_incomplete_outcome_snapshot(conn, task.id) is not None
+    ):
+        return False
+    if _canonical_assignee(task.assignee) not in {authority["technical_owner"], authority["director"]}:
+        return False
+    # Closing the owner run fences stale lifecycle calls; the same request and
+    # original counters remain authoritative for the bounded source review.
+    run_id = _end_run(conn, task.id, outcome="review_requested", status="review",
+                      summary="Host stopped an incomplete investigation at its existing guardrail.")
+    conn.execute(
+        "UPDATE tasks SET status = 'review', assignee = ?, claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+        (authority["director"], task.id),
+    )
+    _append_event(conn, task.id, "review_requested", {
+        "implementer": authority["technical_owner"], "reviewer": authority["director"],
+        "host_disposition": "investigation_incomplete",
+    }, run_id=run_id)
+    review_id = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task.id,),
+    ).fetchone()["id"]
+    _append_event(conn, task.id, "workforce_handoff_incomplete_review_requested", {
+        **authority, "review_requested_event_id": review_id,
+        "checkpoint_at": request.checkpoint_at, "model_calls_used": request.model_calls_used,
+        "max_model_calls": request.max_model_calls,
+        "final_model_call_reserve": request.final_model_call_reserve,
+        "observed_at": now, "disposition": "investigation_incomplete",
+        "incident_repaired": False, "user_action_required": False,
+    }, run_id=run_id)
+    return True
+
+
+def owned_failure_incomplete_review_snapshot(conn, task_id: str) -> Optional[dict]:
+    """Resolve a host-authored current-episode incomplete investigation review."""
+    authority = _owned_failure_decision_authority(conn, task_id)
+    if authority is None:
+        return None
+    row = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'workforce_handoff_incomplete_review_requested' ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+        request = get_coordination_request(conn, authority["request_root_id"])
+        review = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        reviewed = json.loads(review["payload"]) if review else {}
+        if (
+            any(payload.get(key) != value for key, value in authority.items())
+            or payload.get("disposition") != "investigation_incomplete"
+            or payload.get("incident_repaired") is not False or payload.get("user_action_required") is not False
+            or request is None or payload.get("checkpoint_at") != request.checkpoint_at
+            or payload.get("max_model_calls") != request.max_model_calls
+            or payload.get("final_model_call_reserve") != request.final_model_call_reserve
+            or (payload["observed_at"] < request.checkpoint_at
+                and payload["model_calls_used"] < request.max_model_calls - request.final_model_call_reserve)
+            or review is None or review["id"] != payload["review_requested_event_id"]
+            or review["run_id"] != row["run_id"]
+            or reviewed.get("host_disposition") != "investigation_incomplete"
+            or reviewed.get("implementer") != authority["technical_owner"]
+            or reviewed.get("reviewer") != authority["director"]
+        ):
+            return None
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    finished = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind = 'workforce_handoff_investigation_incomplete' LIMIT 1", (task_id, row["id"]),
+    ).fetchone()
+    if finished is not None:
+        return None
+    return {**payload, "event_id": int(row["id"])}
+
+
+def owned_failure_incomplete_outcome_snapshot(conn, task_id: str) -> Optional[dict]:
+    """Metadata-only source-reviewed incomplete outcome, never a user-action request."""
+    authority = _owned_failure_decision_authority(conn, task_id, require_active=False)
+    if authority is None:
+        return None
+    event = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'workforce_handoff_investigation_incomplete' ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if event is None:
+        return None
+    try:
+        payload = json.loads(event["payload"])
+        requested = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND id = ? "
+            "AND kind = 'workforce_handoff_incomplete_review_requested'",
+            (task_id, payload["incomplete_review_event_id"]),
+        ).fetchone()
+        original = json.loads(requested["payload"]) if requested else {}
+        run = conn.execute("SELECT profile, status, outcome FROM task_runs WHERE task_id = ? AND id = ?",
+                           (task_id, event["run_id"])).fetchone()
+        claim = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id DESC LIMIT 1", (task_id, event["run_id"]),
+        ).fetchone()
+        if (
+            any(payload.get(key) != value for key, value in authority.items())
+            or any(original.get(key) != value for key, value in authority.items())
+            or original.get("disposition") != "investigation_incomplete"
+            or original.get("incident_repaired") is not False or original.get("user_action_required") is not False
+            or payload.get("incident_repaired") is not False or payload.get("user_action_required") is not False
+            or payload.get("disposition") != "investigation_incomplete"
+            or run is None or _canonical_assignee(run["profile"]) != authority["director"]
+            or run["status"] != "blocked" or run["outcome"] != "blocked"
+            or claim is None or json.loads(claim["payload"]).get("source_status") != "review"
+            or not payload["incomplete_review_event_id"] < claim["id"] < event["id"]
+        ):
+            return None
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return {**authority, "task_id": task_id, "event_id": int(event["id"]),
+            "disposition": "investigation_incomplete", "incident_repaired": False,
+            "user_action_required": False, "user_authorization_granted": False}
+
+
+def prepare_owned_failure_incomplete_reviews(conn, *, now: Optional[int] = None) -> list[str]:
+    """Host sweep includes blocked/running roots that ready-only admission misses."""
+    timestamp = int(time.time() if now is None else now)
+    roots = conn.execute(
+        "SELECT id, root_task_id FROM coordination_requests WHERE kind = 'owned_operational_failure' "
+        "AND status IN ('active', 'return_pending') AND "
+        "(checkpoint_at <= ? OR model_calls_used >= max_model_calls - final_model_call_reserve)",
+        (timestamp,),
+    ).fetchall()
+    prepared = []
+    for root in roots:
+        with write_txn(conn):
+            request = get_coordination_request(conn, root["id"])
+            if request.status == "active":
+                _mark_coordination_guardrail_in_txn(conn, request.id, task_id=root["root_task_id"],
+                                                   reason="host investigation guardrail reached", timestamp=timestamp)
+                if owned_failure_incomplete_review_snapshot(conn, root["root_task_id"]) is not None:
+                    prepared.append(root["root_task_id"])
+            elif _prepare_owned_failure_incomplete_review_in_txn(conn, request.id, timestamp):
+                prepared.append(root["root_task_id"])
+    return prepared
+
+
+def _normalize_reserved_decision(value: Any) -> dict:
+    """Keep proposed human actions bounded, redacted, and free of OAuth links."""
+    from urllib.parse import urlsplit
+
+    fields = {
+        "failure_event_id": 256, "action_kind": 40, "integration": 100,
+        "account": 200, "action": 1200,
+    }
+    if not isinstance(value, dict) or set(value) != set(fields) | {"evidence_references"}:
+        raise ValueError("reserved_decision requires exact typed action and evidence fields")
+    result = {}
+    for key, limit in fields.items():
+        item = value[key]
+        if not isinstance(item, str) or not item.strip() or len(item) > limit:
+            raise ValueError(f"reserved_decision {key} must be a bounded nonempty string")
+        clean = item.strip()
+        result[key] = str(redact_review_value(clean))
+        if result[key] != clean:
+            raise ValueError("reserved decision fields cannot contain credentials")
+    if result["action_kind"] not in {"user_reauthentication", "authorization_required"}:
+        raise ValueError("unsupported reserved decision action_kind")
+    if result["account"].casefold() in {"unknown", "unspecified", "default", "your account"}:
+        raise ValueError("reserved decision requires concrete account identification")
+    refs = value["evidence_references"]
+    if not isinstance(refs, list) or not 1 <= len(refs) <= 8:
+        raise ValueError("reserved decision requires one to eight evidence references")
+    if any(not isinstance(ref, str) or not ref.strip() or len(ref) > 512 for ref in refs):
+        raise ValueError("reserved decision evidence references must be bounded strings")
+    result["evidence_references"] = [str(redact_review_value(ref.strip())) for ref in refs]
+    if result["evidence_references"] != [ref.strip() for ref in refs]:
+        raise ValueError("reserved decision references cannot contain credentials")
+    for item in [*result.values()]:
+        for text in item if isinstance(item, list) else [item]:
+            for url in re.findall(r"https?://[^\s<>]+", text):
+                parsed = urlsplit(url)
+                if parsed.query or parsed.fragment or parsed.username or parsed.password:
+                    raise ValueError("reserved decisions cannot contain credential-bearing URLs")
+    return result
+
+
+def owned_failure_decision_review_snapshot(conn, task_id: str) -> Optional[dict]:
+    """Return one still-current proposal; body edits cannot mint review authority."""
+    authority = _owned_failure_decision_authority(conn, task_id)
+    if authority is None:
+        return None
+    row = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'workforce_handoff_decision_review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+        if any(payload.get(key) != value for key, value in authority.items()):
+            return None
+        proposal = _normalize_reserved_decision(payload["reserved_decision"])
+        if proposal["failure_event_id"] != authority["failure_event_id"]:
+            return None
+        review = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        review_payload = json.loads(review["payload"]) if review else {}
+        if (
+            review is None or int(review["id"]) != payload["review_requested_event_id"]
+            or review["run_id"] != row["run_id"]
+            or review_payload.get("implementer") != authority["technical_owner"]
+            or review_payload.get("reviewer") != authority["director"]
+        ):
+            return None
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    verdict = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN "
+        "('workforce_handoff_decision_accepted', 'workforce_handoff_decision_rejected') LIMIT 1",
+        (task_id, int(row["id"])),
+    ).fetchone()
+    if verdict is not None:
+        return None
+    return {**authority, "proposal_event_id": int(row["id"]), "reserved_decision": proposal}
+
+
+def owned_failure_decision_outcome_snapshot(conn, task_id: str) -> Optional[dict]:
+    """Expose the exact current-episode reviewed notice, not permission to resume.
+
+    Delivery consumers must key their receipt by ``event_id`` and use only the
+    reviewed structured action, never arbitrary worker summaries or comments.
+    """
+    authority = _owned_failure_decision_authority(conn, task_id, require_active=False)
+    if authority is None:
+        return None
+    event = conn.execute(
+        "SELECT id, run_id, kind, payload FROM task_events WHERE task_id = ? AND kind IN "
+        "('workforce_handoff_decision_accepted', 'workforce_handoff_decision_rejected') "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if event is None:
+        return None
+    try:
+        payload = json.loads(event["payload"])
+        if any(payload.get(key) != value for key, value in authority.items()):
+            return None
+        proposal = conn.execute(
+            "SELECT run_id, payload FROM task_events WHERE id = ? AND task_id = ? "
+            "AND kind = 'workforce_handoff_decision_review_requested'",
+            (payload["proposal_event_id"], task_id),
+        ).fetchone()
+        original = json.loads(proposal["payload"]) if proposal else {}
+        decision = _normalize_reserved_decision(payload["reserved_decision"])
+        if (
+            any(original.get(key) != value for key, value in authority.items())
+            or original.get("reserved_decision") != decision
+            or decision["failure_event_id"] != authority["failure_event_id"]
+            or payload.get("reviewer") != authority["director"]
+            or payload.get("review_run_id") != event["run_id"]
+            or payload.get("incident_repaired") is not False
+            or payload.get("user_authorization_granted") is not False
+        ):
+            return None
+        run = conn.execute(
+            "SELECT profile, status, outcome FROM task_runs WHERE id = ? AND task_id = ?",
+            (event["run_id"], task_id),
+        ).fetchone()
+        claim = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id DESC LIMIT 1", (task_id, event["run_id"]),
+        ).fetchone()
+        claimed = json.loads(claim["payload"]) if claim else {}
+        if (
+            run is None or _canonical_assignee(run["profile"]) != authority["director"]
+            or run["status"] != "blocked" or run["outcome"] != "blocked"
+            or claimed.get("source_status") != "review"
+            or not payload["proposal_event_id"] < claim["id"] < event["id"]
+        ):
+            return None
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return {
+        **authority, "task_id": task_id, "event_id": int(event["id"]),
+        "proposal_event_id": payload["proposal_event_id"], "review_run_id": event["run_id"],
+        "outcome": "accepted" if event["kind"].endswith("_accepted") else "rejected",
+        "reserved_decision": decision, "incident_repaired": False,
+        "user_authorization_granted": False,
+    }
+
+
+def _stop_owned_failure_decision_review(
+    conn, task_id: str, *, decision_review: Any, reason: str, expected_run_id: Optional[int],
+) -> bool:
+    """Accept or reject a decision without granting it or claiming a repair."""
+    if (
+        not isinstance(decision_review, dict)
+        or set(decision_review) != {"proposal_event_id", "outcome"}
+        or decision_review.get("outcome") not in {"accepted", "rejected"}
+        or type(decision_review.get("proposal_event_id")) is not int
+        or type(expected_run_id) is not int or expected_run_id < 1
+    ):
+        raise ValueError("decision_review requires exact proposal, verdict, and active reviewer run")
+    with write_txn(conn):
+        proposal = owned_failure_decision_review_snapshot(conn, task_id)
+        task = get_task(conn, task_id)
+        if (
+            proposal is None or task is None
+            or proposal["proposal_event_id"] != decision_review["proposal_event_id"]
+            or task.status != "running" or task.current_run_id != expected_run_id
+            or _canonical_assignee(task.assignee) != proposal["director"]
+            or not _handoff_source_review_is_current(
+                conn, task_id, _source_acceptance_handoff(task.body), expected_run_id,
+            )
+        ):
+            return False
+        outcome = decision_review["outcome"]
+        kind = "needs_input" if outcome == "accepted" else "capability"
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+            (kind, task_id),
+        )
+        run_id = _end_run(conn, task_id, outcome="blocked", status="blocked", summary=reason)
+        _append_event(conn, task_id, "blocked", {
+            "kind": kind, "reason": reason, "source_status": "review",
+            "decision_review": outcome, "proposal_event_id": proposal["proposal_event_id"],
+        }, run_id=run_id)
+        _append_event(conn, task_id, f"workforce_handoff_decision_{outcome}", {
+            **proposal, "reviewer": proposal["director"], "review_run_id": run_id,
+            "reason": reason, "incident_repaired": False,
+            "user_authorization_granted": False,
+            "continuation_requires_explicit_user_authorization": True,
+        }, run_id=run_id)
+    return True
+
+
 def _current_handoff_recovery_snapshot(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7797,6 +8225,84 @@ def _handoff_recovery_verification_is_current(
     return _current_handoff_recovery_snapshot(conn, task_id, payload) is not None
 
 
+def owned_failure_recovery_outcome_snapshot(conn, task_id: str) -> Optional[dict]:
+    """Return metadata-only proof of a current, source-accepted recovery.
+
+    Unlike the live review predicate, this validates a finished review run.
+    Consumers must key a delivery receipt by ``event_id`` and must not infer
+    recovery from task status or worker prose. No credential, summary, or
+    authorization is returned. Missing or superseded proof fails closed.
+    """
+    authority = _owned_failure_decision_authority(conn, task_id, require_active=False)
+    task = get_task(conn, task_id)
+    if authority is None or task is None:
+        return None
+    request = get_coordination_request(conn, authority["request_root_id"])
+    if (
+        request is None or request.status != "completed" or task.status != "done"
+        or task.current_run_id is not None
+        or _canonical_assignee(task.assignee) != authority["director"]
+    ):
+        return None
+    handoff = _source_acceptance_handoff(task.body)
+    recovery = _current_handoff_recovery_snapshot(conn, task_id, handoff)
+    if recovery is None or recovery["failure_event_id"] != authority["failure_event_id"]:
+        return None
+    rows = conn.execute(
+        "SELECT id, run_id, kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('completed', 'coordination_internal_request_completed', "
+        "'review_requested', 'workforce_handoff_acknowledged', "
+        "'workforce_handoff_recovery_verified') ORDER BY id", (task_id,),
+    ).fetchall()
+    latest = {row["kind"]: row for row in rows}
+    try:
+        completed = latest["completed"]
+        internal = latest["coordination_internal_request_completed"]
+        review = latest["review_requested"]
+        acknowledged = latest["workforce_handoff_acknowledged"]
+        verified = latest["workforce_handoff_recovery_verified"]
+        review_payload = json.loads(review["payload"])
+        if (
+            json.loads(internal["payload"]).get("request_root_id") != request.id
+            or _canonical_assignee(json.loads(acknowledged["payload"]).get("actor")) != authority["technical_owner"]
+            or _canonical_assignee(review_payload.get("implementer")) != authority["technical_owner"]
+            or _canonical_assignee(review_payload.get("reviewer")) != authority["director"]
+            or json.loads(verified["payload"]).get("failure_event_id") != authority["failure_event_id"]
+        ):
+            return None
+        run = conn.execute(
+            "SELECT id, profile, status, outcome FROM task_runs WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        owner_run = conn.execute(
+            "SELECT profile, status, outcome FROM task_runs WHERE task_id = ? AND id = ?",
+            (task_id, review["run_id"]),
+        ).fetchone()
+        claim = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id DESC LIMIT 1", (task_id, completed["run_id"]),
+        ).fetchone()
+        if (
+            run is None or run["id"] != completed["run_id"]
+            or _canonical_assignee(run["profile"]) != authority["director"]
+            or run["status"] != "done" or run["outcome"] != "completed"
+            or owner_run is None
+            or _canonical_assignee(owner_run["profile"]) != authority["technical_owner"]
+            or owner_run["status"] != "review" or owner_run["outcome"] != "review_requested"
+            or claim is None or json.loads(claim["payload"]).get("source_status") != "review"
+            or not acknowledged["id"] < review["id"] < claim["id"] < completed["id"] < internal["id"]
+            or not authority["failure_requirement_event_id"] < verified["id"] < claim["id"]
+        ):
+            return None
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return {
+        **authority, "task_id": task_id, "event_id": int(completed["id"]),
+        "review_run_id": completed["run_id"], "recovery": recovery,
+        "incident_repaired": True, "user_authorization_granted": False,
+    }
+
+
 def coordination_execution_budget_snapshot(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7833,7 +8339,10 @@ def coordination_execution_budget_snapshot(
     ):
         return None
     request = get_coordination_request(conn, request_root_id)
-    if request is None or request.status != "active":
+    if request is None or (
+        request.status != "active"
+        and not (purpose == "terminal_review" and request.status == "return_pending")
+    ):
         return None
     run = conn.execute(
         "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
@@ -7943,9 +8452,27 @@ def terminal_review_context_snapshot(
         conn, task.id, handoff, expected_run_id
     ):
         return None
+    decision = owned_failure_decision_review_snapshot(conn, task.id)
+    incomplete = owned_failure_incomplete_review_snapshot(conn, task.id)
     recovery = _current_handoff_recovery_snapshot(conn, task.id, handoff)
-    if recovery is None:
+    if incomplete is not None:
+        return {
+            "observed_at": phase_snapshot["observed_at"], "purpose": "terminal_review",
+            "request_root_id": request.id, "task_id": task.id,
+            "review_run_id": expected_run_id, "budget": phase_snapshot["budget"],
+            "investigation_incomplete": incomplete, "recovery": None,
+            "required_disposition": "kanban_block; no repair or user-action claim",
+        }
+    if recovery is None and decision is None:
         return None
+    if decision is not None:
+        return {
+            "observed_at": phase_snapshot["observed_at"], "purpose": "terminal_review",
+            "request_root_id": request.id, "task_id": task.id,
+            "review_run_id": expected_run_id, "budget": phase_snapshot["budget"],
+            "reserved_decision": decision, "recovery": None,
+            "required_disposition": "kanban_block with decision_review accepted or rejected; never complete",
+        }
 
     success_pairs = list(zip(
         recovery["success_event_ids"], recovery["success_orders"]
@@ -8960,6 +9487,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    decision_review: Optional[dict] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -8988,6 +9516,42 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    if decision_review is not None:
+        reason = str(redact_review_value(reason or "")).strip()
+        if not reason or len(reason) > 2000:
+            raise ValueError("decision review reason must be a bounded nonempty string")
+        return _stop_owned_failure_decision_review(
+            conn, task_id, decision_review=decision_review, reason=reason,
+            expected_run_id=expected_run_id,
+        )
+    with write_txn(conn):
+        incomplete = owned_failure_incomplete_review_snapshot(conn, task_id)
+        if incomplete is not None:
+            task = get_task(conn, task_id)
+            if (
+                task is None or task.status != "running" or task.current_run_id != expected_run_id
+                or not _handoff_source_review_is_current(
+                    conn, task_id, _source_acceptance_handoff(task.body), expected_run_id,
+                )
+            ):
+                return False
+            reason = str(redact_review_value(reason or "")).strip()
+            if not reason or len(reason) > 2000:
+                raise ValueError("incomplete review reason must be bounded and nonempty")
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL WHERE id = ?", (task_id,),
+            )
+            run_id = _end_run(conn, task_id, outcome="blocked", status="blocked", summary=reason)
+            _append_event(conn, task_id, "blocked", {
+                "kind": "capability", "reason": reason, "source_status": "review",
+                "host_disposition": "investigation_incomplete",
+            }, run_id=run_id)
+            _append_event(conn, task_id, "workforce_handoff_investigation_incomplete", {
+                **incomplete, "incomplete_review_event_id": incomplete["event_id"],
+                "user_authorization_granted": False,
+            }, run_id=run_id)
+            return True
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
@@ -9207,6 +9771,7 @@ def request_review(
     expected_run_id: Optional[int] = None,
     force: bool = False,
     with_reason: bool = False,
+    reserved_decision: Optional[dict] = None,
 ):
     """Transition implementation work into the first-class review phase.
 
@@ -9257,6 +9822,27 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
+        decision_authority = None
+        if reserved_decision is not None:
+            try:
+                reserved_decision = _normalize_reserved_decision(reserved_decision)
+            except ValueError as exc:
+                return _ret(False, str(exc))
+            decision_authority = _owned_failure_decision_authority(conn, task_id)
+            run = conn.execute(
+                "SELECT profile FROM task_runs WHERE id = ? AND task_id = ? "
+                "AND status = 'running' AND outcome IS NULL",
+                (expected_run_id, task_id),
+            ).fetchone()
+            if (
+                decision_authority is None or type(expected_run_id) is not int
+                or expected_run_id < 1 or run is None
+                or trow["status"] != "running" or trow["current_run_id"] != expected_run_id
+                or _canonical_assignee(implementer) != decision_authority["technical_owner"]
+                or _canonical_assignee(run["profile"]) != decision_authority["technical_owner"]
+                or reserved_decision["failure_event_id"] != decision_authority["failure_event_id"]
+            ):
+                return _ret(False, "reserved decision requires the current episode and technical-owner run")
         handoff = _source_acceptance_handoff(trow["body"])
         if handoff is not None:
             if handoff.get("state") not in {"accepted", "active"}:
@@ -9368,6 +9954,15 @@ def request_review(
             },
             run_id=run_id,
         )
+        if decision_authority is not None:
+            review_event_id = conn.execute(
+                "SELECT id FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1", (task_id,),
+            ).fetchone()["id"]
+            _append_event(conn, task_id, "workforce_handoff_decision_review_requested", {
+                **decision_authority, "review_requested_event_id": review_event_id,
+                "reserved_decision": reserved_decision,
+            }, run_id=run_id)
     return _ret(True)
 
 
@@ -9391,6 +9986,10 @@ def request_changes(
         return False, "reason is required"
 
     with write_txn(conn):
+        if owned_failure_decision_review_snapshot(conn, task_id) is not None:
+            return False, "reserved decision review must stop blocked; it cannot relaunch work"
+        if owned_failure_incomplete_review_snapshot(conn, task_id) is not None:
+            return False, "incomplete investigation must stop blocked; it cannot relaunch work"
         task_row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
@@ -9653,6 +10252,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "SELECT status, body, assignee, request_root_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        if owned_failure_decision_outcome_snapshot(conn, task_id) is not None:
+            # Source acceptance approves the notice, not the reserved action or
+            # a new execution budget. A later authorized continuation is separate.
+            return False
+        if owned_failure_incomplete_outcome_snapshot(conn, task_id) is not None:
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current and current["status"] == "blocked"
@@ -13049,6 +13654,8 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    if not dry_run:
+        prepare_owned_failure_incomplete_reviews(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -14015,6 +14622,38 @@ def build_terminal_review_worker_prompt(
         max_attachments=_TERMINAL_REVIEW_MAX_EVIDENCE_PATHS,
     )
     snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    if snapshot.get("investigation_incomplete") is not None:
+        return (
+            f"{TERMINAL_REVIEW_PREFACE}\n"
+            f"Review the incomplete investigation for Kanban task {task.id}.\n\n"
+            f"# Host-bound incomplete investigation\n{snapshot_json}\n\n"
+            f"{budget_direction} The host reached the original investigation guardrail "
+            "without verified recovery or a supported reserved-action proposal. Inspect "
+            "the current evidence and finish with ordinary kanban_block(reason: your "
+            "bounded findings). Do not fabricate a repair, an authorization need, or a "
+            "request for the user to reauthenticate. Do not execute additional repair "
+            "work, create replacement tasks, reset budgets, or use kanban_complete or "
+            "kanban_request_changes. The original incident remains blocked and the "
+            "investigation remains incomplete; source review does not authorize continuation.\n\n"
+            f"# Current-task context\n{context}"
+        )
+    if snapshot.get("reserved_decision") is not None:
+        return (
+            f"{TERMINAL_REVIEW_PREFACE}\n"
+            f"Review the reserved user-action proposal for Kanban task {task.id}.\n\n"
+            f"# Host-bound decision review\n{snapshot_json}\n\n"
+            f"{budget_direction} Inspect the cited evidence independently. The "
+            "integration, account identification, and exact user action are the "
+            "technical owner's claims, not a grant of authority or proof of repair. "
+            "Do not execute the reserved action or request credentials. Finish with "
+            "kanban_block(decision_review={proposal_event_id: the exact displayed id, "
+            "outcome: accepted or rejected}, reason: your bounded verdict). Acceptance "
+            "means the user must decide; the incident remains blocked and unrepaired. "
+            "Never use kanban_complete or kanban_request_changes for this review. "
+            "Continuation requires separately bound explicit user authorization, "
+            "not an automatic retry or a reset of this request's budget.\n\n"
+            f"# Current-task context\n{context}"
+        )
     return (
         f"{TERMINAL_REVIEW_PREFACE}\n"
         f"Work Kanban task {task.id} as its source-acceptance reviewer.\n\n"
