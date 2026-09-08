@@ -561,6 +561,105 @@ def test_bounded_graph_materializes_atomically_and_idempotently(board, organizat
     assert root is not None and root.status == "todo"
 
 
+@pytest.mark.parametrize("coordinated", [False, True])
+@pytest.mark.parametrize("key_kind", ["execution", "outcome"])
+def test_materialization_rejects_preseeded_task_keys_before_mutation(
+    board, organization, coordinated, key_kind,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += (
+        f" with a {key_kind} key collision and coordinated={coordinated}"
+    )
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    plan_row = board.execute(
+        "SELECT stable_key FROM wc_plans WHERE plan_id=?", (plan["plan_id"],)
+    ).fetchone()
+    if key_kind == "execution":
+        collision_key = f"workforce-plan:{plan['plan_id']}:implementation"
+    else:
+        collision_key = f"workforce-outcome:{plan_row['stable_key']}"
+    foreign_id = kanban_db.create_task(
+        board,
+        title="Foreign task using a reserved workforce key",
+        assignee="sloane",
+        idempotency_key=collision_key,
+    )
+    coordination_context = None
+    if coordinated:
+        request, source_id = accepted_coordination_request(
+            board, organization, suffix=f"preseed-{key_kind}",
+        )
+        coordination_context = (request.id, source_id, "work")
+    task_count = board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+
+    with pytest.raises(ValueError, match="idempotency key already belongs"):
+        materialize_plan(
+            board,
+            actor="aurora",
+            plan_id=plan["plan_id"],
+            current_state_evidence=["kanban:current"],
+            current_state_evidence_at=int(time.time()),
+            confirmed_execution_ready=True,
+            organization=organization,
+            coordination_context=coordination_context,
+        )
+
+    assert_plan_remains_draft_without_materialization(
+        board, plan["plan_id"], task_count,
+    )
+    foreign = kanban_db.get_task(board, foreign_id)
+    assert foreign is not None
+    assert foreign.request_root_id is None
+
+
+@pytest.mark.parametrize("returned_kind", ["execution", "outcome"])
+def test_materialization_validates_every_returned_task_before_commit(
+    board, organization, monkeypatch, returned_kind,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += f" with an unexpected returned {returned_kind} task"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    foreign_id = kanban_db.create_task(
+        board,
+        title="Unrelated existing task",
+        assignee="sloane",
+        idempotency_key=f"foreign-{returned_kind}",
+    )
+    task_count = board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    real_create_task = kanban_db.create_task
+
+    def mismatched_create(conn, **kwargs):
+        is_outcome = str(kwargs.get("idempotency_key") or "").startswith(
+            "workforce-outcome:"
+        )
+        if is_outcome == (returned_kind == "outcome"):
+            return foreign_id
+        return real_create_task(conn, **kwargs)
+
+    monkeypatch.setattr(kanban_db, "create_task", mismatched_create)
+
+    with pytest.raises(RuntimeError, match="unexpected task identity"):
+        materialize_plan(
+            board,
+            actor="aurora",
+            plan_id=plan["plan_id"],
+            current_state_evidence=["kanban:current"],
+            current_state_evidence_at=int(time.time()),
+            confirmed_execution_ready=True,
+            organization=organization,
+        )
+
+    assert_plan_remains_draft_without_materialization(
+        board, plan["plan_id"], task_count,
+    )
+
+
 def test_materialization_inherits_active_coordination_budget_and_origin(board, organization):
     payload = plan_payload()
     payload["desired_outcome"] += " inside one accepted request"
@@ -1225,6 +1324,51 @@ def test_native_executor_dispatches_ordinary_uncoordinated_materialization(
         task_id for task_id, _assignee, _workspace in dispatched.spawned
     }
     assert dispatched.coordination_deferred == []
+
+
+def test_later_round_acceptance_rejects_prior_uncoordinated_materialization(
+    board, organization, monkeypatch, tmp_path,
+):
+    from agent import coordination_budget
+
+    with native_coordination_materialization_case(
+        board,
+        organization,
+        monkeypatch,
+        tmp_path,
+        suffix="later-round",
+    ) as case:
+        with coordination_budget.scoped_coordination_budget():
+            materialize_messages = []
+            case["agent"]._execute_tool_calls(
+                MagicMock(
+                    tool_calls=[case["tool_call"]("workforce_materialize")],
+                ),
+                materialize_messages,
+                "origin-task",
+            )
+            materialized = json.loads(materialize_messages[0]["content"])
+            assert materialized["success"] is True
+            assert materialized["created"] is True
+            assert materialized.get("request_root_id") is None
+
+            acceptance_messages = []
+            case["agent"]._execute_tool_calls(
+                MagicMock(tool_calls=[case["tool_call"]("kanban_create")]),
+                acceptance_messages,
+                "origin-task",
+            )
+            rejected = json.loads(acceptance_messages[0]["content"])
+            assert "after uncoordinated workforce materialization" in rejected["error"]
+
+    assert board.execute("SELECT COUNT(*) FROM coordination_requests").fetchone()[0] == 0
+    rows = board.execute(
+        "SELECT t.request_root_id FROM tasks t "
+        "JOIN wc_items w ON w.task_id=t.id "
+        "WHERE w.item_kind IN ('execution','outcome')"
+    ).fetchall()
+    assert len(rows) == 2
+    assert {row["request_root_id"] for row in rows} == {None}
 
 
 def test_sequential_materialization_before_acceptance_is_recoverable(

@@ -754,6 +754,61 @@ def _materialized_plan_result(
     return result
 
 
+def _reject_materialization_task_key_collisions(
+    conn: sqlite3.Connection, idempotency_keys: Iterable[str],
+) -> None:
+    """Reserve a draft plan's predictable task keys inside its write lock."""
+    for idempotency_key in idempotency_keys:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=? "
+            "AND status!='archived' ORDER BY created_at DESC LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        if row is not None:
+            raise ValueError(
+                "workforce materialization idempotency key already belongs to "
+                f"task {row['id']}: {idempotency_key}"
+            )
+
+
+def _require_materialized_task_identity(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    title: str,
+    body: str,
+    assignee: str,
+    created_by: str,
+    tenant: str,
+    idempotency_key: str,
+    goal_mode: bool,
+    session_id: str | None,
+    request_root_id: str | None,
+    parents: Iterable[str],
+) -> None:
+    """Prove create_task returned this plan's task before metadata is attached."""
+    task = kanban_db.get_task(conn, task_id)
+    expected = {
+        "title": title.strip(),
+        "body": body,
+        "assignee": assignee.strip().lower(),
+        "created_by": created_by,
+        "tenant": tenant,
+        "idempotency_key": idempotency_key,
+        "goal_mode": goal_mode,
+        "session_id": session_id,
+        "request_root_id": request_root_id,
+    }
+    if task is None or any(
+        getattr(task, field_name) != value
+        for field_name, value in expected.items()
+    ):
+        raise RuntimeError("workforce materialization returned an unexpected task identity")
+    expected_parents = sorted(set(parents))
+    if kanban_db.parent_ids(conn, task_id) != expected_parents:
+        raise RuntimeError("workforce materialization returned unexpected task parents")
+
+
 def materialize_plan(
     conn: sqlite3.Connection, *, actor: str, plan_id: str,
     current_state_evidence: list[str], current_state_evidence_at: str | int,
@@ -845,6 +900,18 @@ def materialize_plan(
             "coordination_source_task_id": coordination["source_task_id"] if coordination else None,
             "coordination_origin_message_id": origin_message_id or None,
         }
+        expected_request_root_id = (
+            coordination["request_root_id"] if coordination else None
+        )
+        execution_idempotency_keys = {
+            str(node["key"]): f"workforce-plan:{plan_id}:{node['key']}"
+            for node in nodes
+        }
+        outcome_idempotency_key = f"workforce-outcome:{plan['stable_key']}"
+        _reject_materialization_task_key_collisions(
+            conn,
+            [*execution_idempotency_keys.values(), outcome_idempotency_key],
+        )
         by_key: dict[str, str] = {}
         remaining = {str(node["key"]): node for node in nodes}
         while remaining:
@@ -853,21 +920,40 @@ def materialize_plan(
                 parents = [str(value) for value in node.get("parents") or []]
                 if any(parent not in by_key for parent in parents):
                     continue
+                task_title = str(node["title"])
+                task_body = json.dumps({
+                    "kind": "workforce_execution", "plan_id": plan_id,
+                    "desired_outcome": plan["desired_outcome"],
+                    "acceptance_test": node["acceptance_test"],
+                    "current_state_evidence": current_state_evidence,
+                    "current_state_evidence_at": evidence_at,
+                }, indent=2, sort_keys=True)
+                task_assignee = str(node["assignee"])
+                task_tenant = str(node.get("tenant") or "company")
+                task_parents = [by_key[parent] for parent in parents]
+                task_idempotency_key = execution_idempotency_keys[key]
                 task_id = kanban_db.create_task(
-                    conn, title=str(node["title"]),
-                    body=json.dumps({
-                        "kind": "workforce_execution", "plan_id": plan_id,
-                        "desired_outcome": plan["desired_outcome"],
-                        "acceptance_test": node["acceptance_test"],
-                        "current_state_evidence": current_state_evidence,
-                        "current_state_evidence_at": evidence_at,
-                    }, indent=2, sort_keys=True),
-                    assignee=str(node["assignee"]), created_by="aurora",
-                    tenant=str(node.get("tenant") or "company"),
+                    conn, title=task_title, body=task_body,
+                    assignee=task_assignee, created_by="aurora",
+                    tenant=task_tenant,
                     project_id=node.get("project_id"), workspace_kind=str(node.get("workspace_kind") or "scratch"),
-                    parents=[by_key[parent] for parent in parents],
-                    idempotency_key=f"workforce-plan:{plan_id}:{key}", goal_mode=bool(node.get("goal_mode", True)),
+                    parents=task_parents,
+                    idempotency_key=task_idempotency_key, goal_mode=bool(node.get("goal_mode", True)),
                     **task_context,
+                )
+                _require_materialized_task_identity(
+                    conn,
+                    task_id=task_id,
+                    title=task_title,
+                    body=task_body,
+                    assignee=task_assignee,
+                    created_by="aurora",
+                    tenant=task_tenant,
+                    idempotency_key=task_idempotency_key,
+                    goal_mode=bool(node.get("goal_mode", True)),
+                    session_id=task_context["session_id"],
+                    request_root_id=expected_request_root_id,
+                    parents=task_parents,
                 )
                 stable_key = stable_identity(
                     item_kind="execution", desired_outcome=str(node["title"]),
@@ -885,16 +971,34 @@ def materialize_plan(
                 progressed = True
             if not progressed:
                 raise RuntimeError("plan graph could not be topologically materialized")
+        outcome_title = f"Outcome: {plan['title']}"
+        outcome_body = json.dumps({
+            "kind": "workforce_outcome", "plan_id": plan_id,
+            "desired_outcome": plan["desired_outcome"],
+            "acceptance_test": plan["acceptance_test"],
+        }, indent=2, sort_keys=True)
+        outcome_parents = list(by_key.values())
         root_id = kanban_db.create_task(
-            conn, title=f"Outcome: {plan['title']}",
-            body=json.dumps({
-                "kind": "workforce_outcome", "plan_id": plan_id,
-                "desired_outcome": plan["desired_outcome"],
-                "acceptance_test": plan["acceptance_test"],
-            }, indent=2, sort_keys=True),
-            assignee="aurora", created_by="aurora", tenant="company", parents=list(by_key.values()),
-            idempotency_key=f"workforce-outcome:{plan['stable_key']}", workspace_kind="scratch", goal_mode=False,
+            conn, title=outcome_title, body=outcome_body,
+            assignee="aurora", created_by="aurora", tenant="company",
+            parents=outcome_parents,
+            idempotency_key=outcome_idempotency_key,
+            workspace_kind="scratch", goal_mode=False,
             **task_context,
+        )
+        _require_materialized_task_identity(
+            conn,
+            task_id=root_id,
+            title=outcome_title,
+            body=outcome_body,
+            assignee="aurora",
+            created_by="aurora",
+            tenant="company",
+            idempotency_key=outcome_idempotency_key,
+            goal_mode=False,
+            session_id=task_context["session_id"],
+            request_root_id=expected_request_root_id,
+            parents=outcome_parents,
         )
         outcome_key = stable_identity(item_kind="outcome", desired_outcome=plan["desired_outcome"], action_class="outcome", target_ref=plan["goal_ref"])
         conn.execute(

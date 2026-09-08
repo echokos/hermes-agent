@@ -9,7 +9,10 @@ import subprocess
 import time
 from typing import Any
 
-from agent.coordination_budget import coordination_materialization_binding
+from agent.coordination_budget import (
+    coordination_materialization_binding,
+    register_uncoordinated_materialization,
+)
 from hermes_cli import kanban_db
 from hermes_cli.workforce_org import active_workforce_agent
 from plugins.workforce_control.store import (
@@ -62,6 +65,10 @@ def _materialize(args: dict[str, Any], **_kwargs: Any) -> str:
                     confirmed_execution_ready=bool(args.get("confirmed_execution_ready")),
                     coordination_context=coordination_context,
                     coordination_origin=coordination_origin,
+                )
+                register_uncoordinated_materialization(
+                    created=result.get("created") is True,
+                    request_root_id=result.get("request_root_id"),
                 )
         return tool_result(success=True, **result)
     except Exception as exc:

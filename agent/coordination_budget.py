@@ -24,6 +24,7 @@ class CoordinationScope:
     acceptance_scope_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     coordination_acceptance_required: bool = False
     unbudgeted_delegation_started: bool = False
+    uncoordinated_materialization_committed: bool = False
     closed: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -104,6 +105,21 @@ def register_declared_coordination_acceptance(*, declared: bool) -> None:
         scope.coordination_acceptance_required = True
 
 
+def register_uncoordinated_materialization(
+    *, created: bool, request_root_id: str | None,
+) -> None:
+    """Fence later same-turn acceptance after newly committed unbound work."""
+    if not created or str(request_root_id or "").strip():
+        return
+    scope = _scope.get()
+    if scope is None:
+        return
+    with scope.lock:
+        if scope.closed.is_set():
+            raise ValueError("coordination turn already ended")
+        scope.uncoordinated_materialization_committed = True
+
+
 @contextmanager
 def coordination_materialization_binding():
     """Fence task materialization against same-turn request acceptance.
@@ -169,6 +185,11 @@ def coordination_acceptance_binding():
             raise ValueError("coordination turn already ended")
         if scope.unbudgeted_delegation_started:
             raise ValueError("cannot accept a request after unbudgeted delegation started")
+        if scope.uncoordinated_materialization_committed:
+            raise ValueError(
+                "cannot accept a request after uncoordinated workforce "
+                "materialization committed"
+            )
         binding = CoordinationAcceptanceBinding(
             model_calls=scope.provisional_model_calls,
             scope_id=scope.acceptance_scope_id,
