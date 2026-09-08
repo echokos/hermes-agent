@@ -1361,6 +1361,167 @@ def test_owned_failure_factory_has_fixed_internal_caps_and_no_user_route(
             )
 
 
+def test_coordination_work_budget_snapshot_spawn_and_show_are_bound(
+    kanban_home, organization, monkeypatch, tmp_path,
+):
+    import subprocess
+
+    with kb.connect_closing() as conn:
+        root_id, request = _accept_request(
+            conn,
+            organization,
+            max_model_calls=20,
+            final_model_call_reserve=3,
+        )
+        task_id = kb.create_task(
+            conn,
+            title="Implement the bounded child task",
+            assignee="builder",
+            coordination_source_task_id=root_id,
+        )
+        worker, _ = kb.claim_task_for_dispatch(
+            conn, task_id, organization=organization, now=101,
+        )
+        assert worker is not None
+        assert task_id != request.root_task_id
+        assert worker.request_root_id == request.id
+        for ordinal in (1, 2):
+            assert kb.charge_coordination_model_call(
+                conn,
+                request.id,
+                purpose="work",
+                task_id=task_id,
+                now=102,
+            ) == ordinal
+
+        snapshot = kb.coordination_execution_budget_snapshot(
+            conn,
+            task_id,
+            request_root_id=request.id,
+            run_id=worker.current_run_id,
+            purpose="work",
+            now=103,
+        )
+        assert snapshot == {
+            "observed_at": 103,
+            "purpose": "work",
+            "request_root_id": request.id,
+            "task_id": task_id,
+            "run_id": worker.current_run_id,
+            "budget": {
+                "model_calls_used": 2,
+                "max_model_calls": 20,
+                "model_calls_remaining": 18,
+                "aggregate_model_calls_remaining": 18,
+                "final_model_call_reserve": 3,
+                "phase_model_call_limit": 17,
+                "phase_model_calls_remaining": 15,
+                "next_model_call_ordinal": 3,
+            },
+        }
+        prompt = kb.build_coordination_work_worker_prompt(conn, worker, now=103)
+        assert prompt is not None
+        assert prompt.startswith(kb.COORDINATED_WORK_PREFACE)
+        assert '"phase_model_calls_remaining": 15' in prompt
+        assert "Call `kanban_show()` first" in prompt
+        assert "does not replace worker orientation" in prompt
+
+        outside_id = kb.create_task(
+            conn, title="Outside the request cohort", assignee="builder",
+        )
+        outside = kb.claim_task(conn, outside_id, claimer="builder:outside")
+        assert outside is not None
+        assert kb.coordination_execution_budget_snapshot(
+            conn,
+            outside_id,
+            request_root_id=request.id,
+            run_id=outside.current_run_id,
+            purpose="work",
+        ) is None
+        assert kb.coordination_execution_budget_snapshot(
+            conn,
+            task_id,
+            request_root_id=request.id,
+            run_id=worker.current_run_id,
+            purpose="terminal_review",
+        ) is None
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "work-budget-workspace"
+    workspace.mkdir()
+    assert kb._default_spawn(worker, str(workspace)) == 4243
+    query = captured["cmd"][captured["cmd"].index("-q") + 1]
+    assert query.startswith(kb.COORDINATED_WORK_PREFACE)
+    assert '"phase_model_calls_remaining": 15' in query
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(worker.current_run_id))
+    monkeypatch.setenv("HERMES_COORDINATION_REQUEST_ROOT", request.id)
+    monkeypatch.setenv("HERMES_COORDINATION_TASK_ID", task_id)
+    monkeypatch.setenv("HERMES_COORDINATION_PURPOSE", "work")
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    from agent.coordination_budget import scoped_coordination_budget
+    from tools import kanban_tools
+
+    env_only = json.loads(kanban_tools._handle_show({}))
+    assert "coordination_budget" not in env_only
+
+    with scoped_coordination_budget(
+        request_root_id=request.id,
+        task_id=task_id,
+        purpose="work",
+        db_path=kb.kanban_db_path(),
+    ):
+        shown = json.loads(kanban_tools._handle_show({}))
+        assert shown["coordination_budget"]["phase_model_call_limit"] == 17
+        assert shown["coordination_budget"]["phase_model_calls_remaining"] == 15
+        assert shown["coordination_budget"]["model_calls_remaining"] == 18
+        assert shown["coordination_budget"]["final_model_call_reserve"] == 3
+        with kb.connect_closing() as conn:
+            for ordinal in range(3, 17):
+                assert kb.charge_coordination_model_call(
+                    conn,
+                    request.id,
+                    purpose="work",
+                    task_id=task_id,
+                    now=104,
+                ) == ordinal
+        refreshed = json.loads(kanban_tools._handle_show({}))
+        assert refreshed["coordination_budget"]["model_calls_used"] == 16
+        assert refreshed["coordination_budget"]["phase_model_calls_remaining"] == 1
+        assert refreshed["coordination_budget"][
+            "aggregate_model_calls_remaining"
+        ] == 4
+
+    with kb.connect_closing() as conn:
+        for invalid_claim_payload in (None, "", "not-json"):
+            conn.execute(
+                "UPDATE task_events SET payload = ? "
+                "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+                (invalid_claim_payload, task_id, worker.current_run_id),
+            )
+            conn.commit()
+            assert kb.coordination_execution_budget_snapshot(
+                conn,
+                task_id,
+                request_root_id=request.id,
+                run_id=worker.current_run_id,
+                purpose="work",
+            ) is None
+            assert kb.build_coordination_work_worker_prompt(conn, worker) is None
+
+
 def test_terminal_review_snapshot_and_spawn_query_are_host_bound(
     kanban_home, organization, monkeypatch, tmp_path,
 ):
@@ -1381,6 +1542,10 @@ def test_terminal_review_snapshot_and_spawn_query_are_host_bound(
             "model_calls_used": 17,
             "max_model_calls": 20,
             "model_calls_remaining": 3,
+            "aggregate_model_calls_remaining": 3,
+            "final_model_call_reserve": 3,
+            "phase_model_call_limit": 20,
+            "phase_model_calls_remaining": 3,
             "next_model_call_ordinal": 18,
         }
         assert snapshot["evidence_paths"] == [{
@@ -1408,22 +1573,31 @@ def test_terminal_review_snapshot_and_spawn_query_are_host_bound(
     monkeypatch.setenv("HERMES_COORDINATION_REQUEST_ROOT", request.id)
     monkeypatch.setenv("HERMES_COORDINATION_TASK_ID", task_id)
     monkeypatch.setenv("HERMES_COORDINATION_PURPOSE", "terminal_review")
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    from agent.coordination_budget import scoped_coordination_budget
     from tools import kanban_tools
 
-    shown = json.loads(kanban_tools._handle_show({}))
-    assert shown["coordination_budget"]["model_calls_used"] == 17
-    assert shown["coordination_budget"]["model_calls_remaining"] == 3
-    with kb.connect_closing() as conn:
-        assert kb.charge_coordination_model_call(
-            conn,
-            request.id,
-            purpose="terminal_review",
-            task_id=task_id,
-            now=251,
-        ) == 18
-    shown = json.loads(kanban_tools._handle_show({}))
-    assert shown["coordination_budget"]["model_calls_used"] == 18
-    assert shown["coordination_budget"]["model_calls_remaining"] == 2
+    with scoped_coordination_budget(
+        request_root_id=request.id,
+        task_id=task_id,
+        purpose="terminal_review",
+        db_path=kb.kanban_db_path(),
+    ):
+        shown = json.loads(kanban_tools._handle_show({}))
+        assert shown["coordination_budget"]["model_calls_used"] == 17
+        assert shown["coordination_budget"]["model_calls_remaining"] == 3
+        assert shown["coordination_budget"]["phase_model_calls_remaining"] == 3
+        with kb.connect_closing() as conn:
+            assert kb.charge_coordination_model_call(
+                conn,
+                request.id,
+                purpose="terminal_review",
+                task_id=task_id,
+                now=251,
+            ) == 18
+        shown = json.loads(kanban_tools._handle_show({}))
+        assert shown["coordination_budget"]["model_calls_used"] == 18
+        assert shown["coordination_budget"]["model_calls_remaining"] == 2
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
@@ -1490,11 +1664,19 @@ def test_terminal_review_snapshot_fails_closed_on_missing_or_cross_task_scope(
         monkeypatch.setenv("HERMES_COORDINATION_REQUEST_ROOT", request.id)
         monkeypatch.setenv("HERMES_COORDINATION_TASK_ID", task_id)
         monkeypatch.setenv("HERMES_COORDINATION_PURPOSE", "terminal_review")
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+        from agent.coordination_budget import scoped_coordination_budget
         from tools import kanban_tools
 
-        cross_task_show = json.loads(
-            kanban_tools._handle_show({"task_id": other_id})
-        )
+        with scoped_coordination_budget(
+            request_root_id=request.id,
+            task_id=task_id,
+            purpose="terminal_review",
+            db_path=kb.kanban_db_path(),
+        ):
+            cross_task_show = json.loads(
+                kanban_tools._handle_show({"task_id": other_id})
+            )
         assert "coordination_budget" not in cross_task_show
         assert kb.terminal_review_context_snapshot(
             conn,

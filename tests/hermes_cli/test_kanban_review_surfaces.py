@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -84,6 +85,48 @@ def test_review_tools_redact_handoff_and_route_changes(
         assert event.payload["reason"] != (
             "Add a boundary assertion; leaked=" + change_secret
         )
+
+
+def test_worker_review_receipt_survives_immediate_reviewer_claim(
+    review_worker: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import kanban_tools as tools
+
+    implementation_run_id = int(os.environ["HERMES_KANBAN_RUN_ID"])
+    real_request_review = kb.request_review
+    claimed_review_run_id = None
+
+    def request_review_then_claim(conn, task_id, **kwargs):
+        nonlocal claimed_review_run_id
+        result = real_request_review(conn, task_id, **kwargs)
+        if result[0]:
+            reviewer_run = kb.claim_review_task(
+                conn, task_id, claimer="reviewer:race"
+            )
+            assert reviewer_run is not None
+            claimed_review_run_id = reviewer_run.current_run_id
+        return result
+
+    monkeypatch.setattr(kb, "request_review", request_review_then_claim)
+    receipt = json.loads(tools._handle_request_review({
+        "summary": "Implementation complete and locally verified.",
+        "reviewer": "reviewer",
+    }))
+
+    assert receipt == {
+        "ok": True,
+        "task_id": review_worker,
+        "run_id": implementation_run_id,
+        "status": "review",
+    }
+    assert claimed_review_run_id is not None
+    assert claimed_review_run_id != implementation_run_id
+    with kb.connect() as conn:
+        current = kb.get_task(conn, review_worker)
+        assert current is not None
+        assert current.status == "running"
+        assert current.current_run_id == claimed_review_run_id
 
 
 def test_review_tools_are_gated_and_visible_to_kanban_workers(
@@ -237,7 +280,10 @@ def test_worker_guidance_distinguishes_same_card_and_downstream_review() -> None
     assert "`kanban_request_changes`" in KANBAN_GUIDANCE
     assert "metadata=..." in KANBAN_GUIDANCE
     assert "[HERMES_HOST_TERMINAL_REVIEW_V1]" in KANBAN_GUIDANCE
-    assert "Ordinary workers never skip the opening call" in KANBAN_GUIDANCE
+    assert "[HERMES_HOST_COORDINATED_WORK_V1]" in KANBAN_GUIDANCE
+    assert "never skip the opening call" in KANBAN_GUIDANCE
+    assert "phase_model_calls_remaining" in KANBAN_GUIDANCE
+    assert "terminal reserve unavailable" in KANBAN_GUIDANCE
     kanban_defaults = DEFAULT_CONFIG["kanban"]
     assert isinstance(kanban_defaults, dict)
     assert kanban_defaults["review_dispatch"] is True

@@ -151,6 +151,11 @@ def finalize_turn(
         and not interrupted
         and not failed
     )
+    work_review_handoff = (
+        str(_turn_exit_reason) == "work_review_handoff"
+        and not interrupted
+        and not failed
+    )
     budget_fallback_eligible = (
         budget_exhausted
         and not interrupted
@@ -212,7 +217,7 @@ def finalize_turn(
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
             )
-    elif budget_exhausted and not terminal_review_verdict:
+    elif budget_exhausted and not terminal_review_verdict and not work_review_handoff:
         # Bounded fallback (#87096): budget was exhausted but none of the
         # normal fallback paths were eligible (interrupted / failed /
         # anomalous exit_reason). If running as a kanban worker we must
@@ -231,6 +236,7 @@ def finalize_turn(
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
     completed = (
         terminal_review_verdict
+        or work_review_handoff
         or (
             final_response is not None
             and not failed
@@ -312,7 +318,7 @@ def finalize_turn(
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
 
-        # When the turn was interrupted, or a terminal-review verdict ended
+        # When the turn was interrupted, or a host-owned terminal action ended
         # at a tool result, append a synthetic assistant message to close the
         # tool-call sequence. Without this, the session persists a
         # ``tool → user`` alternation that strict providers (Gemini,
@@ -326,16 +332,20 @@ def finalize_turn(
         # here instead. On an interrupt ``final_response`` is typically
         # empty, so fall back to an explicit protocol marker rather than
         # persisting an empty-content assistant turn. The terminal-review
-        # marker records only a host-committed verdict; it is not a model
-        # approval summary and is never returned to the user as model text.
-        if interrupted or terminal_review_verdict:
+        # markers record only host-committed state; they are not model approval
+        # summaries and are never returned to the user as model text.
+        if interrupted or terminal_review_verdict or work_review_handoff:
             from agent.message_sanitization import close_interrupted_tool_sequence
             close_interrupted_tool_sequence(
                 messages,
                 (
                     final_response
                     if interrupted
-                    else "Kanban terminal verdict recorded by host."
+                    else (
+                        "Kanban terminal verdict recorded by host."
+                        if terminal_review_verdict
+                        else "Kanban review handoff recorded by host."
+                    )
                 ),
             )
 
@@ -561,7 +571,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted and not terminal_review_verdict:
+    if not interrupted and not terminal_review_verdict and not work_review_handoff:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()

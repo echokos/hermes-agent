@@ -1731,6 +1731,59 @@ def _terminal_review_tool_round_completed(tool_results: List[Dict[str, Any]]) ->
     return session_called_kanban_terminal(verdict_results)
 
 
+def _work_review_tool_round_completed(tool_results: List[Dict[str, Any]]) -> bool:
+    """Return true for a host-confirmed review handoff in active work scope."""
+    try:
+        from agent.coordination_budget import current_coordination_execution
+
+        execution = current_coordination_execution()
+    except Exception:
+        return False
+    if execution is None:
+        return False
+    request_root_id, task_id, purpose = execution
+    if not request_root_id or not task_id or purpose != "work":
+        return False
+    if (os.environ.get("HERMES_COORDINATION_REQUEST_ROOT") or "").strip() != request_root_id:
+        return False
+    if (os.environ.get("HERMES_COORDINATION_TASK_ID") or "").strip() != task_id:
+        return False
+    if (os.environ.get("HERMES_COORDINATION_PURPOSE") or "").strip() != "work":
+        return False
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() != task_id:
+        return False
+    if (os.environ.get("HERMES_SESSION_SOURCE") or "").strip() != "kanban":
+        return False
+    run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if not run_id.isdecimal() or int(run_id) < 1:
+        return False
+
+    for result in tool_results:
+        if not isinstance(result, dict):
+            continue
+        if str(result.get("name") or result.get("tool_name") or "") != "kanban_request_review":
+            continue
+        content = result.get("content")
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(content, dict):
+            continue
+        if content.get("ok") is not True:
+            continue
+        if str(content.get("task_id") or "").strip() != task_id:
+            continue
+        if str(content.get("status") or "").strip().lower() != "review":
+            continue
+        result_run_id = str(content.get("run_id") or "").strip()
+        if result_run_id != run_id:
+            continue
+        return True
+    return False
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -7251,7 +7304,9 @@ def run_conversation(
                         pass
 
                 _tool_results_start = len(messages)
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                tool_execution_stopped = agent._execute_tool_calls(
+                    assistant_message, messages, effective_task_id, api_call_count
+                )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -7312,6 +7367,26 @@ def run_conversation(
                     # text response after it consumes the final reserved call.
                     agent._session_messages = messages
                     _turn_exit_reason = "terminal_review_verdict"
+                    final_response = ""
+                    break
+
+                if tool_execution_stopped is True:
+                    # The sequential executor verified the active work scope
+                    # against the host's successful handoff result before
+                    # finalizing this tool batch.  Finalization may attach a
+                    # pending /steer marker to that JSON result, so do not
+                    # reparse the altered content before ending the turn.
+                    agent._session_messages = messages
+                    _turn_exit_reason = "work_review_handoff"
+                    final_response = ""
+                    break
+
+                if _work_review_tool_round_completed(messages[_tool_results_start:]):
+                    # The active implementation worker has already handed the
+                    # task to review through the host handler. Do not spend a
+                    # follow-up provider call just to narrate that transition.
+                    agent._session_messages = messages
+                    _turn_exit_reason = "work_review_handoff"
                     final_response = ""
                     break
 

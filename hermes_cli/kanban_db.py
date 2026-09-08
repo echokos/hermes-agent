@@ -7533,6 +7533,103 @@ def _handoff_recovery_verification_is_current(
     return _current_handoff_recovery_snapshot(conn, task_id, payload) is not None
 
 
+def coordination_execution_budget_snapshot(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    request_root_id: str,
+    run_id: int,
+    purpose: str,
+    now: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Return the live phase budget for one bound coordination execution.
+
+    The dispatcher may call this before the worker process has an active
+    conversation ContextVar, so every identity is supplied explicitly and
+    checked against durable task, run, and request state.  Callers inside a
+    conversation must additionally prove their trusted runtime binding before
+    exposing the returned values.
+    """
+    request_root_id = str(request_root_id or "").strip()
+    if not request_root_id or purpose not in {"work", "terminal_review"}:
+        return None
+    try:
+        expected_run_id = int(run_id)
+    except (TypeError, ValueError):
+        return None
+    if expected_run_id < 1:
+        return None
+
+    task = get_task(conn, task_id)
+    if (
+        task is None
+        or task.request_root_id != request_root_id
+        or task.status != "running"
+        or task.current_run_id != expected_run_id
+    ):
+        return None
+    request = get_coordination_request(conn, request_root_id)
+    if request is None or request.status != "active":
+        return None
+    run = conn.execute(
+        "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
+        "AND status = 'running' AND outcome IS NULL",
+        (expected_run_id, task.id),
+    ).fetchone()
+    if run is None:
+        return None
+    claimed = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+        (task.id, expected_run_id),
+    ).fetchone()
+    try:
+        claimed_payload = json.loads(claimed["payload"]) if claimed else None
+    except (TypeError, json.JSONDecodeError):
+        claimed_payload = None
+    if not isinstance(claimed_payload, dict):
+        return None
+    durable_purpose = "work"
+    if (
+        request.kind == "owned_operational_failure"
+        and task.id == request.root_task_id
+        and claimed_payload.get("source_status") == "review"
+    ):
+        durable_purpose = "terminal_review"
+    if purpose != durable_purpose:
+        return None
+
+    aggregate_remaining = max(
+        0, request.max_model_calls - request.model_calls_used
+    )
+    phase_limit = request.max_model_calls
+    if purpose == "work":
+        phase_limit -= request.final_model_call_reserve
+    phase_remaining = max(0, phase_limit - request.model_calls_used)
+    observed_at = int(time.time() if now is None else now)
+    return {
+        "observed_at": observed_at,
+        "purpose": purpose,
+        "request_root_id": request.id,
+        "task_id": task.id,
+        "run_id": expected_run_id,
+        "budget": {
+            "model_calls_used": request.model_calls_used,
+            "max_model_calls": request.max_model_calls,
+            # Preserve the original terminal-review field while making its
+            # aggregate meaning explicit beside the work-phase balance.
+            "model_calls_remaining": aggregate_remaining,
+            "aggregate_model_calls_remaining": aggregate_remaining,
+            "final_model_call_reserve": request.final_model_call_reserve,
+            "phase_model_call_limit": phase_limit,
+            "phase_model_calls_remaining": phase_remaining,
+            "next_model_call_ordinal": (
+                request.model_calls_used + 1 if phase_remaining else None
+            ),
+        },
+    }
+
+
 def terminal_review_context_snapshot(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7549,20 +7646,23 @@ def terminal_review_context_snapshot(
     supply the dispatcher-bound request and run identities; mismatches fail
     closed instead of exposing another task's request budget.
     """
-    request_root_id = str(request_root_id or "").strip()
-    if not request_root_id:
+    phase_snapshot = coordination_execution_budget_snapshot(
+        conn,
+        task_id,
+        request_root_id=request_root_id,
+        run_id=run_id,
+        purpose="terminal_review",
+        now=now,
+    )
+    if phase_snapshot is None:
         return None
-    try:
-        expected_run_id = int(run_id)
-    except (TypeError, ValueError):
-        return None
+    request_root_id = phase_snapshot["request_root_id"]
+    expected_run_id = phase_snapshot["run_id"]
 
     task = get_task(conn, task_id)
     if (
         task is None
-        or task.request_root_id != request_root_id
-        or task.status != "running"
-        or task.current_run_id != expected_run_id
+        or task.id != phase_snapshot["task_id"]
     ):
         return None
     request = get_coordination_request(conn, request_root_id)
@@ -7570,7 +7670,6 @@ def terminal_review_context_snapshot(
         request is None
         or request.kind != "owned_operational_failure"
         or request.root_task_id != task.id
-        or request.status != "active"
     ):
         return None
     handoff = _source_acceptance_handoff(task.body)
@@ -7608,8 +7707,6 @@ def terminal_review_context_snapshot(
         ),
     }
 
-    remaining = max(0, request.max_model_calls - request.model_calls_used)
-    observed_at = int(time.time() if now is None else now)
     attachments = list_attachments(conn, task.id)
     usable_attachments = [
         attachment
@@ -7633,19 +7730,12 @@ def terminal_review_context_snapshot(
         for attachment in shown_attachments
     ]
     return {
-        "observed_at": observed_at,
+        "observed_at": phase_snapshot["observed_at"],
         "purpose": "terminal_review",
         "request_root_id": request.id,
         "task_id": task.id,
         "review_run_id": expected_run_id,
-        "budget": {
-            "model_calls_used": request.model_calls_used,
-            "max_model_calls": request.max_model_calls,
-            "model_calls_remaining": remaining,
-            "next_model_call_ordinal": (
-                request.model_calls_used + 1 if remaining else None
-            ),
-        },
+        "budget": phase_snapshot["budget"],
         "evidence_paths": evidence_paths,
         "omitted_evidence_paths": max(
             0, len(attachments) - len(shown_attachments)
@@ -13384,7 +13474,68 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+COORDINATED_WORK_PREFACE = "[HERMES_HOST_COORDINATED_WORK_V1]"
 TERMINAL_REVIEW_PREFACE = "[HERMES_HOST_TERMINAL_REVIEW_V1]"
+
+
+def build_coordination_work_worker_prompt(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    now: Optional[int] = None,
+) -> Optional[str]:
+    """Build a host-bound work query that makes the phase budget visible."""
+    if (
+        task.coordination_purpose not in {None, "work"}
+        or not task.request_root_id
+        or task.current_run_id is None
+    ):
+        return None
+    snapshot = coordination_execution_budget_snapshot(
+        conn,
+        task.id,
+        request_root_id=task.request_root_id,
+        run_id=task.current_run_id,
+        purpose="work",
+        now=now,
+    )
+    if snapshot is None:
+        return None
+
+    budget = snapshot["budget"]
+    phase_remaining = int(budget["phase_model_calls_remaining"])
+    if phase_remaining <= 1:
+        budget_direction = (
+            "The work phase has at most one provider response left. Orient with "
+            "the required `kanban_show` call and prioritize a truthful lifecycle "
+            "handoff; do not claim or request review for unverified work."
+        )
+    else:
+        budget_direction = (
+            f"Use at most {phase_remaining - 1} provider response"
+            f"{'s' if phase_remaining - 1 != 1 else ''} for implementation and "
+            "verification, and reserve the final work-phase response for exactly "
+            "one truthful lifecycle handoff."
+        )
+
+    snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    return (
+        f"{COORDINATED_WORK_PREFACE}\n"
+        f"Work Kanban task {task.id}.\n\n"
+        "# Host-observed coordination work budget\n"
+        f"{snapshot_json}\n\n"
+        "The host read these request/task/run identities and budget values from "
+        f"the board at observation time {snapshot['observed_at']}. Admission "
+        "rechecks the live authoritative budget before every physical provider "
+        "call, and your first response consumes the displayed next ordinal. The "
+        "aggregate balance includes the terminal reserve, which is unavailable "
+        "during the work phase.\n\n"
+        f"{budget_direction}\n\n"
+        "This marker does not replace worker orientation. Call `kanban_show()` "
+        "first as required; its `coordination_budget` field reports the current "
+        "phase and aggregate balances. Stay within the assigned task, workspace, "
+        "and role rather than expanding into adjacent coordination work."
+    )
 
 
 def build_terminal_review_worker_prompt(
@@ -13519,6 +13670,18 @@ def _default_spawn(
             )
         if terminal_review_prompt is not None:
             prompt = terminal_review_prompt
+    elif task.request_root_id:
+        try:
+            with connect_closing(kanban_db_path(board=board)) as conn:
+                work_prompt = build_coordination_work_worker_prompt(conn, task)
+        except Exception:
+            work_prompt = None
+            _log.exception(
+                "kanban worker: coordination work-budget snapshot unavailable for %s",
+                task.id,
+            )
+        if work_prompt is not None:
+            prompt = work_prompt
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first

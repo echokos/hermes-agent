@@ -1932,7 +1932,48 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def _work_review_handoff_completed(tool_result: dict) -> bool:
+    """Check the conversation loop's exact active-work review predicate.
+
+    This import deliberately stays runtime-local: the predicate lives with the
+    conversation's ContextVar and dispatcher-environment validation, while the
+    executor only needs its explicit decision after persisting a tool row.
+    """
+    try:
+        from agent.conversation_loop import _work_review_tool_round_completed
+
+        return _work_review_tool_round_completed([tool_result]) is True
+    except Exception:
+        return False
+
+
+def _append_work_review_skipped_tool_results(
+    agent,
+    messages: list,
+    tool_calls,
+) -> bool:
+    """Persist paired no-effect results for calls after a review handoff."""
+    for skipped_tc in tool_calls:
+        skipped_name = skipped_tc.function.name
+        messages.append(make_tool_result_message(
+            skipped_name,
+            (
+                f"[Tool execution skipped — {skipped_name} was not started after "
+                "a successful kanban review handoff]"
+            ),
+            skipped_tc.id,
+            effect_disposition="none",
+        ))
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"review-handoff skipped tool result {skipped_name}",
+        ):
+            return False
+    return True
+
+
+def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> bool:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
@@ -1947,9 +1988,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     def _run_agent_tool_execution_middleware(agent, **kwargs):
         return _run_sequential_tool_execution_middleware(agent, **kwargs)
 
+    work_review_handoff = False
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
-            return
+            return False
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.
@@ -1985,7 +2027,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     messages,
                     stage=f"cancelled tool result {skipped_name}",
                 ):
-                    return
+                    return False
             break
 
         function_name = tool_call.function.name
@@ -2023,7 +2065,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 messages,
                 stage=f"invalid tool arguments {function_name}",
             ):
-                return
+                return False
             continue
 
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
@@ -2670,7 +2712,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             messages,
             stage=f"tool result {function_name}",
         ):
-            return
+            return False
 
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
@@ -2725,6 +2767,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
+        if _work_review_handoff_completed(tool_message) is True:
+            work_review_handoff = True
+            if not _append_work_review_skipped_tool_results(
+                agent,
+                messages,
+                assistant_message.tool_calls[i:],
+            ):
+                return False
+            break
+
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i
             agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
@@ -2741,7 +2793,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     messages,
                     stage=f"skipped tool result {skipped_name}",
                 ):
-                    return
+                    return False
             break
 
     # ── Per-turn aggregate budget enforcement ─────────────────────────
@@ -2758,10 +2810,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     if finalize and num_tools_seq > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
+    return work_review_handoff is True
 
 
 
-def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
+
+def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> bool:
     """Execute a mixed tool-call batch as ordered parallel/sequential segments.
 
     ``segments`` is the ``(kind, calls)`` plan from
@@ -2791,9 +2845,10 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    work_review_handoff = False
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
-            return
+            return False
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(
@@ -2801,13 +2856,27 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
                 finalize=False,
             )
         else:
-            execute_tool_calls_sequential(
+            sequential_stopped = execute_tool_calls_sequential(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
             )
+            if sequential_stopped is True:
+                work_review_handoff = True
+                remaining_calls = [
+                    tool_call
+                    for _, later_calls in segments[segment_index + 1:]
+                    for tool_call in later_calls
+                ]
+                if not _append_work_review_skipped_tool_results(
+                    agent,
+                    messages,
+                    remaining_calls,
+                ):
+                    return False
+                break
 
         if getattr(agent, "_incremental_persistence_failed", False):
-            return
+            return False
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)
@@ -2819,6 +2888,8 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             config=_tool_budget,
         )
         agent._apply_pending_steer_to_tool_results(messages, total_tools)
+
+    return work_review_handoff is True
 
 
 __all__ = [

@@ -535,20 +535,39 @@ def _handle_show(args: dict, **kw) -> str:
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
-            terminal_review_snapshot = None
+            coordination_snapshot = None
+            purpose = (os.environ.get("HERMES_COORDINATION_PURPOSE") or "").strip()
+            request_root_id = (
+                os.environ.get("HERMES_COORDINATION_REQUEST_ROOT") or ""
+            ).strip()
+            try:
+                from agent.coordination_budget import current_coordination_execution
+
+                live_execution = current_coordination_execution()
+            except Exception:
+                live_execution = None
             if (
-                tid == (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-                and os.environ.get("HERMES_COORDINATION_PURPOSE")
-                == "terminal_review"
+                purpose in {"work", "terminal_review"}
+                and tid == (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+                and tid
+                == (os.environ.get("HERMES_COORDINATION_TASK_ID") or "").strip()
+                and os.environ.get("HERMES_SESSION_SOURCE") == "kanban"
+                and live_execution == (request_root_id, tid, purpose)
             ):
-                terminal_review_snapshot = kb.terminal_review_context_snapshot(
-                    conn,
-                    tid,
-                    request_root_id=(
-                        os.environ.get("HERMES_COORDINATION_REQUEST_ROOT") or ""
-                    ),
-                    run_id=(os.environ.get("HERMES_KANBAN_RUN_ID") or ""),
-                )
+                snapshot_kwargs = {
+                    "request_root_id": request_root_id,
+                    "run_id": (os.environ.get("HERMES_KANBAN_RUN_ID") or ""),
+                }
+                if purpose == "terminal_review":
+                    coordination_snapshot = kb.terminal_review_context_snapshot(
+                        conn, tid, **snapshot_kwargs
+                    )
+                else:
+                    coordination_snapshot = (
+                        kb.coordination_execution_budget_snapshot(
+                            conn, tid, purpose="work", **snapshot_kwargs
+                        )
+                    )
 
             def _task_dict(t):
                 return {
@@ -596,17 +615,24 @@ def _handle_show(args: dict, **kw) -> str:
                 # dispatcher at spawn time.
                 "worker_context": kb.build_worker_context(conn, tid),
             }
-            if terminal_review_snapshot is not None:
+            if coordination_snapshot is not None:
                 response["coordination_budget"] = {
-                    "observed_at": terminal_review_snapshot["observed_at"],
-                    "purpose": terminal_review_snapshot["purpose"],
-                    "request_root_id": terminal_review_snapshot[
+                    "observed_at": coordination_snapshot["observed_at"],
+                    "purpose": coordination_snapshot["purpose"],
+                    "request_root_id": coordination_snapshot[
                         "request_root_id"
                     ],
-                    "task_id": terminal_review_snapshot["task_id"],
-                    "review_run_id": terminal_review_snapshot["review_run_id"],
-                    **terminal_review_snapshot["budget"],
+                    "task_id": coordination_snapshot["task_id"],
+                    **coordination_snapshot["budget"],
                 }
+                if purpose == "terminal_review":
+                    response["coordination_budget"]["review_run_id"] = (
+                        coordination_snapshot["review_run_id"]
+                    )
+                else:
+                    response["coordination_budget"]["run_id"] = (
+                        coordination_snapshot["run_id"]
+                    )
             return json.dumps(response)
         finally:
             conn.close()
@@ -998,6 +1024,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         # Model-supplied free text stored durably on the event payload —
         # redact like summary / kanban_block's reason.
         reviewer = redact_sensitive_text(str(reviewer), force=True)
+    expected_run_id = _worker_run_id(tid)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1015,13 +1042,23 @@ def _handle_request_review(args: dict, **kw) -> str:
                 summary=summary,
                 metadata=metadata,
                 reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
                 with_reason=True,
             )
             if not ok:
                 detail = fail_reason or "unknown id or not in running/ready"
                 return tool_error(
                     f"could not request review for {tid}: {detail}"
+                )
+            if expected_run_id is not None:
+                # request_review validated this exact implementation run and
+                # atomically committed the review transition. A fast reviewer
+                # may claim the card before this handler builds its receipt;
+                # report the transition we performed, not that later run/state.
+                return _ok(
+                    task_id=tid,
+                    run_id=expected_run_id,
+                    status="review",
                 )
             run = kb.latest_run(conn, tid)
             landed = kb.get_task(conn, tid)
