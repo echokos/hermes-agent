@@ -8,6 +8,17 @@ even when the agent produces useful partial output. Finalized run health cannot
 be changed by a detached worker completing later. A genuinely silent result
 remains silent; failure intake still records its dependency health.
 
+`required_tool_dependency_mode` is operator-owned metadata with two values:
+`always` (the default) treats an uncalled required dependency as degraded;
+`when_invoked` permits legitimate branches that do not call it, such as preserving
+an existing note section. Invoked failed or pending calls still degrade the run
+in either mode. Otherwise, a conditional run with missing observations records
+`last_dependency_status: not_observed`, preserves normal artifact delivery, and
+emits neither a dependency failure nor a recovery event. Recovery still requires
+successful observed calls to every configured dependency. Ordinary model tools
+and the jobs API cannot set this mode. Runbook schedule metadata can declare it;
+refreshing a runbook that omits it preserves the existing operator setting.
+
 Owned failures use the existing Kanban coordination request, technical owner,
 director review, and bounded model-call budget. A reviewed reserved user action
 leaves the incident unrepaired and does not grant that action. Verified recovery
