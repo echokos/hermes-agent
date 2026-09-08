@@ -689,6 +689,37 @@ def _validated_materialization_coordination(
     }
 
 
+def _materialized_plan_result(
+    conn: sqlite3.Connection,
+    *,
+    actor: str,
+    plan: sqlite3.Row,
+    coordination_context: tuple[str, str, str] | None,
+    organization: WorkforceOrganization,
+) -> dict[str, Any]:
+    coordination = _validated_materialization_coordination(
+        conn,
+        actor=actor,
+        context=coordination_context,
+        organization=organization,
+    )
+    root_task_id = str(plan["materialized_root_task_id"] or "")
+    if coordination is not None:
+        root = kanban_db.get_task(conn, root_task_id)
+        if root is None or root.request_root_id != coordination["request_root_id"]:
+            raise ValueError(
+                "materialized plan is not bound to the current coordination request"
+            )
+    result = {
+        "plan_id": str(plan["plan_id"]),
+        "root_task_id": root_task_id,
+        "created": False,
+    }
+    if coordination is not None:
+        result["request_root_id"] = coordination["request_root_id"]
+    return result
+
+
 def materialize_plan(
     conn: sqlite3.Connection, *, actor: str, plan_id: str,
     current_state_evidence: list[str], current_state_evidence_at: str | int,
@@ -708,42 +739,53 @@ def materialize_plan(
     if plan is None:
         raise ValueError("unknown workforce plan")
     if plan["state"] == "materialized":
-        coordination = _validated_materialization_coordination(
-            conn, actor=actor, context=coordination_context, organization=org,
+        return _materialized_plan_result(
+            conn,
+            actor=actor,
+            plan=plan,
+            coordination_context=coordination_context,
+            organization=org,
         )
-        if coordination is not None:
-            root = kanban_db.get_task(conn, plan["materialized_root_task_id"])
-            if root is None or root.request_root_id != coordination["request_root_id"]:
-                raise ValueError(
-                    "materialized plan is not bound to the current coordination request"
-                )
-        result = {
-            "plan_id": plan_id,
-            "root_task_id": plan["materialized_root_task_id"],
-            "created": False,
-        }
-        if coordination is not None:
-            result["request_root_id"] = coordination["request_root_id"]
-        return result
     if plan["state"] != "draft":
         raise ValueError(f"plan cannot be materialized from {plan['state']}")
-    if plan["goal_ref"].strip().casefold() == "unknown":
-        raise ValueError("plans with an unknown goal remain in discovery")
-    unresolved = list(_loads(plan["unresolved_decisions_json"], []))
-    if unresolved:
-        raise ValueError("unresolved decisions must be resolved before materialization")
-    nodes = list(_loads(plan["graph_json"], []))
-    _validate_graph(nodes, org)
-    if any(str(node.get("authority_class") or "routine") == "reserved" for node in nodes):
-        raise PermissionError("reserved-authority nodes require Elliott and cannot be materialized by Aurora")
-    max_nodes = min(MAX_PLAN_NODES, int(state["max_materialized_nodes"]))
-    if len(nodes) > max_nodes:
-        raise ValueError("plan exceeds the configured materialization limit")
 
     now = _now()
-    by_key: dict[str, str] = {}
-    remaining = {str(node["key"]): node for node in nodes}
     with write_txn(conn):
+        # Another connection may have materialized this draft while this call
+        # waited for the write lock. Re-read before any idempotent task create
+        # can return rows owned by that other request.
+        plan = conn.execute(
+            "SELECT * FROM wc_plans WHERE plan_id=?", (plan_id,)
+        ).fetchone()
+        if plan is None:
+            raise ValueError("unknown workforce plan")
+        if plan["state"] == "materialized":
+            return _materialized_plan_result(
+                conn,
+                actor=actor,
+                plan=plan,
+                coordination_context=coordination_context,
+                organization=org,
+            )
+        if plan["state"] != "draft":
+            raise ValueError(f"plan cannot be materialized from {plan['state']}")
+        if plan["goal_ref"].strip().casefold() == "unknown":
+            raise ValueError("plans with an unknown goal remain in discovery")
+        unresolved = list(_loads(plan["unresolved_decisions_json"], []))
+        if unresolved:
+            raise ValueError("unresolved decisions must be resolved before materialization")
+        nodes = list(_loads(plan["graph_json"], []))
+        _validate_graph(nodes, org)
+        if any(
+            str(node.get("authority_class") or "routine") == "reserved"
+            for node in nodes
+        ):
+            raise PermissionError(
+                "reserved-authority nodes require Elliott and cannot be materialized by Aurora"
+            )
+        max_nodes = min(MAX_PLAN_NODES, int(state["max_materialized_nodes"]))
+        if len(nodes) > max_nodes:
+            raise ValueError("plan exceeds the configured materialization limit")
         coordination = _validated_materialization_coordination(
             conn, actor=actor, context=coordination_context, organization=org,
         )
@@ -752,6 +794,8 @@ def materialize_plan(
             "coordination_source_task_id": coordination["source_task_id"] if coordination else None,
             "coordination_origin_message_id": coordination["origin_message_id"] if coordination else None,
         }
+        by_key: dict[str, str] = {}
+        remaining = {str(node["key"]): node for node in nodes}
         while remaining:
             progressed = False
             for key, node in list(remaining.items()):

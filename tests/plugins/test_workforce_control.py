@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
+import threading
 import time
 
 import pytest
@@ -26,6 +29,7 @@ from plugins.workforce_control.store import (
     request_vision_review,
 )
 from plugins.workforce_control import tools as workforce_tools
+from plugins.workforce_control import store as workforce_store
 
 
 ROOT = Path(__file__).parents[2]
@@ -598,6 +602,86 @@ def test_coordinated_materialization_is_idempotent_only_within_the_same_request(
             coordination_context=(other_request.id, other_source_id, "work"),
         )
     assert board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == task_count
+
+
+def test_concurrent_materializations_bind_the_plan_to_exactly_one_request(
+    board, organization, monkeypatch,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += " under concurrent accepted requests"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    requests = [
+        accepted_coordination_request(
+            board, organization, suffix=f"concurrent-{suffix}",
+        )
+        for suffix in ("one", "two")
+    ]
+    database_path = Path(
+        board.execute("PRAGMA database_list").fetchone()["file"]
+    )
+
+    ready = threading.Barrier(2)
+    real_write_txn = workforce_store.write_txn
+
+    @contextmanager
+    def synchronized_write_txn(conn):
+        ready.wait(timeout=5)
+        with real_write_txn(conn) as transaction:
+            yield transaction
+
+    monkeypatch.setattr(workforce_store, "write_txn", synchronized_write_txn)
+
+    def materialize(request_and_source):
+        request, source_id = request_and_source
+        conn = kanban_db.connect(database_path)
+        try:
+            try:
+                result = materialize_plan(
+                    conn,
+                    actor="aurora",
+                    plan_id=plan["plan_id"],
+                    current_state_evidence=["kanban:current"],
+                    current_state_evidence_at=int(time.time()),
+                    confirmed_execution_ready=True,
+                    organization=organization,
+                    coordination_context=(request.id, source_id, "work"),
+                )
+            except ValueError as exc:
+                return request.id, None, str(exc)
+            return request.id, result, None
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(materialize, requests))
+
+    successful = [item for item in results if item[1] is not None]
+    rejected = [item for item in results if item[2] is not None]
+    assert len(successful) == 1
+    assert successful[0][1]["created"] is True
+    assert successful[0][1]["request_root_id"] == successful[0][0]
+    assert len(rejected) == 1
+    assert rejected[0][2] == (
+        "materialized plan is not bound to the current coordination request"
+    )
+
+    winner_request_id = successful[0][0]
+    materialized = board.execute(
+        "SELECT materialized_root_task_id FROM wc_plans WHERE plan_id=?",
+        (plan["plan_id"],),
+    ).fetchone()
+    root = kanban_db.get_task(board, materialized["materialized_root_task_id"])
+    assert root is not None and root.request_root_id == winner_request_id
+    tasks = board.execute(
+        "SELECT t.request_root_id FROM tasks t "
+        "JOIN wc_items w ON w.task_id=t.id "
+        "WHERE w.item_kind IN ('execution','outcome')"
+    ).fetchall()
+    assert len(tasks) == 2
+    assert {row["request_root_id"] for row in tasks} == {winner_request_id}
 
 
 def test_multilevel_materialization_inherits_coordination_on_every_task(
