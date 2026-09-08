@@ -27465,6 +27465,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        direct_agent_photo_request_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -27545,6 +27546,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             headers["Authorization"] = f"Bearer {proxy_key}"
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
+
+        if direct_agent_photo_request_text is not None and proxy_key:
+            from ipaddress import ip_address
+            from urllib.parse import urlsplit
+
+            from gateway.platforms.api_server import (
+                AGENT_PHOTO_REQUEST_MARKER,
+                AGENT_PHOTO_REQUEST_MARKER_HEADER,
+                AGENT_PHOTO_REQUEST_TEXT_HEADER,
+                encode_internal_agent_photo_request_text,
+            )
+
+            proxy_host = (urlsplit(proxy_url).hostname or "").lower()
+            proxy_is_loopback = proxy_host == "localhost"
+            if not proxy_is_loopback:
+                try:
+                    address = ip_address(proxy_host)
+                    proxy_is_loopback = bool(
+                        address.is_loopback
+                        or (
+                            getattr(address, "ipv4_mapped", None) is not None
+                            and address.ipv4_mapped.is_loopback
+                        )
+                    )
+                except ValueError:
+                    pass
+            if proxy_is_loopback:
+                try:
+                    encoded_photo_request = encode_internal_agent_photo_request_text(
+                        direct_agent_photo_request_text
+                    )
+                except ValueError:
+                    logger.warning(
+                        "Proxy omitted oversized or invalid agent photo authorization input"
+                    )
+                else:
+                    headers[AGENT_PHOTO_REQUEST_MARKER_HEADER] = (
+                        AGENT_PHOTO_REQUEST_MARKER
+                    )
+                    headers[AGENT_PHOTO_REQUEST_TEXT_HEADER] = encoded_photo_request
 
         body = {
             "model": "hermes-agent",
@@ -27969,6 +28010,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                direct_agent_photo_request_text=direct_agent_photo_request_text,
             )
 
         from run_agent import AIAgent

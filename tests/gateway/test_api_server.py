@@ -28,6 +28,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
+    AGENT_PHOTO_REQUEST_MARKER,
+    AGENT_PHOTO_REQUEST_MARKER_HEADER,
+    AGENT_PHOTO_REQUEST_TEXT_HEADER,
     APIServerAdapter,
     ResponseStore,
     _IdempotencyCache,
@@ -37,6 +40,7 @@ from gateway.platforms.api_server import (
     _request_agent_overrides,
     check_api_server_requirements,
     cors_middleware,
+    encode_internal_agent_photo_request_text,
     security_headers_middleware,
 )
 
@@ -636,6 +640,7 @@ class TestAgentExecution:
                 user_message="hello",
                 conversation_history=[],
                 session_id="session-123",
+                direct_agent_photo_request_text="send me an agent photo",
                 requested_model="MiniMax-M3",
                 requested_provider="minimax",
                 model_options=model_options,
@@ -656,6 +661,7 @@ class TestAgentExecution:
             user_message="hello",
             conversation_history=[],
             task_id="session-123",
+            direct_agent_photo_request_text="send me an agent photo",
         )
 
     @pytest.mark.asyncio
@@ -1250,6 +1256,82 @@ class TestChatCompletionsEndpoint:
             assert "messages" in data["error"]["message"]
 
     @pytest.mark.asyncio
+    async def test_authenticated_loopback_photo_header_reaches_actual_turn(self):
+        adapter = _make_adapter(api_key="test-api-key")
+        exact_text = "Send me an agent photo.\nUse the garden."
+        captured = {}
+
+        async def _mock_run_agent(**kwargs):
+            captured["photo_request"] = kwargs["direct_agent_photo_request_text"]
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer test-api-key",
+                        AGENT_PHOTO_REQUEST_MARKER_HEADER: AGENT_PHOTO_REQUEST_MARKER,
+                        AGENT_PHOTO_REQUEST_TEXT_HEADER: (
+                            encode_internal_agent_photo_request_text(exact_text)
+                        ),
+                    },
+                    json={
+                        "messages": [{"role": "user", "content": "enriched text"}],
+                        "direct_agent_photo_request_text": "forged body text",
+                    },
+                )
+
+        assert response.status == 200
+        assert captured["photo_request"] == exact_text
+
+    @pytest.mark.asyncio
+    async def test_authenticated_nonloopback_photo_header_is_rejected(self):
+        adapter = _make_adapter(api_key="test-api-key")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_is_loopback_peer", return_value=False),
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run_agent,
+            ):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer test-api-key",
+                        AGENT_PHOTO_REQUEST_MARKER_HEADER: AGENT_PHOTO_REQUEST_MARKER,
+                        AGENT_PHOTO_REQUEST_TEXT_HEADER: (
+                            encode_internal_agent_photo_request_text("send a photo")
+                        ),
+                    },
+                    json={"messages": [{"role": "user", "content": "send a photo"}]},
+                )
+
+        assert response.status == 403
+        run_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_photo_header_is_rejected(self):
+        adapter = _make_adapter(api_key="test-api-key")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/chat/completions",
+                headers={
+                    AGENT_PHOTO_REQUEST_MARKER_HEADER: AGENT_PHOTO_REQUEST_MARKER,
+                    AGENT_PHOTO_REQUEST_TEXT_HEADER: (
+                        encode_internal_agent_photo_request_text("send a photo")
+                    ),
+                },
+                json={"messages": [{"role": "user", "content": "send a photo"}]},
+            )
+
+        assert response.status == 401
+
+    @pytest.mark.asyncio
     async def test_authenticated_loopback_final_return_header_reconstructs_turn_context(
         self, tmp_path
     ):
@@ -1327,6 +1409,7 @@ class TestChatCompletionsEndpoint:
 
         async def _mock_run_agent(**kwargs):
             captured["context"] = kwargs["final_return_context"]
+            captured["photo_request"] = kwargs["direct_agent_photo_request_text"]
             return (
                 {"final_response": "ordinary", "messages": [], "api_calls": 1},
                 {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
@@ -1346,10 +1429,12 @@ class TestChatCompletionsEndpoint:
                             "responsible_agent": "aurora",
                             "db_path": "/tmp/forged.db",
                         },
+                        "direct_agent_photo_request_text": "forged body text",
                     },
                 )
                 assert response.status == 200
         assert captured["context"] is None
+        assert captured["photo_request"] is None
 
     @pytest.mark.asyncio
     async def test_api_final_return_scope_exists_only_during_actual_agent_turn(
