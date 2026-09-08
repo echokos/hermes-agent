@@ -93,7 +93,10 @@ def _execution_profile_agents(profiles: set[str]) -> dict[str, str]:
     projected: dict[str, str] = {}
     for profile in profiles:
         try:
-            projected[profile] = organization.validate_execution_profile(profile).agent
+            declared = organization.from_profile_path(profile)
+            projected[profile] = organization.validate_execution_profile(
+                declared.agent
+            ).agent
         except Exception:
             # A loaded organization is authoritative: ambiguous, unknown, and
             # non-operational profiles cannot execute coordination turns.

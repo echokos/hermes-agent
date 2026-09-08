@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import yaml
 
 from gateway.config import Platform
 from gateway.kanban_watchers import (
@@ -39,7 +40,13 @@ class Runner(GatewayKanbanWatchersMixin):
 def board(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     (home / "organization").mkdir(parents=True)
-    (home / "organization" / "organization.yaml").write_text(ORGANIZATION)
+    organization = yaml.safe_load(ORGANIZATION)
+    for agent in organization["agents"]:
+        if agent["operational"]:
+            agent["profile_path"] = f"/profiles/{agent['agent']}"
+    (home / "organization" / "organization.yaml").write_text(
+        yaml.safe_dump(organization, sort_keys=False)
+    )
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
@@ -227,9 +234,60 @@ def test_execution_profile_projection_distinguishes_absent_and_invalid_org(
         "HERMES_WORKFORCE_ORG",
         str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
     )
-    assert _execution_profile_agents({"main", "amy", "missing-profile"}) == {
+    assert _execution_profile_agents({"root", "main", "amy", "missing-profile"}) == {
         "main": "root"
     }
+
+
+def test_canonical_root_name_cannot_claim_through_undeclared_runtime_profile(
+    board,
+    monkeypatch,
+):
+    from hermes_cli.workforce_handoffs import create_handoff
+    from hermes_cli.workforce_org import load_organization
+
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    now = datetime.now(timezone.utc)
+    with kb.connect_closing(board) as conn:
+        created = create_handoff(
+            conn,
+            source_agent="aurora",
+            target_agent="root",
+            expected_outcome="Reject the undeclared Root runtime profile",
+            acceptance_test="No pickup is durably claimed",
+            evidence_references=["execution:root-profile-mismatch"],
+            acknowledgment_deadline=(now + timedelta(minutes=2)).isoformat(),
+            checkpoint_at=(now + timedelta(minutes=20)).isoformat(),
+            organization=load_organization(),
+            requires_source_acceptance=True,
+            context={
+                "kind": "owned_operational_failure",
+                "technical_owner": "root",
+                "director": "aurora",
+                "workflow_id": "root-profile-mismatch",
+                "event_id": "root-profile-mismatch",
+            },
+        )
+        events_before = [event.kind for event in kb.list_events(conn, created["task_id"])]
+
+    runner = Runner()
+    runner._active_profile_name = lambda: "root"
+    runner._kanban_pickup_owned_failure = AsyncMock()
+    asyncio.run(finish_tick(runner))
+
+    runner._kanban_pickup_owned_failure.assert_not_awaited()
+    assert runner._kanban_coordination_jobs == {}
+    with kb.connect_closing(board) as conn:
+        task = kb.get_task(conn, created["task_id"])
+        assert task is not None
+        assert task.request_root_id is None
+        assert [event.kind for event in kb.list_events(conn, task.id)] == events_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM coordination_requests"
+        ).fetchone()[0] == 0
 
 
 def test_root_alias_pickup_uses_main_profile_and_stays_single_flight(board, monkeypatch):

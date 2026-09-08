@@ -175,6 +175,7 @@ def test_final_return_profile_match_uses_canonical_workforce_identity(
     )
 
     assert final_return_context_matches_profile(context, "main") is True
+    assert final_return_context_matches_profile(context, "root") is False
     assert final_return_context_matches_profile(context, "aurora") is False
     assert final_return_context_matches_profile(context, "missing-profile") is False
 

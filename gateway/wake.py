@@ -196,7 +196,8 @@ def final_return_context_matches_profile(
         return False
     try:
         expected_agent = organization.validate_execution_profile(expected).agent
-        actual_agent = organization.validate_execution_profile(actual).agent
+        declared = organization.from_profile_path(actual)
+        actual_agent = organization.validate_execution_profile(declared.agent).agent
     except Exception:
         return False
     return expected_agent == actual_agent
