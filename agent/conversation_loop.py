@@ -7304,7 +7304,9 @@ def run_conversation(
                         pass
 
                 _tool_results_start = len(messages)
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                tool_execution_stopped = agent._execute_tool_calls(
+                    assistant_message, messages, effective_task_id, api_call_count
+                )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -7365,6 +7367,17 @@ def run_conversation(
                     # text response after it consumes the final reserved call.
                     agent._session_messages = messages
                     _turn_exit_reason = "terminal_review_verdict"
+                    final_response = ""
+                    break
+
+                if tool_execution_stopped is True:
+                    # The sequential executor verified the active work scope
+                    # against the host's successful handoff result before
+                    # finalizing this tool batch.  Finalization may attach a
+                    # pending /steer marker to that JSON result, so do not
+                    # reparse the altered content before ending the turn.
+                    agent._session_messages = messages
+                    _turn_exit_reason = "work_review_handoff"
                     final_response = ""
                     break
 

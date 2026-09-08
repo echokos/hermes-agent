@@ -14,6 +14,7 @@ import pytest
 
 from agent.coordination_budget import scoped_coordination_budget
 from agent.conversation_loop import _work_review_tool_round_completed
+from agent.tool_dispatch_helpers import _plan_tool_batch_segments
 from hermes_cli import kanban_db as kb
 from hermes_cli.workforce_handoffs import acknowledge_handoff, create_handoff
 from hermes_cli.workforce_org import load_organization
@@ -83,11 +84,11 @@ def _tool_call(name: str, arguments: dict, call_id: str) -> SimpleNamespace:
     )
 
 
-def _tool_response(tool_call: SimpleNamespace) -> SimpleNamespace:
+def _tool_response(*tool_calls: SimpleNamespace) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
-                message=SimpleNamespace(content="", tool_calls=[tool_call]),
+                message=SimpleNamespace(content="", tool_calls=list(tool_calls)),
                 finish_reason="tool_calls",
             )
         ],
@@ -96,11 +97,12 @@ def _tool_response(tool_call: SimpleNamespace) -> SimpleNamespace:
     )
 
 
-def _new_agent() -> AIAgent:
+def _new_agent(*tool_names: str) -> AIAgent:
+    tool_names = tool_names or ("kanban_request_review",)
     with (
         patch(
             "run_agent.get_tool_definitions",
-            return_value=_tool_definitions("kanban_request_review"),
+            return_value=_tool_definitions(*tool_names),
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
@@ -267,6 +269,204 @@ def test_work_review_handoff_stops_at_call_seventeen(work_review_context):
     assert "crashed" not in events
     assert "completed" not in events
     assert str(run_id) == os.environ["HERMES_KANBAN_RUN_ID"]
+
+
+def test_work_review_handoff_survives_pending_steer_at_call_seventeen(
+    work_review_context,
+):
+    """A post-tool steer must not turn a verified handoff into call 18."""
+    _, task_id, _ = work_review_context
+    agent = _new_agent()
+    agent._pending_steer = "Preserve this operator correction."
+    response = _tool_response(
+        _tool_call(
+            "kanban_request_review",
+            {"summary": "Repair evidence is attached and ready for review."},
+            "call-17-review",
+        )
+    )
+
+    result = _run_review_batch(agent, task_id=task_id, responses=(response,), scope=True)
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["turn_exit_reason"] == "work_review_handoff"
+    assert result["final_response"] == ""
+    tool_messages = [m for m in agent._session_messages if m.get("role") == "tool"]
+    assert len(tool_messages) == 1
+    assert "Preserve this operator correction." in str(tool_messages[0].get("content"))
+    assert agent._session_messages[-1]["role"] == "assistant"
+    assert agent._session_messages[-1]["content"] == "Kanban review handoff recorded by host."
+
+
+def _run_review_batch(
+    agent: AIAgent,
+    *,
+    task_id: str,
+    responses: tuple[SimpleNamespace, ...],
+    scope: bool,
+) -> dict:
+    agent.max_iterations = 1
+    agent.client.chat.completions.create.side_effect = responses
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.title_generator.maybe_auto_title"),
+        patch("agent.turn_finalizer._record_kanban_budget_exhausted"),
+    ):
+        if scope:
+            with scoped_coordination_budget():
+                return agent.run_conversation("Repair the owned failure.", task_id=task_id)
+        return agent.run_conversation("Repair the owned failure.", task_id=task_id)
+
+
+def test_work_review_handoff_skips_mutating_suffix_in_segmented_batch(
+    work_review_context,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A persisted host review result prevents later batch mutations."""
+    _, task_id, implementation_run_id = work_review_context
+    source = tmp_path / "source.txt"
+    source.write_text("evidence")
+    before = tmp_path / "before.txt"
+    after_one = tmp_path / "after-one.txt"
+    after_two = tmp_path / "after-two.txt"
+    agent = _new_agent("read_file", "write_file", "kanban_request_review")
+    response = _tool_response(
+        _tool_call("read_file", {"path": str(source)}, "call-17-read"),
+        _tool_call("write_file", {"path": str(before), "content": "before"}, "call-17-before"),
+        _tool_call(
+            "kanban_request_review",
+            {"summary": "Evidence is attached and ready for review."},
+            "call-17-review",
+        ),
+        _tool_call("write_file", {"path": str(after_one), "content": "must not land"}, "call-17-after-one"),
+        _tool_call("write_file", {"path": str(after_two), "content": "must not land"}, "call-17-after-two"),
+    )
+    segments = _plan_tool_batch_segments(response.choices[0].message.tool_calls)
+    assert [kind for kind, _ in segments] == ["parallel", "sequential", "parallel"]
+    real_request_review = kb.request_review
+
+    def request_review_then_claim(conn, handoff_task_id, **kwargs):
+        outcome = real_request_review(conn, handoff_task_id, **kwargs)
+        if outcome[0]:
+            claimed = kb.claim_review_task(conn, handoff_task_id, claimer="director:race")
+            assert claimed is not None
+            assert claimed.current_run_id != implementation_run_id
+        return outcome
+
+    monkeypatch.setattr(kb, "request_review", request_review_then_claim)
+
+    result = _run_review_batch(agent, task_id=task_id, responses=(response,), scope=True)
+
+    assert before.read_text() == "before"
+    assert not after_one.exists()
+    assert not after_two.exists()
+    assert result["turn_exit_reason"] == "work_review_handoff"
+    tool_messages = [m for m in agent._session_messages if m.get("role") == "tool"]
+    assert [m.get("tool_call_id") for m in tool_messages] == [
+        "call-17-read", "call-17-before", "call-17-review", "call-17-after-one", "call-17-after-two",
+    ]
+    assert [m.get("name") for m in tool_messages] == [
+        "read_file", "write_file", "kanban_request_review", "write_file", "write_file",
+    ]
+    assert [m.get("effect_disposition") for m in tool_messages[-2:]] == ["none", "none"]
+    assert all("was not started" in str(m.get("content")) for m in tool_messages[-2:])
+    assert json.loads(str(tool_messages[2]["content"])) == {
+        "ok": True,
+        "task_id": task_id,
+        "run_id": implementation_run_id,
+        "status": "review",
+    }
+    assert agent.client.chat.completions.create.call_count == 1
+
+
+def test_work_review_handoff_skips_mutating_suffix_in_sequential_batch(
+    work_review_context,
+    tmp_path: Path,
+):
+    """The all-sequential planner path also leaves a paired skipped result."""
+    _, task_id, _ = work_review_context
+    source = tmp_path / "source.txt"
+    source.write_text("evidence")
+    after = tmp_path / "after.txt"
+    agent = _new_agent("read_file", "write_file", "kanban_request_review")
+    response = _tool_response(
+        _tool_call("read_file", {"path": str(source)}, "call-17-read"),
+        _tool_call(
+            "kanban_request_review",
+            {"summary": "Evidence is attached and ready for review."},
+            "call-17-review",
+        ),
+        _tool_call("write_file", {"path": str(after), "content": "must not land"}, "call-17-after"),
+    )
+    segments = _plan_tool_batch_segments(response.choices[0].message.tool_calls)
+    assert [kind for kind, _ in segments] == ["sequential"]
+
+    result = _run_review_batch(agent, task_id=task_id, responses=(response,), scope=True)
+
+    assert not after.exists()
+    assert result["turn_exit_reason"] == "work_review_handoff"
+    tool_messages = [m for m in agent._session_messages if m.get("role") == "tool"]
+    assert [m.get("tool_call_id") for m in tool_messages] == [
+        "call-17-read", "call-17-review", "call-17-after",
+    ]
+    assert tool_messages[-1].get("effect_disposition") == "none"
+
+
+def test_rejected_review_does_not_skip_suffix(
+    work_review_context,
+    tmp_path: Path,
+):
+    """A host rejection cannot suppress later calls in the same batch."""
+    _, task_id, _ = work_review_context
+    after = tmp_path / "after.txt"
+    agent = _new_agent("write_file", "kanban_request_review")
+    response = _tool_response(
+        _tool_call("kanban_request_review", {"summary": ""}, "call-review"),
+        _tool_call("write_file", {"path": str(after), "content": "landed"}, "call-after"),
+    )
+
+    _run_review_batch(agent, task_id=task_id, responses=(response,), scope=True)
+
+    assert after.read_text() == "landed"
+    tool_messages = [m for m in agent._session_messages if m.get("role") == "tool"]
+    assert [m.get("tool_call_id") for m in tool_messages] == ["call-review", "call-after"]
+    assert tool_messages[-1].get("effect_disposition") != "none"
+
+
+def test_ordinary_review_without_active_scope_does_not_skip_suffix(
+    work_review_context,
+    tmp_path: Path,
+):
+    """Environment-shaped ordinary calls cannot activate the executor stop."""
+    _, task_id, _ = work_review_context
+    after = tmp_path / "after.txt"
+    agent = _new_agent("write_file", "kanban_request_review")
+    assistant_message = SimpleNamespace(
+        tool_calls=[
+            _tool_call(
+                "kanban_request_review",
+                {"summary": "Evidence is attached and ready for review."},
+                "call-review",
+            ),
+            _tool_call(
+                "write_file",
+                {"path": str(after), "content": "landed"},
+                "call-after",
+            ),
+        ]
+    )
+    messages: list[dict] = []
+
+    with patch.object(agent, "_flush_messages_to_session_db", return_value=True):
+        stopped = agent._execute_tool_calls(assistant_message, messages, task_id)
+
+    assert stopped is False
+    assert after.read_text() == "landed"
+    assert [m.get("tool_call_id") for m in messages] == ["call-review", "call-after"]
+    assert messages[-1].get("effect_disposition") != "none"
 
 
 @pytest.mark.parametrize(

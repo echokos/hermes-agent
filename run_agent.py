@@ -8171,7 +8171,7 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
-    def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> Optional[bool]:
         """Execute tool calls from the assistant message and append results to messages.
 
         The segment planner splits the batch into maximal contiguous runs of
@@ -8181,6 +8181,9 @@ class AIAgent:
         original single-path dispatch; mixed batches execute segment by
         segment in emission order so safe subsets still run concurrently
         while side-effect ordering is preserved.
+
+        Returns ``True`` only when a sequential executor verified a work-review
+        handoff; concurrent dispatch retains its historical ``None`` result.
         """
         tool_calls = assistant_message.tool_calls
 
@@ -8305,7 +8308,7 @@ class AIAgent:
         from agent.tool_executor import execute_tool_calls_concurrent
         return execute_tool_calls_concurrent(self, assistant_message, messages, effective_task_id, api_call_count)
 
-    def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> bool:
         """Forwarder — see ``agent.tool_executor.execute_tool_calls_sequential``."""
         from agent.tool_executor import execute_tool_calls_sequential
         return execute_tool_calls_sequential(self, assistant_message, messages, effective_task_id, api_call_count)
