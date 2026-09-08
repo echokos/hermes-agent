@@ -22,7 +22,7 @@ class CoordinationScope:
     provisional_model_calls: int = 0
     settled_provisional_model_calls: int = 0
     acceptance_scope_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    declared_acceptance_batches: int = 0
+    coordination_acceptance_required: bool = False
     unbudgeted_delegation_started: bool = False
     closed: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
@@ -91,42 +91,31 @@ def declares_coordination_acceptance(function_name: str, arguments: object) -> b
     return report is True or str(report).strip().lower() in {"true", "1", "yes"}
 
 
-def begin_declared_coordination_acceptance(*, declared: bool) -> CoordinationScope | None:
-    """Publish a parsed same-batch acceptance before tool workers start."""
+def register_declared_coordination_acceptance(*, declared: bool) -> None:
+    """Make a parsed acceptance declaration mandatory for this user turn."""
     if not declared:
-        return None
+        return
     scope = _scope.get()
-    if scope is None:
-        return None
-    with scope.lock:
-        if scope.closed.is_set():
-            raise ValueError("coordination turn already ended")
-        scope.declared_acceptance_batches += 1
-    return scope
-
-
-def end_declared_coordination_acceptance(scope: CoordinationScope | None) -> None:
-    """Withdraw one executor-owned same-batch acceptance declaration."""
     if scope is None:
         return
     with scope.lock:
-        if scope.declared_acceptance_batches <= 0:
-            raise RuntimeError("coordination acceptance declaration is unbalanced")
-        scope.declared_acceptance_batches -= 1
+        if scope.closed.is_set():
+            raise ValueError("coordination turn already ended")
+        scope.coordination_acceptance_required = True
 
 
 @contextmanager
 def coordination_materialization_binding():
     """Fence task materialization against same-turn request acceptance.
 
-    If acceptance commits first, resolve and return its execution context. If
-    materialization commits first, keep acceptance parked until the caller has
-    durably stamped every task with this turn's origin so the accepting
-    transaction can adopt them.
+    A parsed coordination declaration makes acceptance mandatory for the rest
+    of the turn. Materialization may proceed only after the request commits;
+    otherwise it fails before opening the materialization transaction and the
+    draft remains recoverable on a later tool round or user turn.
     """
     scope = _current_scope()
     if scope is None:
-        yield None, ("", ""), False
+        yield None, ("", "")
         return
     with scope.lock:
         if scope.closed.is_set():
@@ -139,14 +128,12 @@ def coordination_materialization_binding():
                 scope.task_id,
                 scope.purpose,
             )
-        acceptance_pending = (
-            execution is None and scope.declared_acceptance_batches > 0
-        )
-        yield (
-            execution,
-            (scope.origin_session_id, scope.origin_message_id),
-            acceptance_pending,
-        )
+        if execution is None and scope.coordination_acceptance_required:
+            raise ValueError(
+                "workforce materialization requires successful coordination "
+                "acceptance; retry after kanban_create succeeds"
+            )
+        yield execution, (scope.origin_session_id, scope.origin_message_id)
 
 
 @dataclass

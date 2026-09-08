@@ -138,12 +138,11 @@ def _workforce_handoff_launch_refusal(
     assignee: Optional[str],
     launch_phase: str,
 ) -> Optional[str]:
-    """Return why a structured workforce task is not launchable.
+    """Return why a structured workforce handoff is not launchable.
 
-    Origin-stamped materialization stays inert until request acceptance adopts
-    it. Every handoff must also be accepted, current, and routed to the actor
-    authorized for the phase that will actually launch. An owned operational
-    failure must be linked to its own bounded coordination request.
+    Every handoff must be accepted, current, and routed to the actor authorized
+    for the phase that will actually launch. An owned operational failure also
+    must be linked to its own bounded coordination request.
     """
     if not isinstance(body, str) or not body.strip():
         return None
@@ -151,14 +150,7 @@ def _workforce_handoff_launch_refusal(
         payload = json.loads(body)
     except (TypeError, ValueError):
         return None
-    if not isinstance(payload, dict):
-        return None
-    if (
-        payload.get("coordination_acceptance_pending") is True
-        and not request_root_id
-    ):
-        return "workforce task is pending coordination acceptance"
-    if payload.get("kind") != "workforce_handoff":
+    if not isinstance(payload, dict) or payload.get("kind") != "workforce_handoff":
         return None
     state = payload.get("state")
     if not isinstance(state, str) or state not in {"accepted", "active"}:

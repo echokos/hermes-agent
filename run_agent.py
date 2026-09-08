@@ -8208,9 +8208,8 @@ class AIAgent:
         """
         tool_calls = assistant_message.tool_calls
         from agent.coordination_budget import (
-            begin_declared_coordination_acceptance,
             declares_coordination_acceptance,
-            end_declared_coordination_acceptance,
+            register_declared_coordination_acceptance,
         )
 
         declared_acceptance = False
@@ -8225,7 +8224,7 @@ class AIAgent:
             ):
                 declared_acceptance = True
                 break
-        acceptance_declaration = begin_declared_coordination_acceptance(
+        register_declared_coordination_acceptance(
             declared=declared_acceptance
         )
 
@@ -8258,7 +8257,6 @@ class AIAgent:
                 segments=segments,
             )
         finally:
-            end_declared_coordination_acceptance(acceptance_declaration)
             self._executing_tools = False
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:

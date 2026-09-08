@@ -1489,9 +1489,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         spinner.start()
 
     from agent.coordination_budget import (
-        begin_declared_coordination_acceptance,
         declares_coordination_acceptance,
-        end_declared_coordination_acceptance,
+        register_declared_coordination_acceptance,
     )
 
     def _declares_acceptance(name, args, parse_error, scope_block):
@@ -1499,7 +1498,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             return False
         return declares_coordination_acceptance(name, args)
 
-    acceptance_declaration = begin_declared_coordination_acceptance(
+    register_declared_coordination_acceptance(
         declared=any(
             _declares_acceptance(name, args, parse_error, scope_block)
             for _tc, name, args, _trace, parse_error, scope_block in parsed_calls
@@ -1700,7 +1699,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     cancel_futures=abandon_executor,
                 )
     finally:
-        end_declared_coordination_acceptance(acceptance_declaration)
         if spinner:
             # Build a summary message for the spinner stop
             completed = sum(1 for r in results if r is not None)

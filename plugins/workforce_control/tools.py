@@ -53,7 +53,6 @@ def _materialize(args: dict[str, Any], **_kwargs: Any) -> str:
         with coordination_materialization_binding() as (
             coordination_context,
             coordination_origin,
-            coordination_acceptance_pending,
         ):
             with kanban_db.connect_closing() as conn:
                 result = materialize_plan(
@@ -63,7 +62,6 @@ def _materialize(args: dict[str, Any], **_kwargs: Any) -> str:
                     confirmed_execution_ready=bool(args.get("confirmed_execution_ready")),
                     coordination_context=coordination_context,
                     coordination_origin=coordination_origin,
-                    coordination_acceptance_pending=coordination_acceptance_pending,
                 )
         return tool_result(success=True, **result)
     except Exception as exc:

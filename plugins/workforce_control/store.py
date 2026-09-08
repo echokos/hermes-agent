@@ -744,36 +744,6 @@ def _materialized_plan_result(
             raise ValueError(
                 "materialized plan is not bound to the current coordination request"
             )
-    else:
-        root_body = _loads(root.body if root is not None else None, {})
-        pending_adoption = (
-            root is not None
-            and root.request_root_id is None
-            and isinstance(root_body, dict)
-            and root_body.get("coordination_acceptance_pending") is True
-        )
-    if coordination is None and pending_adoption:
-        if coordination_origin is None:
-            raise ValueError(
-                "materialized plan is pending adoption by its coordination origin"
-            )
-        created = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
-            "ORDER BY id DESC LIMIT 1",
-            (root_task_id,),
-        ).fetchone()
-        created_payload = _loads(created["payload"] if created else None, {})
-        if (
-            root is None
-            or root.request_root_id is not None
-            or root.session_id != coordination_origin[0]
-            or not isinstance(created_payload, dict)
-            or created_payload.get("coordination_origin_message_id")
-            != coordination_origin[1]
-        ):
-            raise ValueError(
-                "materialized plan is not pending adoption by the current coordination origin"
-            )
     result = {
         "plan_id": str(plan["plan_id"]),
         "root_task_id": root_task_id,
@@ -790,7 +760,6 @@ def materialize_plan(
     confirmed_execution_ready: bool, organization: WorkforceOrganization | None = None,
     coordination_context: tuple[str, str, str] | None = None,
     coordination_origin: tuple[str, str] | None = None,
-    coordination_acceptance_pending: bool = False,
 ) -> dict[str, Any]:
     org = organization or load_organization()
     if org.resolve_profile(actor).agent != "aurora":
@@ -862,9 +831,6 @@ def materialize_plan(
         coordination = _validated_materialization_coordination(
             conn, actor=actor, context=coordination_context, organization=org,
         )
-        acceptance_pending = coordination is None and coordination_acceptance_pending
-        if acceptance_pending and coordination_origin is None:
-            raise ValueError("pending coordination acceptance requires a current origin")
         origin_session_id, origin_message_id = coordination_origin or ("", "")
         if coordination is not None:
             if (origin_session_id, origin_message_id) not in {
@@ -895,10 +861,6 @@ def materialize_plan(
                         "acceptance_test": node["acceptance_test"],
                         "current_state_evidence": current_state_evidence,
                         "current_state_evidence_at": evidence_at,
-                        **(
-                            {"coordination_acceptance_pending": True}
-                            if acceptance_pending else {}
-                        ),
                     }, indent=2, sort_keys=True),
                     assignee=str(node["assignee"]), created_by="aurora",
                     tenant=str(node.get("tenant") or "company"),
@@ -929,10 +891,6 @@ def materialize_plan(
                 "kind": "workforce_outcome", "plan_id": plan_id,
                 "desired_outcome": plan["desired_outcome"],
                 "acceptance_test": plan["acceptance_test"],
-                **(
-                    {"coordination_acceptance_pending": True}
-                    if acceptance_pending else {}
-                ),
             }, indent=2, sort_keys=True),
             assignee="aurora", created_by="aurora", tenant="company", parents=list(by_key.values()),
             idempotency_key=f"workforce-outcome:{plan['stable_key']}", workspace_kind="scratch", goal_mode=False,

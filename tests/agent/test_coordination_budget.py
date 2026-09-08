@@ -139,7 +139,7 @@ def test_current_execution_rejects_unbound_capture_scope(budget_request, monkeyp
         assert budget.current_coordination_execution() is None
 
 
-def test_materialization_pending_requires_a_prepublished_acceptance(
+def test_declared_acceptance_blocks_materialization_until_success_or_new_turn(
     budget_request, monkeypatch,
 ):
     from gateway import session_context
@@ -156,17 +156,27 @@ def test_materialization_pending_requires_a_prepublished_acceptance(
 
     with budget.scoped_coordination_budget():
         with budget.coordination_materialization_binding() as binding:
-            assert binding == (None, ("ordinary-session", "ordinary-message"), False)
+            assert binding == (None, ("ordinary-session", "ordinary-message"))
 
-        declaration = budget.begin_declared_coordination_acceptance(declared=True)
-        try:
-            with budget.coordination_materialization_binding() as binding:
-                assert binding == (None, ("ordinary-session", "ordinary-message"), True)
-        finally:
-            budget.end_declared_coordination_acceptance(declaration)
+        budget.register_declared_coordination_acceptance(declared=True)
+        with pytest.raises(
+            ValueError, match="requires successful coordination acceptance"
+        ):
+            with budget.coordination_materialization_binding():
+                pass
 
+        # Failure is sticky for this user turn and cannot reopen an unbudgeted
+        # materialization lane after the executor returns.
+        with pytest.raises(
+            ValueError, match="requires successful coordination acceptance"
+        ):
+            with budget.coordination_materialization_binding():
+                pass
+
+    # A fresh user turn has no declared coordination requirement.
+    with budget.scoped_coordination_budget():
         with budget.coordination_materialization_binding() as binding:
-            assert binding == (None, ("ordinary-session", "ordinary-message"), False)
+            assert binding == (None, ("ordinary-session", "ordinary-message"))
 
 
 @pytest.mark.parametrize("report_to_origin", [True, "true", "yes", 1])
