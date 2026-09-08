@@ -8,6 +8,7 @@ import time
 
 import pytest
 import json
+from unittest.mock import MagicMock
 
 from hermes_cli import kanban_db
 from hermes_cli.workforce_org import load_organization
@@ -130,6 +131,88 @@ def assert_plan_remains_draft_without_materialization(board, plan_id, task_count
     assert board.execute(
         "SELECT COUNT(*) FROM wc_items WHERE item_kind IN ('execution','outcome')"
     ).fetchone()[0] == 0
+
+
+def concurrent_executor_stub(monkeypatch, invoke):
+    """Minimal agent using the production concurrent tool executor."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "")
+    import run_agent as run_agent_module
+
+    class Stub:
+        _interrupt_requested = False
+        _interrupt_message = None
+        _execution_thread_id = threading.current_thread().ident
+        _interrupt_thread_signal_pending = False
+        log_prefix = ""
+        quiet_mode = True
+        verbose_logging = False
+        log_prefix_chars = 200
+        _checkpoint_mgr = MagicMock(enabled=False)
+        tool_progress_callback = None
+        tool_start_callback = None
+        tool_complete_callback = None
+        tool_progress_mode = "off"
+        _todo_store = MagicMock()
+        _session_db = None
+        valid_tool_names = set()
+        _turns_since_memory = 0
+        _iters_since_skill = 0
+        _current_tool = None
+        _last_activity = 0
+        _print_fn = print
+        session_id = ""
+        _current_turn_id = ""
+        _current_api_request_id = ""
+        _active_children: list = []
+
+        def __init__(self):
+            self._tool_worker_threads: set = set()
+            self._tool_worker_threads_lock = threading.Lock()
+            self._active_children_lock = threading.Lock()
+
+        def _touch_activity(self, _description):
+            self._last_activity = time.time()
+
+        def _vprint(self, _message, force=False):
+            pass
+
+        def _safe_print(self, _message):
+            pass
+
+        def _should_emit_quiet_tool_messages(self):
+            return False
+
+        def _should_start_quiet_spinner(self):
+            return False
+
+        def _has_stream_consumers(self):
+            return False
+
+        def _tool_result_content_for_active_model(self, _name, result):
+            return result
+
+        def _record_file_mutation_result(self, *_args, **_kwargs):
+            pass
+
+    stub = Stub()
+    stub._subdirectory_hints = MagicMock()
+    stub._subdirectory_hints.check_tool_call = lambda *_args, **_kwargs: None
+    stub._tool_guardrails = MagicMock()
+    stub._tool_guardrails.before_call = (
+        lambda *_args, **_kwargs: MagicMock(allows_execution=True)
+    )
+    stub._flush_messages_to_session_db = lambda *_args, **_kwargs: None
+    stub._append_guardrail_observation = (
+        lambda _name, _function_args, result, *_args, **_kwargs: result
+    )
+    stub._execute_tool_calls_concurrent = (
+        run_agent_module.AIAgent._execute_tool_calls_concurrent.__get__(stub)
+    )
+    stub._apply_pending_steer_to_tool_results = lambda *_args, **_kwargs: None
+    stub._guardrail_block_result = lambda _decision: json.dumps({"error": "blocked"})
+    stub._invoke_tool = invoke
+    return stub
 
 
 def test_runtime_is_paused_and_killed_by_default(board):
@@ -435,6 +518,76 @@ def test_materialization_inherits_active_coordination_budget_and_origin(board, o
         ).fetchone()
         assert json.loads(created["payload"])["coordination_origin_message_id"] == request.origin_message_id
     assert kanban_db.get_coordination_request(board, request.id).max_model_calls == 8
+
+
+def test_materialization_resolves_a_committed_same_origin_request_after_runtime_miss(
+    board, organization,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += " after the runtime binding missed a commit"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    request, _source_id = accepted_coordination_request(
+        board, organization, suffix="durable-origin",
+    )
+
+    materialized = materialize_plan(
+        board,
+        actor="aurora",
+        plan_id=plan["plan_id"],
+        current_state_evidence=["kanban:current"],
+        current_state_evidence_at=int(time.time()),
+        confirmed_execution_ready=True,
+        organization=organization,
+        coordination_origin=(
+            request.origin_session_id,
+            request.origin_message_id,
+        ),
+    )
+
+    assert materialized["request_root_id"] == request.id
+    task_ids = [*materialized["execution_tasks"].values(), materialized["root_task_id"]]
+    assert {
+        kanban_db.get_task(board, task_id).request_root_id for task_id in task_ids
+    } == {request.id}
+
+
+def test_materialized_plan_cannot_claim_pending_adoption_by_another_origin(
+    board, organization,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += " without crossing request origins"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    request, source_id = accepted_coordination_request(
+        board, organization, suffix="original-materialization",
+    )
+    materialize_plan(
+        board,
+        actor="aurora",
+        plan_id=plan["plan_id"],
+        current_state_evidence=["kanban:current"],
+        current_state_evidence_at=int(time.time()),
+        confirmed_execution_ready=True,
+        organization=organization,
+        coordination_context=(request.id, source_id, "work"),
+    )
+
+    with pytest.raises(ValueError, match="not pending adoption"):
+        materialize_plan(
+            board,
+            actor="aurora",
+            plan_id=plan["plan_id"],
+            current_state_evidence=["kanban:current"],
+            current_state_evidence_at=int(time.time()),
+            confirmed_execution_ready=True,
+            organization=organization,
+            coordination_origin=("different-origin", "different-message"),
+        )
 
 
 @pytest.mark.parametrize("source_kind", ["unbound", "other_request"])
@@ -806,6 +959,7 @@ def test_invalid_coordination_context_rejects_before_materializing_tasks(
 
 def test_materialize_tool_forwards_only_the_trusted_runtime_coordination(monkeypatch):
     expected = ("cr_current", "t_current", "work")
+    expected_origin = ("origin-session", "origin-message")
     captured = {}
 
     class ConnectionContext:
@@ -815,7 +969,11 @@ def test_materialize_tool_forwards_only_the_trusted_runtime_coordination(monkeyp
         def __exit__(self, *_args):
             return False
 
-    monkeypatch.setattr(workforce_tools, "current_coordination_execution", lambda: expected)
+    @contextmanager
+    def binding():
+        yield expected, expected_origin
+
+    monkeypatch.setattr(workforce_tools, "coordination_materialization_binding", binding)
     monkeypatch.setattr(workforce_tools.kanban_db, "connect_closing", ConnectionContext)
     monkeypatch.setattr(workforce_tools, "_actor", lambda: "aurora")
 
@@ -833,6 +991,167 @@ def test_materialize_tool_forwards_only_the_trusted_runtime_coordination(monkeyp
 
     assert result["success"] is True
     assert captured["coordination_context"] == expected
+    assert captured["coordination_origin"] == expected_origin
+
+
+@pytest.mark.parametrize("winner", ["acceptance", "materialization"])
+def test_concurrent_executor_binds_same_batch_materialization_to_accepted_request(
+    board, organization, monkeypatch, tmp_path, winner,
+):
+    from agent import coordination_budget
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools
+
+    database_path = Path(board.execute("PRAGMA database_list").fetchone()["file"])
+    profile_home = tmp_path / "profiles" / "aurora"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(database_path))
+    monkeypatch.setenv("HERMES_PROFILE", "aurora")
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(ROOT / "workforce" / "organization.yaml"),
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    payload = plan_payload()
+    payload["desired_outcome"] += f" when {winner} wins the same-batch race"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+
+    session_id = f"same-batch-{winner}-session"
+    message_id = f"same-batch-{winner}-message"
+    materialization_started = threading.Event()
+    acceptance_started = threading.Event()
+
+    if winner == "acceptance":
+        real_factory = kanban_db.create_coordination_request
+        real_binding = workforce_tools.coordination_materialization_binding
+
+        def controlled_factory(*args, **kwargs):
+            acceptance_started.set()
+            assert materialization_started.wait(timeout=5)
+            return real_factory(*args, **kwargs)
+
+        @contextmanager
+        def observed_materialization_binding():
+            materialization_started.set()
+            with real_binding() as value:
+                yield value
+
+        monkeypatch.setattr(
+            kanban_db, "create_coordination_request", controlled_factory,
+        )
+        monkeypatch.setattr(
+            workforce_tools,
+            "coordination_materialization_binding",
+            observed_materialization_binding,
+        )
+        call_order = ("kanban_create", "workforce_materialize")
+    else:
+        real_materialize = workforce_tools.materialize_plan
+        real_request_lookup = coordination_budget.current_coordination_request_id
+
+        def controlled_materialize(*args, **kwargs):
+            materialization_started.set()
+            assert acceptance_started.wait(timeout=5)
+            return real_materialize(*args, **kwargs)
+
+        def observed_request_lookup():
+            acceptance_started.set()
+            return real_request_lookup()
+
+        monkeypatch.setattr(workforce_tools, "materialize_plan", controlled_materialize)
+        monkeypatch.setattr(
+            coordination_budget,
+            "current_coordination_request_id",
+            observed_request_lookup,
+        )
+        call_order = ("workforce_materialize", "kanban_create")
+
+    arguments = {
+        "kanban_create": {
+            "title": f"Return the {winner}-first result",
+            "assignee": "aurora",
+            "report_to_origin": True,
+            "coordination": {
+                "max_leaf_launches": 2,
+                "max_concurrent_leaf": 1,
+                "max_model_calls": 8,
+            },
+        },
+        "workforce_materialize": {
+            "plan_id": plan["plan_id"],
+            "current_state_evidence": ["kanban:current"],
+            "current_state_evidence_at": int(time.time()),
+            "confirmed_execution_ready": True,
+        },
+    }
+
+    def invoke(name, args, *_positional, **_kwargs):
+        if name == "kanban_create":
+            return kanban_tools._handle_create(args)
+        if name == "workforce_materialize":
+            return workforce_tools._materialize(args)
+        raise AssertionError(f"unexpected tool: {name}")
+
+    def tool_call(name):
+        function = MagicMock(name=name, arguments=json.dumps(arguments[name]))
+        function.name = name
+        return MagicMock(function=function, id=f"call-{name}")
+
+    agent = concurrent_executor_stub(monkeypatch, invoke)
+    assistant_message = MagicMock(
+        tool_calls=[tool_call(name) for name in call_order],
+    )
+    messages = []
+    tokens = set_session_vars(
+        platform="buzz",
+        chat_id="elliott-dm",
+        chat_type="dm",
+        user_id="elliott",
+        session_id=session_id,
+        message_id=message_id,
+        profile="aurora",
+    )
+    try:
+        with coordination_budget.scoped_coordination_budget():
+            agent._execute_tool_calls_concurrent(
+                assistant_message, messages, "origin-task",
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    results = {message["name"]: json.loads(message["content"]) for message in messages}
+    assert results["kanban_create"]["ok"] is True
+    assert results["workforce_materialize"]["success"] is True
+    request_root_id = results["kanban_create"]["request_root_id"]
+    materialized = board.execute(
+        "SELECT t.id,t.request_root_id,t.session_id,e.payload "
+        "FROM tasks t JOIN wc_items w ON w.task_id=t.id "
+        "JOIN task_events e ON e.task_id=t.id AND e.kind='created' "
+        "WHERE w.item_kind IN ('execution','outcome') ORDER BY t.id"
+    ).fetchall()
+    assert len(materialized) == 2
+    assert {row["request_root_id"] for row in materialized} == {request_root_id}
+    assert {row["session_id"] for row in materialized} == {session_id}
+    assert {
+        json.loads(row["payload"])["coordination_origin_message_id"]
+        for row in materialized
+    } == {message_id}
+
+    execution_task_id = board.execute(
+        "SELECT t.id FROM tasks t JOIN wc_items w ON w.task_id=t.id "
+        "WHERE w.item_kind='execution'"
+    ).fetchone()["id"]
+    claimed, reservation = kanban_db.claim_task_for_dispatch(
+        board, execution_task_id, organization=organization,
+    )
+    assert claimed is not None
+    assert reservation is not None
+    assert reservation.request_root_id == request_root_id
 
 
 def test_plan_rejects_more_than_eight_execution_nodes(board, organization):

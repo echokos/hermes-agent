@@ -80,6 +80,33 @@ def current_coordination_execution() -> tuple[str, str, str] | None:
         return scope.request_root_id, scope.task_id, scope.purpose
 
 
+@contextmanager
+def coordination_materialization_binding():
+    """Fence task materialization against same-turn request acceptance.
+
+    If acceptance commits first, resolve and return its execution context. If
+    materialization commits first, keep acceptance parked until the caller has
+    durably stamped every task with this turn's origin so the accepting
+    transaction can adopt them.
+    """
+    scope = _current_scope()
+    if scope is None:
+        yield None, ("", "")
+        return
+    with scope.lock:
+        if scope.closed.is_set():
+            raise ValueError("coordination turn already ended")
+        _resolve_request_root(scope)
+        execution = None
+        if scope.request_root_id and scope.task_id:
+            execution = (
+                scope.request_root_id,
+                scope.task_id,
+                scope.purpose,
+            )
+        yield execution, (scope.origin_session_id, scope.origin_message_id)
+
+
 @dataclass
 class CoordinationAcceptanceBinding:
     model_calls: int

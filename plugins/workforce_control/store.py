@@ -689,14 +689,48 @@ def _validated_materialization_coordination(
     }
 
 
+def _resolved_materialization_context(
+    conn: sqlite3.Connection,
+    *,
+    context: tuple[str, str, str] | None,
+    origin: tuple[str, str] | None,
+) -> tuple[tuple[str, str, str] | None, tuple[str, str] | None]:
+    normalized_origin = None
+    if origin is not None:
+        try:
+            origin_session_id, origin_message_id = origin
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid current coordination origin") from exc
+        origin_session_id = str(origin_session_id or "").strip()
+        origin_message_id = str(origin_message_id or "").strip()
+        if bool(origin_session_id) != bool(origin_message_id):
+            raise ValueError("current coordination origin is incomplete")
+        if origin_session_id:
+            normalized_origin = (origin_session_id, origin_message_id)
+    if context is None and normalized_origin is not None:
+        request = kanban_db.get_coordination_request(
+            conn,
+            kanban_db.coordination_request_id(*normalized_origin),
+        )
+        if request is not None:
+            context = (request.id, request.root_task_id, "work")
+    return context, normalized_origin
+
+
 def _materialized_plan_result(
     conn: sqlite3.Connection,
     *,
     actor: str,
     plan: sqlite3.Row,
     coordination_context: tuple[str, str, str] | None,
+    coordination_origin: tuple[str, str] | None,
     organization: WorkforceOrganization,
 ) -> dict[str, Any]:
+    coordination_context, coordination_origin = _resolved_materialization_context(
+        conn,
+        context=coordination_context,
+        origin=coordination_origin,
+    )
     coordination = _validated_materialization_coordination(
         conn,
         actor=actor,
@@ -709,6 +743,25 @@ def _materialized_plan_result(
         if root is None or root.request_root_id != coordination["request_root_id"]:
             raise ValueError(
                 "materialized plan is not bound to the current coordination request"
+            )
+    elif coordination_origin is not None:
+        root = kanban_db.get_task(conn, root_task_id)
+        created = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
+            "ORDER BY id DESC LIMIT 1",
+            (root_task_id,),
+        ).fetchone()
+        created_payload = _loads(created["payload"] if created else None, {})
+        if (
+            root is None
+            or root.request_root_id is not None
+            or root.session_id != coordination_origin[0]
+            or not isinstance(created_payload, dict)
+            or created_payload.get("coordination_origin_message_id")
+            != coordination_origin[1]
+        ):
+            raise ValueError(
+                "materialized plan is not pending adoption by the current coordination origin"
             )
     result = {
         "plan_id": str(plan["plan_id"]),
@@ -725,6 +778,7 @@ def materialize_plan(
     current_state_evidence: list[str], current_state_evidence_at: str | int,
     confirmed_execution_ready: bool, organization: WorkforceOrganization | None = None,
     coordination_context: tuple[str, str, str] | None = None,
+    coordination_origin: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     org = organization or load_organization()
     if org.resolve_profile(actor).agent != "aurora":
@@ -744,6 +798,7 @@ def materialize_plan(
             actor=actor,
             plan=plan,
             coordination_context=coordination_context,
+            coordination_origin=coordination_origin,
             organization=org,
         )
     if plan["state"] != "draft":
@@ -765,6 +820,7 @@ def materialize_plan(
                 actor=actor,
                 plan=plan,
                 coordination_context=coordination_context,
+                coordination_origin=coordination_origin,
                 organization=org,
             )
         if plan["state"] != "draft":
@@ -786,13 +842,27 @@ def materialize_plan(
         max_nodes = min(MAX_PLAN_NODES, int(state["max_materialized_nodes"]))
         if len(nodes) > max_nodes:
             raise ValueError("plan exceeds the configured materialization limit")
+        coordination_context, coordination_origin = _resolved_materialization_context(
+            conn,
+            context=coordination_context,
+            origin=coordination_origin,
+        )
         coordination = _validated_materialization_coordination(
             conn, actor=actor, context=coordination_context, organization=org,
         )
+        origin_session_id, origin_message_id = coordination_origin or ("", "")
+        if coordination is not None:
+            if (origin_session_id, origin_message_id) not in {
+                ("", ""),
+                (coordination["origin_session_id"], coordination["origin_message_id"]),
+            }:
+                raise ValueError("current coordination origin does not match the accepted request")
+            origin_session_id = coordination["origin_session_id"]
+            origin_message_id = coordination["origin_message_id"]
         task_context = {
-            "session_id": coordination["origin_session_id"] if coordination else None,
+            "session_id": origin_session_id or None,
             "coordination_source_task_id": coordination["source_task_id"] if coordination else None,
-            "coordination_origin_message_id": coordination["origin_message_id"] if coordination else None,
+            "coordination_origin_message_id": origin_message_id or None,
         }
         by_key: dict[str, str] = {}
         remaining = {str(node["key"]): node for node in nodes}
