@@ -1,7 +1,7 @@
 # Operational Failure Outcomes
 
-Operator-owned Cron jobs can declare `required_mcp_tools`,
-`observed_mcp_tools`, and `failure_ownership` in their native job metadata.
+Operator-owned Cron jobs can declare `required_tool_dependencies` and
+`failure_ownership` in their native job metadata.
 Required tool calls are tracked by actual invocation and typed MCP results.
 Pending, failed, interrupted, or missing required calls prevent healthy status,
 even when the agent produces useful partial output. Finalized run health cannot
