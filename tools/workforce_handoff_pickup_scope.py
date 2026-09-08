@@ -52,7 +52,7 @@ def _active_profile_matches(target: str) -> bool:
 
     try:
         return (
-            os.environ.get("HERMES_PROFILE", "").strip() == target
+            _canonical_agent(os.environ.get("HERMES_PROFILE", "")) == target
             and _canonical_agent(get_active_profile_name()) == target
         )
     except Exception:

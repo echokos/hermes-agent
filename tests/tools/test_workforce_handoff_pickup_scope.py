@@ -147,6 +147,21 @@ def test_active_pickup_profile_requires_both_profile_env_and_active_home(monkeyp
     assert _active_profile_matches("alina") is False
 
 
+def test_active_pickup_profile_accepts_root_on_main_but_rejects_wrong_profile(monkeypatch):
+    from tools.workforce_handoff_pickup_scope import _active_profile_matches
+
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    monkeypatch.setenv("HERMES_PROFILE", "main")
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "main")
+    assert _active_profile_matches("root") is True
+
+    monkeypatch.setenv("HERMES_PROFILE", "aurora")
+    assert _active_profile_matches("root") is False
+
+
 def test_only_a_validated_pickup_envelope_eagerly_exposes_the_handoff_tool(monkeypatch):
     from agent.agent_init import _pickup_eager_tool_names
 

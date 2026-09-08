@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import subprocess
 import sys
 import threading
 import time
@@ -102,6 +103,23 @@ def test_pickup_env_scrubs_worker_identity_and_sets_exact_scope(monkeypatch, tmp
     assert env["HERMES_SESSION_SOURCE"] == "tool"
     assert env["HERMES_COORDINATION_REQUEST_ROOT"] == "cr_pickup_123"
     assert env["HERMES_WORKFORCE_HANDOFF_PICKUP_TARGET"] == "alina"
+
+
+def test_root_execution_profile_validation_rejects_wrong_or_nonoperational_profile(
+    monkeypatch,
+):
+    from hermes_cli.workforce_handoff_pickup import _canonical_execution_profile
+
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    assert _canonical_execution_profile(None, target_agent="root") == "main"
+    assert _canonical_execution_profile("main", target_agent="root") == "main"
+    with pytest.raises(ValueError, match="does not match"):
+        _canonical_execution_profile("aurora", target_agent="root")
+    with pytest.raises(ValueError):
+        _canonical_execution_profile("amy", target_agent="root")
 
 
 @pytest.mark.skipif(IS_WINDOWS, reason="pickup log descriptor hardening is POSIX-only")
@@ -252,8 +270,14 @@ def test_pickup_cancellation_kills_and_reaps_the_dedicated_process(
 
 
 @pytest.mark.skipif(IS_WINDOWS, reason="pickup process hardening is POSIX-only")
-def test_pickup_runs_actual_cli_and_real_registry_with_loopback_provider(monkeypatch, tmp_path):
-    """The pickup process must cross CLI, provider, registry, and durable DB."""
+@pytest.mark.parametrize(
+    ("target_agent", "execution_profile"),
+    [("alina", "alina"), ("root", "main")],
+)
+def test_pickup_runs_actual_cli_and_real_registry_with_loopback_provider(
+    monkeypatch, tmp_path, target_agent, execution_profile,
+):
+    """Pickup must run the concrete profile with canonical tool authority."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     from hermes_cli import kanban_db
@@ -373,7 +397,7 @@ def test_pickup_runs_actual_cli_and_real_registry_with_loopback_provider(monkeyp
     thread.start()
     try:
         root = tmp_path / ".hermes"
-        profile = root / "profiles" / "alina"
+        profile = root / "profiles" / execution_profile
         profile.mkdir(parents=True)
         monkeypatch.setenv("HERMES_HOME", str(root))
         monkeypatch.setenv(
@@ -399,7 +423,7 @@ def test_pickup_runs_actual_cli_and_real_registry_with_loopback_provider(monkeyp
             created = create_handoff(
                 conn,
                 source_agent="aurora",
-                target_agent="alina",
+                target_agent=target_agent,
                 expected_outcome="Repair the owned operational failure",
                 acceptance_test="A later probe succeeds",
                 evidence_references=["execution:failure-1"],
@@ -408,7 +432,7 @@ def test_pickup_runs_actual_cli_and_real_registry_with_loopback_provider(monkeyp
                 organization=organization,
                 context={
                     "kind": "owned_operational_failure",
-                    "technical_owner": "alina",
+                    "technical_owner": target_agent,
                     "director": "aurora",
                     "workflow_id": "owned-failure-test",
                     "event_id": "failure-1",
@@ -416,7 +440,10 @@ def test_pickup_runs_actual_cli_and_real_registry_with_loopback_provider(monkeyp
                 requires_source_acceptance=True,
             )
             pickup = claim_owned_failure_handoff_pickup(
-                conn, target_agent="alina", organization=organization, now=now + 1
+                conn,
+                target_agent=target_agent,
+                organization=organization,
+                now=now + 1,
             )
         assert pickup is not None
         server.task_id = created["task_id"]
@@ -428,7 +455,7 @@ def test_pickup_runs_actual_cli_and_real_registry_with_loopback_provider(monkeyp
         result = asyncio.run(run_workforce_handoff_pickup(
             task_id=created["task_id"],
             request_root_id=pickup["request_root_id"],
-            target_agent="alina",
+            target_agent=target_agent,
             source_agent="aurora",
             database_path=db_path,
         ))
@@ -453,9 +480,38 @@ def test_pickup_runs_actual_cli_and_real_registry_with_loopback_provider(monkeyp
         with kanban_db.connect_closing(db_path) as conn:
             task = kanban_db.get_task(conn, created["task_id"])
             assert json.loads(task.body)["state"] == "accepted"
-            assert [event.kind for event in kanban_db.list_events(conn, created["task_id"])].count(
-                "workforce_handoff_acknowledged"
-            ) == 1
+            acknowledged = [
+                event for event in kanban_db.list_events(conn, created["task_id"])
+                if event.kind == "workforce_handoff_acknowledged"
+            ]
+            assert len(acknowledged) == 1
+            assert acknowledged[0].payload["actor"] == target_agent
+
+        launched: dict[str, object] = {}
+
+        class Worker:
+            pid = 4242
+
+        def launch_worker(command, **kwargs):
+            launched["command"] = list(command)
+            launched["env"] = dict(kwargs["env"])
+            return Worker()
+
+        monkeypatch.setattr(subprocess, "Popen", launch_worker)
+        monkeypatch.setattr(kanban_db, "_memory_pressure_level", lambda: "normal")
+        with kanban_db.connect_closing(db_path) as conn:
+            dispatch = kanban_db.dispatch_once(conn, max_spawn=1)
+            task = kanban_db.get_task(conn, created["task_id"])
+
+        assert dispatch.spawned[0][:2] == (created["task_id"], target_agent)
+        assert launched["command"][1:3] == ["-p", execution_profile]
+        assert launched["env"]["HERMES_PROFILE"] == execution_profile
+        assert launched["env"]["HERMES_HOME"] == str(profile)
+        assert organization.validate_execution_profile(
+            launched["env"]["HERMES_PROFILE"]
+        ).agent == target_agent
+        assert task.status == "running"
+        assert task.assignee == target_agent
     finally:
         server.shutdown()
         server.server_close()

@@ -9,6 +9,7 @@ Two strategies:
 """
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -26,6 +27,7 @@ from gateway.wake import (
     complete_final_return_delivery,
     deliver_wake,
     final_return_context_from_event,
+    final_return_context_matches_profile,
 )
 
 
@@ -160,6 +162,21 @@ def test_deliver_push_wake_rejects_partial_or_extra_final_return_context(tmp_pat
                 coordination_context={**context, "purpose": "final_return"},
             )
         )
+
+
+def test_final_return_profile_match_uses_canonical_workforce_identity(
+    tmp_path, monkeypatch,
+):
+    context = _final_return_context(tmp_path)
+    context["responsible_agent"] = "root"
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+
+    assert final_return_context_matches_profile(context, "main") is True
+    assert final_return_context_matches_profile(context, "aurora") is False
+    assert final_return_context_matches_profile(context, "missing-profile") is False
 
 
 def test_repeated_final_return_after_ambiguous_turn_never_enqueues_second_model(tmp_path, monkeypatch):

@@ -163,6 +163,40 @@ def test_default_spawn_resolves_canonical_root_only_for_worker_launch(
     assert task.assignee == "root"
 
 
+def test_actual_review_dispatch_runs_root_on_main_profile(
+    canonical_root_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    class FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "normal")
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review launch", assignee="root")
+        _park_in_review(conn, task_id)
+        result = kb.dispatch_once(conn, max_spawn=1)
+        task = kb.get_task(conn, task_id)
+
+    assert result.spawned[0][:2] == (task_id, "root")
+    assert captured["cmd"][1:3] == ["-p", "main"]
+    assert captured["env"]["HERMES_PROFILE"] == "main"
+    assert captured["env"]["HERMES_HOME"] == str(
+        canonical_root_home / "profiles" / "main"
+    )
+    assert task is not None
+    assert task.status == "running"
+    assert task.assignee == "root"
+
+
 def test_direct_profiles_stay_spawnable_and_unknown_lanes_stay_skipped(
     canonical_root_home: Path,
 ) -> None:

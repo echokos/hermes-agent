@@ -4724,6 +4724,7 @@ def has_coordination_tick_work(
     *,
     board: Optional[str] = None,
     notifier_profiles: Optional[Iterable[str]] = None,
+    notifier_agents: Optional[Iterable[str]] = None,
     include_unowned: bool = False,
 ) -> bool:
     """Cheap read-only probe for final-return or owned-failure intake work.
@@ -4741,6 +4742,15 @@ def has_coordination_tick_work(
             str(profile).strip()
             for profile in notifier_profiles
             if str(profile).strip()
+        }
+    )
+    agents = (
+        profiles
+        if notifier_agents is None
+        else {
+            str(agent).strip()
+            for agent in notifier_agents
+            if str(agent).strip()
         }
     )
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
@@ -4762,7 +4772,7 @@ def has_coordination_tick_work(
                 "AND status IN ('active', 'return_pending')"
             ).fetchall()
             for request in requests:
-                if profiles is not None and request["responsible_agent"] not in profiles:
+                if agents is not None and request["responsible_agent"] not in agents:
                     continue
                 routes = conn.execute(
                     "SELECT notifier_profile, delivery_mode FROM kanban_notify_subs "
@@ -4780,15 +4790,15 @@ def has_coordination_tick_work(
 
             params: list[Any] = []
             assignee_clause = ""
-            if profiles is not None:
-                if not profiles:
+            if agents is not None:
+                if not agents:
                     return False
                 assignee_clause = (
                     " AND assignee IN ("
-                    + ",".join("?" for _ in profiles)
+                    + ",".join("?" for _ in agents)
                     + ")"
                 )
-                params.extend(sorted(profiles))
+                params.extend(sorted(agents))
             candidates = conn.execute(
                 "SELECT assignee, body FROM tasks WHERE status = 'triage' "
                 "AND body LIKE '%\"kind\": \"workforce_handoff\"%'"
@@ -4829,6 +4839,7 @@ def prepare_coordination_final_return_deliveries(
     conn: sqlite3.Connection,
     *,
     notifier_profiles: Optional[Iterable[str]] = None,
+    notifier_agents: Optional[Iterable[str]] = None,
     include_unowned: bool = False,
     now: Optional[int] = None,
 ) -> list[dict[str, Any]]:
@@ -4849,6 +4860,15 @@ def prepare_coordination_final_return_deliveries(
             if str(profile).strip()
         }
     )
+    agents = (
+        profiles
+        if notifier_agents is None
+        else {
+            str(agent).strip()
+            for agent in notifier_agents
+            if str(agent).strip()
+        }
+    )
     rows = conn.execute(
         "SELECT id FROM coordination_requests WHERE kind = 'origin_request' "
         "AND status IN ('active', 'return_pending') ORDER BY created_at, id"
@@ -4857,7 +4877,7 @@ def prepare_coordination_final_return_deliveries(
         request = get_coordination_request(conn, row["id"])
         if request is None:
             continue
-        if profiles is not None and request.responsible_agent not in profiles:
+        if agents is not None and request.responsible_agent not in agents:
             continue
         try:
             route = _coordination_final_route(conn, request.root_task_id)
@@ -4891,7 +4911,7 @@ def prepare_coordination_final_return_deliveries(
         request = get_coordination_request(conn, row["id"])
         if request is None:
             continue
-        if profiles is not None and request.responsible_agent not in profiles:
+        if agents is not None and request.responsible_agent not in agents:
             continue
         try:
             route = _coordination_final_route(conn, request.root_task_id)
