@@ -83,6 +83,51 @@ def plan_payload(*, nodes=None, unresolved=None):
     }
 
 
+def accepted_coordination_request(
+    board,
+    organization,
+    *,
+    suffix: str,
+    assignee: str = "aurora",
+):
+    session_id = f"{assignee}-buzz-session-{suffix}"
+    root_task_id = kanban_db.create_task(
+        board,
+        title=f"Return the verified workforce outcome {suffix}",
+        assignee=assignee,
+        session_id=session_id,
+    )
+    kanban_db.add_notify_sub(
+        board,
+        task_id=root_task_id,
+        platform="buzz",
+        chat_id=f"private-origin-{suffix}",
+        notifier_profile=assignee,
+        delivery_mode="wake",
+    )
+    request = kanban_db.create_coordination_request(
+        board,
+        root_task_id=root_task_id,
+        origin_session_id=session_id,
+        origin_message_id=f"request-message-{suffix}",
+        max_leaf_launches=8,
+        max_concurrent_leaf=2,
+        max_model_calls=16,
+        organization=organization,
+    )
+    return request, root_task_id
+
+
+def assert_plan_remains_draft_without_materialization(board, plan_id, task_count):
+    assert board.execute(
+        "SELECT state FROM wc_plans WHERE plan_id=?", (plan_id,)
+    ).fetchone()[0] == "draft"
+    assert board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == task_count
+    assert board.execute(
+        "SELECT COUNT(*) FROM wc_items WHERE item_kind IN ('execution','outcome')"
+    ).fetchone()[0] == 0
+
+
 def test_runtime_is_paused_and_killed_by_default(board):
     state = runtime_state(board)
     assert state["mode"] == "paused"
@@ -386,6 +431,234 @@ def test_materialization_inherits_active_coordination_budget_and_origin(board, o
         ).fetchone()
         assert json.loads(created["payload"])["coordination_origin_message_id"] == request.origin_message_id
     assert kanban_db.get_coordination_request(board, request.id).max_model_calls == 8
+
+
+@pytest.mark.parametrize("source_kind", ["unbound", "other_request"])
+def test_active_coordination_rejects_a_source_outside_the_request_before_mutation(
+    board, organization, source_kind,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += f" with {source_kind} coordination source"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    request, _request_root_id = accepted_coordination_request(
+        board, organization, suffix="current",
+    )
+    if source_kind == "unbound":
+        source_id = kanban_db.create_task(
+            board,
+            title="Unbound coordination source",
+            assignee="aurora",
+            session_id=request.origin_session_id,
+        )
+    else:
+        _other_request, source_id = accepted_coordination_request(
+            board, organization, suffix="other",
+        )
+    task_count = board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    with pytest.raises(ValueError, match="not bound to the accepted request"):
+        materialize_plan(
+            board,
+            actor="aurora",
+            plan_id=plan["plan_id"],
+            current_state_evidence=["kanban:current"],
+            current_state_evidence_at=int(time.time()),
+            confirmed_execution_ready=True,
+            organization=organization,
+            coordination_context=(request.id, source_id, "work"),
+        )
+
+    assert_plan_remains_draft_without_materialization(
+        board, plan["plan_id"], task_count,
+    )
+
+
+def test_active_coordination_rejects_the_wrong_responsible_agent_before_mutation(
+    board, organization,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += " with another responsible agent"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    request, source_id = accepted_coordination_request(
+        board, organization, suffix="root-owned", assignee="root",
+    )
+    task_count = board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    with pytest.raises(PermissionError, match="owned by another manager"):
+        materialize_plan(
+            board,
+            actor="aurora",
+            plan_id=plan["plan_id"],
+            current_state_evidence=["kanban:current"],
+            current_state_evidence_at=int(time.time()),
+            confirmed_execution_ready=True,
+            organization=organization,
+            coordination_context=(request.id, source_id, "work"),
+        )
+
+    assert_plan_remains_draft_without_materialization(
+        board, plan["plan_id"], task_count,
+    )
+
+
+def test_active_coordination_rejects_non_work_purpose_before_mutation(
+    board, organization,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += " with terminal review purpose"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    request, source_id = accepted_coordination_request(
+        board, organization, suffix="terminal-review",
+    )
+    task_count = board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    with pytest.raises(ValueError, match="current coordination work context"):
+        materialize_plan(
+            board,
+            actor="aurora",
+            plan_id=plan["plan_id"],
+            current_state_evidence=["kanban:current"],
+            current_state_evidence_at=int(time.time()),
+            confirmed_execution_ready=True,
+            organization=organization,
+            coordination_context=(request.id, source_id, "terminal_review"),
+        )
+
+    assert_plan_remains_draft_without_materialization(
+        board, plan["plan_id"], task_count,
+    )
+
+
+def test_coordinated_materialization_is_idempotent_only_within_the_same_request(
+    board, organization,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += " with request-scoped idempotency"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    request, source_id = accepted_coordination_request(
+        board, organization, suffix="first",
+    )
+    context = (request.id, source_id, "work")
+
+    first = materialize_plan(
+        board,
+        actor="aurora",
+        plan_id=plan["plan_id"],
+        current_state_evidence=["kanban:current"],
+        current_state_evidence_at=int(time.time()),
+        confirmed_execution_ready=True,
+        organization=organization,
+        coordination_context=context,
+    )
+    task_count = board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    second = materialize_plan(
+        board,
+        actor="aurora",
+        plan_id=plan["plan_id"],
+        current_state_evidence=["kanban:current"],
+        current_state_evidence_at=int(time.time()),
+        confirmed_execution_ready=True,
+        organization=organization,
+        coordination_context=context,
+    )
+
+    assert second == {
+        "plan_id": plan["plan_id"],
+        "root_task_id": first["root_task_id"],
+        "created": False,
+        "request_root_id": request.id,
+    }
+    assert board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == task_count
+
+    other_request, other_source_id = accepted_coordination_request(
+        board, organization, suffix="second",
+    )
+    task_count = board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    with pytest.raises(ValueError, match="not bound to the current coordination request"):
+        materialize_plan(
+            board,
+            actor="aurora",
+            plan_id=plan["plan_id"],
+            current_state_evidence=["kanban:current"],
+            current_state_evidence_at=int(time.time()),
+            confirmed_execution_ready=True,
+            organization=organization,
+            coordination_context=(other_request.id, other_source_id, "work"),
+        )
+    assert board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == task_count
+
+
+def test_multilevel_materialization_inherits_coordination_on_every_task(
+    board, organization,
+):
+    nodes = [
+        {
+            "key": key,
+            "title": f"Implement stage {key}",
+            "assignee": "sloane",
+            "responsibility": "implementation",
+            "action_class": "software_implementation",
+            "acceptance_test": f"Stage {key} passes",
+            "authority_class": "routine",
+            "parents": parents,
+        }
+        for key, parents in (
+            ("one", []),
+            ("two", ["one"]),
+            ("three", ["two"]),
+        )
+    ]
+    payload = plan_payload(nodes=nodes)
+    payload["desired_outcome"] += " through a three-level graph"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    request, source_id = accepted_coordination_request(
+        board, organization, suffix="multilevel",
+    )
+
+    materialized = materialize_plan(
+        board,
+        actor="aurora",
+        plan_id=plan["plan_id"],
+        current_state_evidence=["kanban:current"],
+        current_state_evidence_at=int(time.time()),
+        confirmed_execution_ready=True,
+        organization=organization,
+        coordination_context=(request.id, source_id, "work"),
+    )
+
+    execution = materialized["execution_tasks"]
+    assert kanban_db.parent_ids(board, execution["two"]) == [execution["one"]]
+    assert kanban_db.parent_ids(board, execution["three"]) == [execution["two"]]
+    task_ids = [*execution.values(), materialized["root_task_id"]]
+    for task_id in task_ids:
+        task = kanban_db.get_task(board, task_id)
+        assert task is not None
+        assert task.request_root_id == request.id
+        assert task.session_id == request.origin_session_id
+        created = board.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='created' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert (
+            json.loads(created["payload"])["coordination_origin_message_id"]
+            == request.origin_message_id
+        )
 
 
 @pytest.mark.parametrize("request_status", [None, "completed"])
