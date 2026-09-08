@@ -407,6 +407,22 @@ def _process_group_running(group_id: int) -> bool:
     return False
 
 
+def _stop_paid_process_group(process: subprocess.Popen) -> None:
+    cleanup_deadline = time.monotonic() + _GENERATION_CLEANUP_TIMEOUT_SECONDS
+    try:
+        os.killpg(process.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX capability checked before launch
+    except ProcessLookupError:
+        pass
+    try:
+        process.communicate(timeout=_GENERATION_CLEANUP_TIMEOUT_SECONDS)
+        while _process_group_running(process.pid):
+            if time.monotonic() >= cleanup_deadline:
+                raise _GenerationStopped("cleanup_unverified")
+            time.sleep(min(0.05, max(0, cleanup_deadline - time.monotonic())))
+    except subprocess.TimeoutExpired:
+        raise _GenerationStopped("cleanup_unverified") from None
+
+
 def _execute_paid_command(
     command: list[str], *, env: dict[str, str], pass_fds: tuple[int, ...], timeout: float
 ) -> subprocess.CompletedProcess:
@@ -438,24 +454,16 @@ def _execute_paid_command(
                 stdout, stderr = process.communicate(
                     timeout=min(_GENERATION_POLL_SECONDS, remaining)
                 )
-                return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                break
             except subprocess.TimeoutExpired:
                 continue
     except BaseException:
-        cleanup_deadline = time.monotonic() + _GENERATION_CLEANUP_TIMEOUT_SECONDS
-        try:
-            os.killpg(process.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX capability checked before launch
-        except ProcessLookupError:
-            pass
-        try:
-            process.communicate(timeout=_GENERATION_CLEANUP_TIMEOUT_SECONDS)
-            while _process_group_running(process.pid):
-                if time.monotonic() >= cleanup_deadline:
-                    raise _GenerationStopped("cleanup_unverified")
-                time.sleep(min(0.05, max(0, cleanup_deadline - time.monotonic())))
-        except subprocess.TimeoutExpired:
-            raise _GenerationStopped("cleanup_unverified") from None
+        _stop_paid_process_group(process)
         raise
+    # EOF and wrapper exit do not prove that detached-stdio children stopped.
+    if _process_group_running(process.pid):
+        _stop_paid_process_group(process)
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def _trusted_wrapper_fd() -> int:

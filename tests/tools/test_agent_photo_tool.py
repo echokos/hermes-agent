@@ -633,6 +633,71 @@ def test_paid_timeout_reaps_wrapper_and_child(monkeypatch, tmp_path):
     assert not state_path.exists() or state_path.read_text(encoding="utf-8").split()[2] == "Z"
 
 
+@pytest.mark.parametrize("wrapper_exit", [0, 1])
+def test_normal_wrapper_exit_stops_detached_stdio_child_before_fallback(
+    monkeypatch, personal_profile, tmp_path, wrapper_exit
+):
+    import signal
+    import sys
+    from tools import agent_photo_tool
+
+    personal_profile("amy")
+    monkeypatch.setattr(agent_photo_tool, "_generation_cancelled", lambda: False)
+    execute_paid = agent_photo_tool._execute_paid_command
+    marker = tmp_path / "detached-child-pid"
+    script = (
+        "import pathlib,subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid),encoding='utf-8'); "
+        "sys.exit(int(sys.argv[2]))"
+    )
+
+    def assert_child_stopped():
+        child_pid = int(marker.read_text(encoding="utf-8"))
+        state_path = Path(f"/proc/{child_pid}/stat")
+        assert not state_path.exists() or state_path.read_text(encoding="utf-8").split()[2] == "Z"
+
+    def execute(command, **kwargs):
+        if command[3] == "gemini":
+            return execute_paid(
+                [sys.executable, "-c", script, str(marker), str(wrapper_exit)],
+                env={}, pass_fds=(), timeout=3,
+            )
+        assert command[3] == "grok"
+        assert_child_stopped()
+        return SimpleNamespace(returncode=0, stdout="result", stderr="")
+
+    monkeypatch.setattr(agent_photo_tool, "_execute_paid_command", execute)
+    try:
+        result = _approved_generation({"action": "generate", "prompt": "portrait"})
+        assert result["providers_attempted"] == (
+            ["gemini"] if wrapper_exit == 0 else ["gemini", "grok"]
+        )
+        assert result["success"] is True
+        assert_child_stopped()
+    finally:
+        if marker.exists():
+            try:
+                os.kill(int(marker.read_text(encoding="utf-8")), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_normal_failed_wrapper_cannot_return_with_unverified_group_cleanup(monkeypatch):
+    import sys
+    from tools import agent_photo_tool
+
+    monkeypatch.setattr(agent_photo_tool, "_generation_cancelled", lambda: False)
+    monkeypatch.setattr(agent_photo_tool, "_process_group_running", lambda group: True)
+    monkeypatch.setattr(agent_photo_tool, "_GENERATION_CLEANUP_TIMEOUT_SECONDS", 0.1)
+    with pytest.raises(agent_photo_tool._GenerationStopped, match="cleanup_unverified"):
+        agent_photo_tool._execute_paid_command(
+            [sys.executable, "-c", "raise SystemExit(1)"],
+            env={}, pass_fds=(), timeout=3,
+        )
+
+
 def test_unverified_process_group_cleanup_is_not_a_reaped_timeout(monkeypatch):
     import sys
     from tools import agent_photo_tool
