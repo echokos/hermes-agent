@@ -6,6 +6,12 @@ import pytest
 
 from gateway.config import Platform, StreamingConfig
 from gateway.platforms.base import resolve_proxy_url
+from gateway.platforms.api_server import (
+    AGENT_PHOTO_REQUEST_MARKER,
+    AGENT_PHOTO_REQUEST_MARKER_HEADER,
+    AGENT_PHOTO_REQUEST_TEXT_HEADER,
+    encode_internal_agent_photo_request_text,
+)
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -159,11 +165,15 @@ class TestRunAgentProxyDispatch:
             session_id="test-session-123",
             session_key="test-key",
             run_generation=7,
+            direct_agent_photo_request_text="send me an agent photo",
         )
 
         assert result["final_response"] == "Hello from remote!"
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
+        assert runner._run_agent_via_proxy.call_args.kwargs[
+            "direct_agent_photo_request_text"
+        ] == "send me an agent photo"
 
 
 class TestRunAgentViaProxy:
@@ -171,7 +181,7 @@ class TestRunAgentViaProxy:
 
     @pytest.mark.asyncio
     async def test_builds_correct_request(self, monkeypatch):
-        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://127.0.0.1:8642")
         monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
         runner = _make_runner()
         source = _make_source()
@@ -198,16 +208,25 @@ class TestRunAgentViaProxy:
                         ],
                         source=source,
                         session_id="session-abc",
+                        direct_agent_photo_request_text="Send me an agent photo.\nExactly this.",
                     )
 
         # Verify request URL
-        assert session.captured_url == "http://host:8642/v1/chat/completions"
+        assert session.captured_url == "http://127.0.0.1:8642/v1/chat/completions"
 
         # Verify auth header
         assert session.captured_headers["Authorization"] == "Bearer test-key-123"
 
         # Verify session ID header
         assert session.captured_headers["X-Hermes-Session-Id"] == "session-abc"
+        assert session.captured_headers[AGENT_PHOTO_REQUEST_MARKER_HEADER] == (
+            AGENT_PHOTO_REQUEST_MARKER
+        )
+        assert session.captured_headers[AGENT_PHOTO_REQUEST_TEXT_HEADER] == (
+            encode_internal_agent_photo_request_text(
+                "Send me an agent photo.\nExactly this."
+            )
+        )
 
         # Verify messages include system, history, and current message
         messages = session.captured_json["messages"]
@@ -221,6 +240,32 @@ class TestRunAgentViaProxy:
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_remote_proxy_does_not_emit_privileged_photo_headers(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://remote.example:8642")
+        monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
+        runner = _make_runner()
+        resp = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'],
+        )
+        session = _FakeSession(resp)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    await runner._run_agent_via_proxy(
+                        message="send a photo",
+                        context_prompt="",
+                        history=[],
+                        source=_make_source(),
+                        session_id="test",
+                        direct_agent_photo_request_text="send a photo",
+                    )
+
+        assert AGENT_PHOTO_REQUEST_MARKER_HEADER not in session.captured_headers
+        assert AGENT_PHOTO_REQUEST_TEXT_HEADER not in session.captured_headers
 
 
     @pytest.mark.asyncio
@@ -294,4 +339,3 @@ class TestEnvVarRegistration:
         info = OPTIONAL_ENV_VARS["GATEWAY_PROXY_URL"]
         assert info["category"] == "messaging"
         assert info["password"] is False
-

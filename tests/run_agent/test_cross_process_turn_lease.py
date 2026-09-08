@@ -5,7 +5,10 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from agent import relay_runtime
 from hermes_state import SessionDB
@@ -194,6 +197,80 @@ def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
 
     assert observed["history"] is seed
     assert db.events == []
+
+
+def test_agent_photo_authorization_is_invalidated_when_conversation_raises(
+    monkeypatch,
+):
+    from agent.agent_photo_request import (
+        AgentPhotoRequestAuthorization,
+        AgentPhotoRequestOrigin,
+        _CURRENT_AUTHORIZATION,
+        bind_agent_photo_request,
+        get_current_agent_photo_request_authorization,
+    )
+
+    agent = _agent_with_db(
+        _DB(session_exists=False),
+        session_id="photo-session",
+        platform="telegram",
+    )
+    captured = {}
+    caller_authorization = AgentPhotoRequestAuthorization(
+        AgentPhotoRequestOrigin(
+            text="caller",
+            text_sha256="caller-hash",
+            session_id="caller-session",
+            turn_id="caller-turn",
+            profile_name="kourtnie",
+            profile_path="/profiles/kourtnie",
+            user_message_index=0,
+        )
+    )
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "kourtnie"
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_hermes_home", lambda: Path("/profiles/kourtnie")
+    )
+
+    def fail_run(_agent, *_args, **kwargs):
+        assert get_current_agent_photo_request_authorization() is None
+        authorization = bind_agent_photo_request(
+            kwargs["_agent_photo_request_run"],
+            kwargs["direct_agent_photo_request_text"],
+            session_id=_agent.session_id,
+            turn_id="photo-turn",
+            user_message_index=1,
+        )
+        captured["authorization"] = authorization
+        assert get_current_agent_photo_request_authorization() is authorization
+        raise RuntimeError("conversation failed")
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fail_run)
+    caller_token = _CURRENT_AUTHORIZATION.set(caller_authorization)
+    try:
+        with pytest.raises(RuntimeError, match="conversation failed"):
+            AIAgent.run_conversation(
+                agent,
+                "send me a photo",
+                conversation_history=[],
+                direct_agent_photo_request_text="send me a photo",
+            )
+        assert get_current_agent_photo_request_authorization() is caller_authorization
+    finally:
+        _CURRENT_AUTHORIZATION.reset(caller_token)
+
+    authorization = captured["authorization"]
+    assert authorization.begin_review(
+        session_id="photo-session",
+        turn_id="photo-turn",
+        subject={
+            "profile_name": "kourtnie",
+            "profile_path": "/profiles/kourtnie",
+        },
+    )[0] == "expired"
 
 
 def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):

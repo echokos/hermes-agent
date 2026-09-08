@@ -41,6 +41,7 @@ Requires:
 """
 
 import asyncio
+import base64
 import ipaddress
 import errno
 import hashlib
@@ -71,6 +72,40 @@ _PROFILE_REJECTED = object()
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
+
+# Private wire protocol used by GatewayRunner's loopback proxy relay. The
+# public OpenAI-shaped request body never carries this authorization input.
+AGENT_PHOTO_REQUEST_MARKER_HEADER = "X-Hermes-Internal-Agent-Photo"
+AGENT_PHOTO_REQUEST_TEXT_HEADER = "X-Hermes-Agent-Photo-Request"
+AGENT_PHOTO_REQUEST_MARKER = "trusted-human-v1"
+_AGENT_PHOTO_REQUEST_ENCODED_MAX_BYTES = 7000
+
+
+def encode_internal_agent_photo_request_text(text: str) -> str:
+    """Encode exact user-authored text for the bounded loopback header."""
+    if not isinstance(text, str) or not text:
+        raise ValueError("agent photo request text must be a non-empty string")
+    encoded = base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+    if len(encoded) > _AGENT_PHOTO_REQUEST_ENCODED_MAX_BYTES:
+        raise ValueError("agent photo request text exceeds internal header limit")
+    return encoded
+
+
+def _decode_internal_agent_photo_request_text(encoded: str) -> str:
+    if not encoded or len(encoded) > _AGENT_PHOTO_REQUEST_ENCODED_MAX_BYTES:
+        raise ValueError("invalid agent photo request header length")
+    try:
+        raw = base64.b64decode(
+            encoded + "=" * (-len(encoded) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+        text = raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid agent photo request encoding") from exc
+    if not text:
+        raise ValueError("empty agent photo request text")
+    return text
 
 def _approval_event_choices(
     *, smart_denied: bool, allow_session: bool, allow_permanent: bool
@@ -1902,6 +1937,41 @@ class APIServerAdapter(BasePlatformAdapter):
         except ValueError:
             return None, "", web.json_response(
                 _openai_error("Invalid internal wake context"), status=400
+            )
+
+    def _parse_internal_agent_photo_request(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Recover trusted human text only from the local proxy relay."""
+        marker = request.headers.get(AGENT_PHOTO_REQUEST_MARKER_HEADER)
+        encoded = request.headers.get(AGENT_PHOTO_REQUEST_TEXT_HEADER)
+        if marker is None and encoded is None:
+            return None, None
+        if marker != AGENT_PHOTO_REQUEST_MARKER or not encoded:
+            return None, web.json_response(
+                _openai_error("Invalid internal agent photo request"), status=400
+            )
+
+        expected_key = self._expected_api_key()
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+        if (
+            not expected_key
+            or not self._is_loopback_peer(request)
+            or not hmac.compare_digest(token.encode(), expected_key.encode())
+        ):
+            logger.warning(
+                "Rejected privileged agent photo request: %s",
+                self._request_audit_log_suffix(request),
+            )
+            return None, web.json_response(
+                _openai_error("Invalid internal agent photo provenance"), status=403
+            )
+        try:
+            return _decode_internal_agent_photo_request_text(encoded), None
+        except ValueError:
+            return None, web.json_response(
+                _openai_error("Invalid internal agent photo request"), status=400
             )
 
     @staticmethod
@@ -4270,6 +4340,11 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if context_error is not None:
             return context_error
+        direct_agent_photo_request_text, photo_request_error = (
+            self._parse_internal_agent_photo_request(request)
+        )
+        if photo_request_error is not None:
+            return photo_request_error
         if final_return_context is not None:
             from gateway.wake import final_return_context_matches_profile
             from hermes_cli.profiles import get_active_profile_name
@@ -4544,6 +4619,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 final_return_context=final_return_context,
                 final_return_claim_token=final_return_claim_token,
+                direct_agent_photo_request_text=direct_agent_photo_request_text,
                 **agent_overrides,
                 route=route,
             ))
@@ -4567,6 +4643,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 final_return_context=final_return_context,
                 final_return_claim_token=final_return_claim_token,
+                direct_agent_photo_request_text=direct_agent_photo_request_text,
                 **agent_overrides,
                 route=route,
             )
@@ -6551,6 +6628,7 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         final_return_context: Optional[dict[str, str]] = None,
         final_return_claim_token: str = "",
+        direct_agent_photo_request_text: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6631,12 +6709,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
-                    if final_return_context is None:
-                        result = agent.run_conversation(
-                            user_message=user_message,
-                            conversation_history=conversation_history,
-                            task_id=effective_task_id,
+                    conversation_kwargs = {
+                        "user_message": user_message,
+                        "conversation_history": conversation_history,
+                        "task_id": effective_task_id,
+                    }
+                    if direct_agent_photo_request_text is not None:
+                        conversation_kwargs["direct_agent_photo_request_text"] = (
+                            direct_agent_photo_request_text
                         )
+                    if final_return_context is None:
+                        result = agent.run_conversation(**conversation_kwargs)
                     else:
                         # API wakes execute outside GatewayRunner. Bind the
                         # same budget at the physical AIAgent turn boundary,
@@ -6649,11 +6732,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             purpose="final_return",
                             db_path=Path(final_return_context["db_path"]),
                         ):
-                            result = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
-                            )
+                            result = agent.run_conversation(**conversation_kwargs)
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

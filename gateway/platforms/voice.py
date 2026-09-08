@@ -217,6 +217,7 @@ class VoiceAdapter(BasePlatformAdapter):
             content = str(msg.get("content", ""))
             if not content.strip():
                 return
+            authored_content = content.strip()
 
             call = self._active_calls.get(call_id)
             if not call:
@@ -243,6 +244,13 @@ class VoiceAdapter(BasePlatformAdapter):
                 content = VOICE_CONTEXT_PREFIX + content
                 call["context_sent"] = True
 
+            agent_photo_request_text = None
+            if call.get("source") == "voice" or (
+                call.get("source") == "phone"
+                and call.get("is_elliott") is True
+            ):
+                agent_photo_request_text = authored_content
+
             message_id = f"voice-{call_id}-{id(msg)}"
             event = MessageEvent(
                 text=content,
@@ -253,6 +261,7 @@ class VoiceAdapter(BasePlatformAdapter):
                     chat_id=f"voice:{call.get('session_id') or call_id}",
                 ),
                 message_id=message_id,
+                agent_photo_request_text=agent_photo_request_text,
             )
             call["session_key"] = self._session_key_for_source(event.source)
             call["message_ids"].add(message_id)

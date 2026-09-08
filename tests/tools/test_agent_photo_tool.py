@@ -197,8 +197,11 @@ def test_personal_profiles_can_discover_skill_and_use_no_spend_actions(
         assert command[0] == f"/proc/self/fd/{kwargs['pass_fds'][0]}"
         profile_fd = kwargs["pass_fds"][1]
         assert kwargs == {
+            "stdin": agent_photo_tool.subprocess.DEVNULL,
             "capture_output": True,
             "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
             "timeout": agent_photo_tool._wrapper_timeout("preview"),
             "env": agent_photo_tool._wrapper_environment(profile, profile_fd=profile_fd),
             "pass_fds": kwargs["pass_fds"],
@@ -369,8 +372,8 @@ def test_generation_treats_dash_prefixed_prompt_as_data_after_approval(monkeypat
         subject=agent_photo_tool.agent_photo_approval_subject(args),
     )
     monkeypatch.setattr(
-        agent_photo_tool.subprocess,
-        "run",
+        agent_photo_tool,
+        "_execute_paid_command",
         lambda command, **kwargs: calls.append((command, kwargs))
         or SimpleNamespace(returncode=0, stdout="ok", stderr=""),
     )
@@ -398,7 +401,330 @@ def test_generation_treats_dash_prefixed_prompt_as_data_after_approval(monkeypat
     assert kwargs["env"] == agent_photo_tool._wrapper_environment(
         profile, profile_fd=kwargs["pass_fds"][1]
     )
-    assert kwargs["timeout"] == agent_photo_tool._wrapper_timeout("generate")
+    assert kwargs["timeout"] == agent_photo_tool._GEMINI_ATTEMPT_TIMEOUT_SECONDS
+
+
+def _approved_generation(args):
+    from tools import agent_photo_tool
+    from tools.approval import _issue_tool_approval_provenance
+
+    provenance = _issue_tool_approval_provenance(
+        "agent_photo", args, session_id="photo-session", tool_call_id="photo-call",
+        turn_id="photo-turn", subject=agent_photo_tool.agent_photo_approval_subject(args),
+    )
+    return json.loads(agent_photo_tool.agent_photo_tool(
+        args, approval_provenance=provenance, session_id="photo-session",
+        tool_call_id="photo-call", turn_id="photo-turn",
+    ))
+
+
+@pytest.mark.parametrize(
+    "first,second,expected",
+    [
+        (0, 0, ["gemini"]),
+        (1, 0, ["gemini", "grok"]),
+        (1, 1, ["gemini", "grok"]),
+        (2, 0, ["gemini"]),
+        (-9, 0, ["gemini"]),
+    ],
+)
+def test_generation_has_exact_bounded_fallback(
+    monkeypatch, personal_profile, first, second, expected
+):
+    from tools import agent_photo_tool
+
+    profile = personal_profile("kourtnie")
+    calls = []
+
+    def execute(command, **kwargs):
+        calls.append((command, kwargs))
+        code = first if len(calls) == 1 else second
+        return SimpleNamespace(returncode=code, stdout="result", stderr="")
+
+    monkeypatch.setattr(agent_photo_tool, "_execute_paid_command", execute)
+    args = {"action": "generate", "prompt": "portrait"}
+    subject = agent_photo_tool.agent_photo_approval_subject(args)
+    result = _approved_generation(args)
+
+    assert result["providers_attempted"] == expected
+    assert [command[3] for command, _ in calls] == expected
+    assert subject["provider_sequence"] == ["gemini", "grok"]
+    assert subject["attempts_per_provider"] == 1
+    assert subject["max_generation_seconds"] < 420
+    for command, kwargs in calls:
+        assert command[1:] == ["--approved", "--model", command[3], "--", "portrait"]
+        assert kwargs["env"] == agent_photo_tool._wrapper_environment(profile)
+        assert 0 < kwargs["timeout"] <= agent_photo_tool._GENERATION_TIMEOUT_SECONDS
+    assert bool(result.get("success")) == (first == 0 or (first == 1 and second == 0))
+
+
+@pytest.mark.parametrize("model", ["grok", "seedream"])
+def test_explicit_other_provider_never_falls_back(monkeypatch, personal_profile, model):
+    from tools import agent_photo_tool
+
+    personal_profile("amy")
+    calls = []
+
+    def execute(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=1, stdout="failed", stderr="")
+
+    monkeypatch.setattr(agent_photo_tool, "_execute_paid_command", execute)
+    result = _approved_generation({"action": "generate", "prompt": "portrait", "model": model})
+    assert result["providers_attempted"] == [model]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("reason,expected", [
+    ("timeout", ["gemini", "grok"]),
+    ("cancelled", ["gemini"]),
+    ("cleanup_unverified", ["gemini"]),
+])
+def test_only_reaped_timeout_can_fall_back(monkeypatch, personal_profile, reason, expected):
+    from tools import agent_photo_tool
+
+    personal_profile("amy")
+    calls = []
+
+    def execute(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 1:
+            raise agent_photo_tool._GenerationStopped(reason)
+        return SimpleNamespace(returncode=0, stdout="photo", stderr="")
+
+    monkeypatch.setattr(agent_photo_tool, "_execute_paid_command", execute)
+    result = _approved_generation({"action": "generate", "prompt": "portrait"})
+    assert result["providers_attempted"] == expected
+    assert [command[3] for command in calls] == expected
+
+
+def test_revoked_request_stops_before_fallback(monkeypatch, personal_profile):
+    from tools import agent_photo_tool
+
+    personal_profile("amy")
+    calls = []
+    monkeypatch.setattr(agent_photo_tool, "_generation_cancelled", lambda: bool(calls))
+
+    def execute(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=1, stdout="failed", stderr="")
+
+    monkeypatch.setattr(agent_photo_tool, "_execute_paid_command", execute)
+    result = _approved_generation({"action": "generate", "prompt": "portrait"})
+    assert result["providers_attempted"] == ["gemini"]
+    assert "cancelled" in result["error"]
+
+
+def test_human_approved_run_without_request_origin_stops_on_run_end(monkeypatch, personal_profile):
+    from agent.agent_photo_request import (
+        finish_agent_photo_request_run, get_current_agent_photo_request_authorization,
+        start_agent_photo_request_run,
+    )
+    from tools import agent_photo_tool
+
+    personal_profile("amy")
+    agent = SimpleNamespace()
+    run, token = start_agent_photo_request_run(agent)
+    calls = []
+
+    def execute(command, **kwargs):
+        calls.append(command)
+        run.finish()
+        return SimpleNamespace(returncode=1, stdout="failed", stderr="")
+
+    monkeypatch.setattr(agent_photo_tool, "_execute_paid_command", execute)
+    try:
+        assert get_current_agent_photo_request_authorization() is None
+        result = _approved_generation({"action": "generate", "prompt": "portrait"})
+        assert result["providers_attempted"] == ["gemini"]
+        assert "cancelled" in result["error"]
+    finally:
+        finish_agent_photo_request_run(agent, run, token)
+
+
+def test_gemini_only_request_preserves_single_attempt(monkeypatch, personal_profile):
+    from tools import agent_photo_tool
+
+    personal_profile("amy")
+    calls = []
+    monkeypatch.setattr(agent_photo_tool, "_execute_paid_command", lambda command, **kwargs:
+        calls.append(command) or SimpleNamespace(returncode=1, stdout="failed", stderr=""))
+    args = {"action": "generate", "prompt": "portrait", "fallback_to_grok": False}
+    result = _approved_generation(args)
+    assert result["providers_attempted"] == ["gemini"]
+    assert len(calls) == 1
+    assert agent_photo_tool.agent_photo_approval_subject(args)["provider_sequence"] == ["gemini"]
+
+
+def test_fallback_choice_cannot_change_after_approval(monkeypatch, personal_profile):
+    from tools import agent_photo_tool
+    from tools.approval import _issue_tool_approval_provenance
+
+    personal_profile("amy")
+    args = {"action": "generate", "prompt": "portrait", "fallback_to_grok": False}
+    provenance = _issue_tool_approval_provenance(
+        "agent_photo", args, session_id="photo-session", tool_call_id="photo-call", turn_id="photo-turn",
+        subject=agent_photo_tool.agent_photo_approval_subject(args),
+    )
+    monkeypatch.setattr(agent_photo_tool, "_execute_paid_command", lambda *a, **k:
+        pytest.fail("changed fallback policy must not launch"))
+    result = json.loads(agent_photo_tool.agent_photo_tool(
+        {**args, "fallback_to_grok": True}, approval_provenance=provenance,
+        session_id="photo-session", tool_call_id="photo-call", turn_id="photo-turn",
+    ))
+    assert "requires executor approval provenance" in result["error"]
+
+
+@pytest.mark.parametrize("options", [
+    {"fallback_to_grok": "true"},
+    {"fallback_to_grok": 1},
+    {"fallback_to_grok": None},
+    {"model": "grok", "fallback_to_grok": True},
+    {"model": "seedream", "fallback_to_grok": True},
+])
+def test_invalid_fallback_never_launches(monkeypatch, personal_profile, options):
+    from tools import agent_photo_tool
+
+    personal_profile("amy")
+    monkeypatch.setattr(agent_photo_tool, "_execute_paid_command", lambda *a, **k:
+        pytest.fail("invalid fallback policy must not launch"))
+    result = json.loads(agent_photo_tool.agent_photo_tool(
+        {"action": "generate", "prompt": "portrait", **options},
+    ))
+    assert "error" in result
+
+
+def test_exhausted_generation_deadline_stops_fallback(monkeypatch, personal_profile):
+    from tools import agent_photo_tool
+
+    personal_profile("amy")
+    now = [100.0]
+    calls = []
+    monkeypatch.setattr(agent_photo_tool.time, "monotonic", lambda: now[0])
+
+    def execute(command, **kwargs):
+        calls.append(command)
+        now[0] += agent_photo_tool._GENERATION_TIMEOUT_SECONDS
+        return SimpleNamespace(returncode=1, stdout="failed", stderr="")
+
+    monkeypatch.setattr(agent_photo_tool, "_execute_paid_command", execute)
+    result = _approved_generation({"action": "generate", "prompt": "portrait"})
+    assert result["providers_attempted"] == ["gemini"]
+    assert "deadline reached" in result["error"]
+
+
+def test_paid_timeout_reaps_wrapper_and_child(monkeypatch, tmp_path):
+    import sys
+    from tools import agent_photo_tool
+
+    monkeypatch.setattr(agent_photo_tool, "_generation_cancelled", lambda: False)
+    marker = tmp_path / "child-pid"
+    script = (
+        "import pathlib,subprocess,sys,time; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid),encoding='utf-8'); time.sleep(30)"
+    )
+    with pytest.raises(agent_photo_tool._GenerationStopped, match="timeout"):
+        agent_photo_tool._execute_paid_command(
+            [sys.executable, "-c", script, str(marker)], env={}, pass_fds=(), timeout=1,
+        )
+    child_pid = int(marker.read_text(encoding="utf-8"))
+    state_path = Path(f"/proc/{child_pid}/stat")
+    assert not state_path.exists() or state_path.read_text(encoding="utf-8").split()[2] == "Z"
+
+
+@pytest.mark.live_system_guard_bypass  # cleanup may kill a helper reparented to init
+@pytest.mark.parametrize("wrapper_exit", [0, 1])
+def test_normal_wrapper_exit_stops_detached_stdio_child_before_fallback(
+    monkeypatch, personal_profile, tmp_path, wrapper_exit
+):
+    import signal
+    import sys
+    from tools import agent_photo_tool
+
+    personal_profile("amy")
+    monkeypatch.setattr(agent_photo_tool, "_generation_cancelled", lambda: False)
+    execute_paid = agent_photo_tool._execute_paid_command
+    marker = tmp_path / "detached-child-pid"
+    script = (
+        "import pathlib,subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+        "fields=pathlib.Path(f'/proc/{child.pid}/stat').read_text().rpartition(')')[2].split(); "
+        "pathlib.Path(sys.argv[1]).write_text(f'{child.pid} {fields[19]}',encoding='utf-8'); "
+        "sys.exit(int(sys.argv[2]))"
+    )
+
+    def matching_child_state():
+        child_pid_text, child_start_text = marker.read_text(encoding="utf-8").split()
+        child_pid = int(child_pid_text)
+        state_path = Path(f"/proc/{child_pid}/stat")
+        try:
+            fields = state_path.read_text(encoding="utf-8").rpartition(")")[2].split()
+        except FileNotFoundError:
+            return child_pid, None
+        if int(fields[19]) != int(child_start_text):
+            return child_pid, None
+        return child_pid, fields[0]
+
+    def assert_child_stopped():
+        _child_pid, state = matching_child_state()
+        assert state in {None, "Z"}
+
+    def execute(command, **kwargs):
+        if command[3] == "gemini":
+            return execute_paid(
+                [sys.executable, "-c", script, str(marker), str(wrapper_exit)],
+                env={}, pass_fds=(), timeout=3,
+            )
+        assert command[3] == "grok"
+        assert_child_stopped()
+        return SimpleNamespace(returncode=0, stdout="result", stderr="")
+
+    monkeypatch.setattr(agent_photo_tool, "_execute_paid_command", execute)
+    try:
+        result = _approved_generation({"action": "generate", "prompt": "portrait"})
+        assert result["providers_attempted"] == (
+            ["gemini"] if wrapper_exit == 0 else ["gemini", "grok"]
+        )
+        assert result["success"] is True
+        assert_child_stopped()
+    finally:
+        if marker.exists():
+            child_pid, state = matching_child_state()
+            if state not in {None, "Z"}:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+def test_normal_failed_wrapper_cannot_return_with_unverified_group_cleanup(monkeypatch):
+    import sys
+    from tools import agent_photo_tool
+
+    monkeypatch.setattr(agent_photo_tool, "_generation_cancelled", lambda: False)
+    monkeypatch.setattr(agent_photo_tool, "_process_group_running", lambda group: True)
+    monkeypatch.setattr(agent_photo_tool, "_GENERATION_CLEANUP_TIMEOUT_SECONDS", 0.1)
+    with pytest.raises(agent_photo_tool._GenerationStopped, match="cleanup_unverified"):
+        agent_photo_tool._execute_paid_command(
+            [sys.executable, "-c", "raise SystemExit(1)"],
+            env={}, pass_fds=(), timeout=3,
+        )
+
+
+def test_unverified_process_group_cleanup_is_not_a_reaped_timeout(monkeypatch):
+    import sys
+    from tools import agent_photo_tool
+
+    monkeypatch.setattr(agent_photo_tool, "_generation_cancelled", lambda: False)
+    monkeypatch.setattr(agent_photo_tool, "_process_group_running", lambda group: True)
+    monkeypatch.setattr(agent_photo_tool, "_GENERATION_CLEANUP_TIMEOUT_SECONDS", 0.1)
+    with pytest.raises(agent_photo_tool._GenerationStopped, match="cleanup_unverified"):
+        agent_photo_tool._execute_paid_command(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            env={}, pass_fds=(), timeout=0.1,
+        )
 
 
 @pytest.mark.parametrize(

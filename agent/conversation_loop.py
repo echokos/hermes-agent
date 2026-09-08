@@ -1796,6 +1796,8 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    direct_agent_photo_request_text: Optional[str] = None,
+    _agent_photo_request_run: Any = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1919,6 +1921,17 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+
+    if direct_agent_photo_request_text is not None:
+        from agent.agent_photo_request import bind_agent_photo_request
+
+        bind_agent_photo_request(
+            _agent_photo_request_run,
+            direct_agent_photo_request_text,
+            session_id=str(getattr(agent, "session_id", None) or ""),
+            turn_id=turn_id,
+            user_message_index=current_turn_user_idx,
+        )
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.

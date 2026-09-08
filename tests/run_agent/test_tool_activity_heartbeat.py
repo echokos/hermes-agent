@@ -197,6 +197,73 @@ def test_fast_tool_call_does_not_leave_stray_heartbeat(monkeypatch):
     assert len(touches) == n, "heartbeat thread kept running after tool returned"
 
 
+def test_threaded_executor_passes_turn_snapshot_to_registered_photo_resolver(monkeypatch):
+    """The real worker path must carry the shared one-use request object."""
+    import agent.tool_executor as te
+    from agent.agent_photo_request import (
+        AgentPhotoRequestAuthorization,
+        AgentPhotoRequestOrigin,
+        _CURRENT_AUTHORIZATION,
+    )
+
+    subject = {
+        "profile_name": "kourtnie",
+        "profile_path": "/profiles/kourtnie",
+        "prompt_sha256": "abc",
+        "model": "gemini",
+    }
+    authorization = AgentPhotoRequestAuthorization(
+        AgentPhotoRequestOrigin(
+            text="Send me an agent-photo",
+            text_sha256="request-hash",
+            session_id="session-1",
+            turn_id="turn-1",
+            profile_name="kourtnie",
+            profile_path="/profiles/kourtnie",
+            user_message_index=0,
+        )
+    )
+    monkeypatch.setattr(
+        "tools.agent_photo_tool.agent_photo_approval_subject", lambda _args: subject
+    )
+    monkeypatch.setattr(
+        "tools.approval.classify_agent_photo_request", lambda *_args: "requested"
+    )
+    monkeypatch.setattr(
+        "tools.approval.request_tool_approval",
+        lambda *a, **k: pytest.fail("direct request must not prompt"),
+    )
+
+    agent = _make_agent(monkeypatch)
+    agent.session_id = "session-1"
+    agent._current_turn_id = "turn-1"
+    agent._tool_guardrails = MagicMock(
+        before_call=lambda name, args: MagicMock(allows_execution=True)
+    )
+    box = [None]
+    token = _CURRENT_AUTHORIZATION.set(authorization)
+    try:
+        outcome = te._run_sequential_tool_execution_middleware(
+            agent,
+            function_name="agent_photo",
+            function_args={
+                "action": "generate",
+                "prompt": "portrait",
+                "model": "gemini",
+            },
+            effective_task_id="task",
+            tool_call_id="call-1",
+            execute=lambda _args: "executed",
+            approval_provenance_box=box,
+        )
+    finally:
+        _CURRENT_AUTHORIZATION.reset(token)
+
+    assert outcome.result == "executed"
+    assert outcome.dispatched is True
+    assert box[0] is not None
+
+
 def test_heartbeat_stops_when_execute_raises(monkeypatch):
     """If the tool call raises, the heartbeat thread still stops (no leak)."""
 

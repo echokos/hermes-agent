@@ -6273,6 +6273,10 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if ctx.direct_agent_photo_request_text is not None:
+                _conversation_kwargs["direct_agent_photo_request_text"] = (
+                    ctx.direct_agent_photo_request_text
+                )
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -19996,6 +20000,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                direct_agent_photo_request_text=(
+                    getattr(event, "agent_photo_request_text", None)
+                    if (
+                        not getattr(event, "internal", False)
+                        and getattr(event, "allow_gateway_control", True)
+                        and not getattr(source, "is_bot", False)
+                        and source.platform
+                        in {Platform.TELEGRAM, Platform.MATRIX, Platform.VOICE}
+                    )
+                    else None
+                ),
                 message_type=event.message_type,
                 coordination_context=_final_return_context,
             )
@@ -27450,6 +27465,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        direct_agent_photo_request_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -27530,6 +27546,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             headers["Authorization"] = f"Bearer {proxy_key}"
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
+
+        if direct_agent_photo_request_text is not None and proxy_key:
+            from ipaddress import ip_address
+            from urllib.parse import urlsplit
+
+            from gateway.platforms.api_server import (
+                AGENT_PHOTO_REQUEST_MARKER,
+                AGENT_PHOTO_REQUEST_MARKER_HEADER,
+                AGENT_PHOTO_REQUEST_TEXT_HEADER,
+                encode_internal_agent_photo_request_text,
+            )
+
+            proxy_host = (urlsplit(proxy_url).hostname or "").lower()
+            proxy_is_loopback = proxy_host == "localhost"
+            if not proxy_is_loopback:
+                try:
+                    address = ip_address(proxy_host)
+                    proxy_is_loopback = bool(
+                        address.is_loopback
+                        or (
+                            getattr(address, "ipv4_mapped", None) is not None
+                            and address.ipv4_mapped.is_loopback
+                        )
+                    )
+                except ValueError:
+                    pass
+            if proxy_is_loopback:
+                try:
+                    encoded_photo_request = encode_internal_agent_photo_request_text(
+                        direct_agent_photo_request_text
+                    )
+                except ValueError:
+                    logger.warning(
+                        "Proxy omitted oversized or invalid agent photo authorization input"
+                    )
+                else:
+                    headers[AGENT_PHOTO_REQUEST_MARKER_HEADER] = (
+                        AGENT_PHOTO_REQUEST_MARKER
+                    )
+                    headers[AGENT_PHOTO_REQUEST_TEXT_HEADER] = encoded_photo_request
 
         body = {
             "model": "hermes-agent",
@@ -27741,6 +27797,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        direct_agent_photo_request_text: Optional[str] = None,
         message_type: Optional[str] = None,
         coordination_context: Optional[dict[str, str]] = None,
     ) -> Dict[str, Any]:
@@ -27762,6 +27819,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                direct_agent_photo_request_text=direct_agent_photo_request_text,
                 message_type=message_type,
                 coordination_context=coordination_context,
             )
@@ -27776,6 +27834,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                direct_agent_photo_request_text=direct_agent_photo_request_text,
                 message_type=message_type,
                 coordination_context=coordination_context,
             )
@@ -27920,6 +27979,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        direct_agent_photo_request_text: Optional[str] = None,
         message_type: Optional[str] = None,
         coordination_context: Optional[dict[str, str]] = None,
     ) -> Dict[str, Any]:
@@ -27950,6 +28010,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                direct_agent_photo_request_text=direct_agent_photo_request_text,
             )
 
         from run_agent import AIAgent
@@ -28250,6 +28311,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            direct_agent_photo_request_text=direct_agent_photo_request_text,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         turn_ctx.coordination_context = coordination_context

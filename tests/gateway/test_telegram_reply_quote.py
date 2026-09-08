@@ -12,6 +12,8 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from gateway.config import PlatformConfig
 
 
@@ -92,5 +94,46 @@ def test_native_partial_quote_used_as_reply_to_text():
 
     assert event.reply_to_text == "Item B: rotate keys"
     assert event.reply_to_message_id == "42"
+    assert event.agent_photo_request_text == "mark this one as done"
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"forward_origin": object()},
+        {"forward_from": object()},
+        {"forward_from_chat": object()},
+        {"via_bot": object()},
+    ],
+)
+def test_forwarded_or_inline_bot_text_is_not_direct_photo_authorization(extra):
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    msg = _make_message(text="send me an agent-photo")
+    for key, value in extra.items():
+        setattr(msg, key, value)
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.agent_photo_request_text is None
+
+
+@pytest.mark.parametrize("text", [None, 7, MagicMock()])
+def test_non_text_payload_does_not_authorize_photo(text):
+    from gateway.platforms.base import MessageType
+
+    event = _make_adapter()._build_message_event(_make_message(text=text), MessageType.TEXT)
+
+    assert event.agent_photo_request_text is None
+
+
+@pytest.mark.parametrize("bot", [None, MagicMock(), SimpleNamespace(username="@MyBot")])
+def test_photo_request_capture_handles_optional_bot_identity(bot):
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    adapter._bot = bot
+    event = adapter._build_message_event(_make_message(text="send an agent photo"), MessageType.TEXT)
+
+    assert event.agent_photo_request_text == "send an agent photo"

@@ -2412,6 +2412,11 @@ class MessageEvent:
     # Proactive plugin events set this to False so untrusted payload text
     # remains conversational input.
     allow_gateway_control: bool = True
+
+    # Exact user-authored text/caption captured before reply, attachment,
+    # skill, or plugin enrichment. Only explicitly supported authenticated
+    # ingress adapters populate this dedicated authorization input.
+    agent_photo_request_text: Optional[str] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""

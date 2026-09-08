@@ -7,9 +7,12 @@ It is not a shell, skill browser, or generic file interface.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import signal
 import stat
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -31,12 +34,15 @@ _GENERATION_TIMEOUT_SECONDS = (
     + _GENERATION_DOWNLOAD_TIMEOUT_SECONDS
     + _GENERATION_RUNNER_SETUP_TIMEOUT_SECONDS
 )
+_GENERATION_CLEANUP_TIMEOUT_SECONDS = 5
+_GENERATION_POLL_SECONDS = 0.25
+_GEMINI_ATTEMPT_TIMEOUT_SECONDS = 180
 
 _ACTION_ALLOWED_KEYS = {
     "instructions": {"action"},
     "preview": {"action", "prompt"},
     "characters_status": {"action"},
-    "generate": {"action", "prompt", "model"},
+    "generate": {"action", "prompt", "model", "fallback_to_grok"},
 }
 
 AGENT_PHOTO_SCHEMA = {
@@ -46,7 +52,9 @@ AGENT_PHOTO_SCHEMA = {
         "It can load only the shared agent-photo instructions, preview a prompt, "
         "check the bound character status, or make one user-requested generation. "
         "It cannot run shell commands, accept file paths, or access another profile. "
-        "Generation requires a fresh human approval and always passes --approved to the wrapper."
+        "Generation requires a direct current-message request or fresh human approval, "
+        "and always passes --approved to the wrapper. By default Gemini failure falls back to "
+        "Grok once within the same request; no further provider attempts are made."
     ),
     "parameters": {
         "type": "object",
@@ -64,7 +72,11 @@ AGENT_PHOTO_SCHEMA = {
             "model": {
                 "type": "string",
                 "enum": ["gemini", "grok", "seedream"],
-                "description": "Generation provider. Used only for generate; defaults to gemini.",
+                "description": "Generation provider. Defaults to gemini with one Grok fallback. Explicit grok or seedream makes one attempt without fallback.",
+            },
+            "fallback_to_grok": {
+                "type": "boolean",
+                "description": "Gemini only: defaults to true. Set false when the user asks for Gemini without fallback. Never enables any other fallback provider.",
             },
         },
         "required": ["action"],
@@ -271,10 +283,26 @@ def _read_fixed_file(root: Path, parts: tuple[str, ...], *, resource: str) -> st
 
 
 def _shared_skill_instructions(profile: Path) -> str:
-    return _read_fixed_file(
+    shared = _read_fixed_file(
         profile.parent.parent,
         ("shared-skills", "agent-photo", "SKILL.md"),
         resource="shared procedure",
+    )
+    return (
+        "# Native agent_photo execution\n\n"
+        "Use this native tool, not terminal commands. A direct current user photo "
+        "request authorizes generation without another approval prompt. The native "
+        "generate action defaults to one Gemini attempt followed, on failure, by "
+        "one Grok attempt within the same request. It manages that fallback itself; "
+        "do not call generate again to retry it. Set fallback_to_grok=false for "
+        "an explicit Gemini-only request. Explicit Grok or Seedream selections "
+        "make one attempt and never fall back. This native contract supersedes "
+        "the standalone CLI fallback instructions below; it never passes the "
+        "broad --allow-fallback flag. No terminal access or credential changes "
+        "are needed to invoke the native tool. Deliver each returned MEDIA line "
+        "once. After timeout, report the uncertain provider outcome rather than "
+        "claiming no remote image could have been generated.\n\n"
+        + shared
     )
 
 
@@ -315,13 +343,127 @@ def agent_photo_approval_subject(args: dict[str, Any]) -> dict[str, Any]:
     model = args.get("model", "gemini")
     if not isinstance(model, str) or model not in {"gemini", "grok", "seedream"}:
         raise ValueError("model must be one of: gemini, grok, seedream")
+    providers = _generation_providers(args)
     return {
         "profile_name": profile.name,
         "profile_path": str(profile),
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "model": model,
         "output_options": ["--approved", "--model", model, "--"],
+        "provider_sequence": providers,
+        "attempts_per_provider": 1,
+        "gemini_attempt_seconds": _GEMINI_ATTEMPT_TIMEOUT_SECONDS,
+        "max_generation_seconds": _GENERATION_TIMEOUT_SECONDS
+        + len(providers) * _GENERATION_CLEANUP_TIMEOUT_SECONDS,
     }
+
+
+def _generation_providers(args: dict[str, Any]) -> list[str]:
+    model = args.get("model", "gemini")
+    fallback = args.get("fallback_to_grok", model == "gemini")
+    if type(fallback) is not bool:
+        raise ValueError("fallback_to_grok must be a boolean")
+    if fallback and model != "gemini":
+        raise ValueError("fallback_to_grok is available only for Gemini")
+    return ["gemini", "grok"] if fallback else [model]
+
+
+def _generation_cancelled() -> bool:
+    from agent.agent_photo_request import (
+        get_current_agent_photo_request_authorization,
+        get_current_agent_photo_request_run,
+    )
+    from tools.interrupt import is_interrupted
+
+    authorization = get_current_agent_photo_request_authorization()
+    run = get_current_agent_photo_request_run()
+    return (
+        is_interrupted()
+        or (run is not None and not run.is_active())
+        or (authorization is not None and not authorization.is_active())
+    )
+
+
+class _GenerationStopped(Exception):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _process_group_running(group_id: int) -> bool:
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            if os.getpgid(int(entry.name)) != group_id:
+                continue
+            state = (entry / "stat").read_text(encoding="utf-8", errors="replace").rpartition(")")[2].split()[0]
+            if state != "Z":
+                return True
+        except ProcessLookupError:
+            continue
+        except FileNotFoundError:
+            continue
+    return False
+
+
+def _stop_paid_process_group(process: subprocess.Popen) -> None:
+    cleanup_deadline = time.monotonic() + _GENERATION_CLEANUP_TIMEOUT_SECONDS
+    try:
+        os.killpg(process.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX capability checked before launch
+    except ProcessLookupError:
+        pass
+    try:
+        process.communicate(timeout=_GENERATION_CLEANUP_TIMEOUT_SECONDS)
+        while _process_group_running(process.pid):
+            if time.monotonic() >= cleanup_deadline:
+                raise _GenerationStopped("cleanup_unverified")
+            time.sleep(min(0.05, max(0, cleanup_deadline - time.monotonic())))
+    except subprocess.TimeoutExpired:
+        raise _GenerationStopped("cleanup_unverified") from None
+
+
+def _execute_paid_command(
+    command: list[str], *, env: dict[str, str], pass_fds: tuple[int, ...], timeout: float
+) -> subprocess.CompletedProcess:
+    """Reap the wrapper and its generator before allowing a fallback attempt."""
+    _require_secure_descriptor_capability()
+    if _generation_cancelled():
+        raise _GenerationStopped("cancelled")
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        pass_fds=pass_fds,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            if _generation_cancelled():
+                raise _GenerationStopped("cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _GenerationStopped("timeout")
+            try:
+                stdout, stderr = process.communicate(
+                    timeout=min(_GENERATION_POLL_SECONDS, remaining)
+                )
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        _stop_paid_process_group(process)
+        raise
+    # EOF and wrapper exit do not prove that detached-stdio children stopped.
+    if _process_group_running(process.pid):
+        _stop_paid_process_group(process)
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def _trusted_wrapper_fd() -> int:
@@ -350,7 +492,9 @@ def _trusted_wrapper_fd() -> int:
         raise
 
 
-def _run_wrapper(profile: Path, command: list[str], action: str) -> str:
+def _run_wrapper(
+    profile: Path, command: list[str], action: str, *, timeout: float | None = None
+) -> str:
     wrapper_fd = _trusted_wrapper_fd()
     try:
         profile_fd = _open_personal_profile_directory(
@@ -361,13 +505,23 @@ def _run_wrapper(profile: Path, command: list[str], action: str) -> str:
         os.close(wrapper_fd)
         raise
     try:
-        completed = subprocess.run(
-            [f"/proc/self/fd/{wrapper_fd}", *command],
-            capture_output=True,
-            text=True,
-            timeout=_wrapper_timeout(action),
-            env=_wrapper_environment(profile, profile_fd=profile_fd),
-            pass_fds=(wrapper_fd, profile_fd),
+        argv = [f"/proc/self/fd/{wrapper_fd}", *command]
+        kwargs = {
+            "timeout": _wrapper_timeout(action) if timeout is None else timeout,
+            "env": _wrapper_environment(profile, profile_fd=profile_fd),
+            "pass_fds": (wrapper_fd, profile_fd),
+        }
+        if action == "generate":
+            completed = _execute_paid_command(argv, **kwargs)
+        else:
+            completed = subprocess.run(
+                argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", **kwargs
+            )
+    except _GenerationStopped as exc:
+        return tool_error(
+            f"agent-photo {action} stopped: {exc.reason}",
+            failure_kind=exc.reason,
         )
     except FileNotFoundError:
         return tool_error("the fixed operator-installed hermes-agent-photo wrapper is not installed")
@@ -383,7 +537,11 @@ def _run_wrapper(profile: Path, command: list[str], action: str) -> str:
     if len(output) > _MAX_OUTPUT_CHARS:
         output = output[:_MAX_OUTPUT_CHARS] + "\n[output truncated]"
     if completed.returncode:
-        return tool_error(f"agent-photo {action} failed", output=output)
+        return tool_error(
+            f"agent-photo {action} failed",
+            output=output,
+            failure_kind="attempt_failed" if action == "generate" and completed.returncode == 1 else "runner_refused",
+        )
     return tool_result({"success": True, "action": action, "output": output})
 
 
@@ -439,7 +597,34 @@ def agent_photo_tool(
             subject=agent_photo_approval_subject(args),
         ):
             return tool_error("agent-photo generation requires executor approval provenance")
-        return _run_wrapper(profile, ["--approved", "--model", model, "--", prompt], action)
+        providers_attempted: list[str] = []
+        deadline = time.monotonic() + _GENERATION_TIMEOUT_SECONDS
+        for provider in _generation_providers(args):
+            if _generation_cancelled():
+                return tool_error("agent-photo generation cancelled", providers_attempted=providers_attempted)
+            if _active_personal_profile() != profile:
+                return tool_error("agent-photo profile changed before generation")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return tool_error("agent-photo generation deadline reached", providers_attempted=providers_attempted)
+            attempt_timeout = (
+                min(remaining, _GEMINI_ATTEMPT_TIMEOUT_SECONDS)
+                if provider == "gemini"
+                else remaining
+            )
+            providers_attempted.append(provider)
+            result = json.loads(
+                _run_wrapper(
+                    profile,
+                    ["--approved", "--model", provider, "--", prompt],
+                    action,
+                    timeout=attempt_timeout,
+                )
+            )
+            result["providers_attempted"] = list(providers_attempted)
+            if result.get("success") or result.get("failure_kind") not in {"attempt_failed", "timeout"}:
+                break
+        return tool_result(result)
     except (OSError, ValueError) as exc:
         return tool_error(str(exc))
 

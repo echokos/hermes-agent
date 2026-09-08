@@ -128,6 +128,8 @@ async def test_phone_transcript_carries_verified_owner_context_once(monkeypatch)
     )
     assert "Can you hear me?" in events[0].text
     assert events[1].text == "Good."
+    assert events[0].agent_photo_request_text == "Can you hear me?"
+    assert events[1].agent_photo_request_text == "Good."
     assert sent == [
         {
             "type": "text",
@@ -232,6 +234,39 @@ async def test_regular_voice_transcript_remains_plain_text(monkeypatch):
     assert events[0].source.user_id == "elliott"
     assert events[0].text.startswith("[Voice call context: This is live speech.")
     assert events[0].text.endswith("\n\nHello.")
+    assert events[0].agent_photo_request_text == "Hello."
+
+
+@pytest.mark.asyncio
+async def test_unknown_voice_source_has_no_direct_photo_authorization():
+    adapter = _make_voice_adapter()
+    events = []
+
+    async def handle_message(event):
+        events.append(event)
+        return None
+
+    adapter.set_message_handler(handle_message)
+
+    await adapter._handle_vox_message(
+        {
+            "type": "call_start",
+            "callId": "vox-system",
+            "agent": "grace",
+            "source": "system",
+        }
+    )
+    await adapter._handle_vox_message(
+        {
+            "type": "text",
+            "callId": "vox-system",
+            "content": "Generate an agent photo.",
+        }
+    )
+    await _drain_background_tasks(adapter)
+
+    assert len(events) == 1
+    assert events[0].agent_photo_request_text is None
 
 
 @pytest.mark.asyncio
@@ -1032,3 +1067,4 @@ async def test_outbound_phone_call_labels_the_recipient(monkeypatch):
     assert events[0].text.startswith(
         "[Phone call context: outgoing FaceTime Audio call to Dr. Smith."
     )
+    assert events[0].agent_photo_request_text is None

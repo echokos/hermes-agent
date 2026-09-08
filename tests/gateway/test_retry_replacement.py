@@ -41,6 +41,7 @@ async def test_gateway_retry_replaces_last_user_turn_in_transcript(tmp_path, mon
 
     async def fake_handle_message(event):
         assert event.text == "retry me"
+        assert event.agent_photo_request_text is None
         transcript_before = store.load_transcript(session_id)
         assert [m.get("content") for m in transcript_before if m.get("role") == "user"] == [
             "first question"

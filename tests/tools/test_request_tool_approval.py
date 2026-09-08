@@ -126,7 +126,12 @@ class TestToolApprovalProvenance:
         assert result.approval_provenance is not None
         assert calls == [
             (
-                ("agent_photo", "Approve this paid agent-photo generation for the active personal profile?"),
+                (
+                    "agent_photo",
+                    "Approve this paid agent-photo generation for the active personal "
+                    "profile? This authorizes one Gemini attempt and, only if it fails, "
+                    "one Grok fallback attempt within the same request.",
+                ),
                 {
                     "rule_key": "agent_photo_generation",
                     "allow_session": False,
@@ -137,6 +142,41 @@ class TestToolApprovalProvenance:
                 },
             )
         ]
+
+    @pytest.mark.parametrize(
+        ("model", "expected", "unexpected"),
+        [
+            ("gemini", "one Gemini attempt with no provider fallback", "Grok"),
+            ("grok", "one Grok attempt with no provider fallback", "Gemini"),
+            ("seedream", "one Seedream attempt with no provider fallback", "Grok"),
+            ("malicious-provider-name", None, "malicious-provider-name"),
+        ],
+    )
+    def test_agent_photo_human_gate_discloses_only_valid_provider_scope(
+        self, model, expected, unexpected
+    ):
+        from hermes_cli.plugins import _get_pre_tool_call_directive_details
+
+        details = _get_pre_tool_call_directive_details(
+            "agent_photo",
+            {
+                "action": "generate",
+                "prompt": "portrait",
+                "model": model,
+                "fallback_to_grok": False,
+            },
+        )
+
+        assert details.action == "approve"
+        assert details.message is not None
+        if expected is not None:
+            assert expected in details.message
+        else:
+            assert details.message == (
+                "Approve this paid agent-photo generation for the active personal "
+                "profile?"
+            )
+        assert unexpected not in details.message
 
     @pytest.mark.parametrize(
         ("tool", "args_patch", "call"),

@@ -8743,9 +8743,10 @@ class TelegramAdapter(BasePlatformAdapter):
         window without an extra Bot API round-trip.
         """
         observed = getattr(self, "_bot_username_observed", None)
-        if observed:
+        if isinstance(observed, str) and observed:
             return observed
-        return (getattr(self._bot, "username", None) or "").lstrip("@").lower()
+        username = getattr(getattr(self, "_bot", None), "username", None)
+        return username.lstrip("@").lower() if isinstance(username, str) else ""
 
     def _note_bot_username(self, username: Optional[str]) -> None:
         """Record the bot's current @username, logging real renames."""
@@ -9685,6 +9686,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # Append text from the follow-up chunk
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            existing.agent_photo_request_text = None
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             # Merge any media that might be attached
             if event.media_urls:
@@ -9809,6 +9811,7 @@ class TelegramAdapter(BasePlatformAdapter):
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
+            existing.agent_photo_request_text = None
 
         prior_task = self._pending_photo_batch_tasks.get(batch_key)
         if prior_task and not prior_task.done():
@@ -10136,6 +10139,7 @@ class TelegramAdapter(BasePlatformAdapter):
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
+            existing.agent_photo_request_text = None
 
         prior_task = self._media_group_tasks.get(media_group_id)
         if prior_task:
@@ -10555,6 +10559,17 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        _forwarded = any(
+            getattr(message, attr, None) is not None
+            for attr in ("forward_origin", "forward_from", "forward_from_chat")
+        )
+        _agent_photo_request_text = None
+        if user is not None and not getattr(user, "is_bot", False) and not _forwarded:
+            if getattr(message, "via_bot", None) is None:
+                _authored_text = message.text or getattr(message, "caption", None)
+                if isinstance(_authored_text, str):
+                    _agent_photo_request_text = self._clean_bot_trigger_text(_authored_text)
+
         return MessageEvent(
             text=message.text or "",
             message_type=msg_type,
@@ -10567,6 +10582,7 @@ class TelegramAdapter(BasePlatformAdapter):
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
             timestamp=message.date,
+            agent_photo_request_text=_agent_photo_request_text,
         )
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
