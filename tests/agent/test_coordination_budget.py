@@ -139,6 +139,52 @@ def test_current_execution_rejects_unbound_capture_scope(budget_request, monkeyp
         assert budget.current_coordination_execution() is None
 
 
+def test_materialization_pending_requires_a_prepublished_acceptance(
+    budget_request, monkeypatch,
+):
+    from gateway import session_context
+
+    values = {
+        "HERMES_SESSION_ID": "ordinary-session",
+        "HERMES_SESSION_MESSAGE_ID": "ordinary-message",
+    }
+    monkeypatch.setattr(
+        session_context,
+        "get_session_env",
+        lambda key, default="": values.get(key, default),
+    )
+
+    with budget.scoped_coordination_budget():
+        with budget.coordination_materialization_binding() as binding:
+            assert binding == (None, ("ordinary-session", "ordinary-message"), False)
+
+        declaration = budget.begin_declared_coordination_acceptance(declared=True)
+        try:
+            with budget.coordination_materialization_binding() as binding:
+                assert binding == (None, ("ordinary-session", "ordinary-message"), True)
+        finally:
+            budget.end_declared_coordination_acceptance(declaration)
+
+        with budget.coordination_materialization_binding() as binding:
+            assert binding == (None, ("ordinary-session", "ordinary-message"), False)
+
+
+@pytest.mark.parametrize("report_to_origin", [True, "true", "yes", 1])
+def test_acceptance_declaration_requires_a_coordination_object(report_to_origin):
+    assert budget.declares_coordination_acceptance(
+        "kanban_create",
+        {"coordination": {}, "report_to_origin": report_to_origin},
+    )
+    assert not budget.declares_coordination_acceptance(
+        "kanban_create",
+        {"report_to_origin": report_to_origin},
+    )
+    assert not budget.declares_coordination_acceptance(
+        "kanban_create",
+        {"coordination": [], "report_to_origin": report_to_origin},
+    )
+
+
 def test_root_accepted_later_in_real_tool_thread_and_rotation_keeps_origin(budget_request, monkeypatch):
     from gateway import session_context
     from tools.thread_context import propagate_context_to_thread

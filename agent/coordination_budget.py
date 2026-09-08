@@ -22,6 +22,7 @@ class CoordinationScope:
     provisional_model_calls: int = 0
     settled_provisional_model_calls: int = 0
     acceptance_scope_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    declared_acceptance_batches: int = 0
     unbudgeted_delegation_started: bool = False
     closed: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
@@ -80,6 +81,40 @@ def current_coordination_execution() -> tuple[str, str, str] | None:
         return scope.request_root_id, scope.task_id, scope.purpose
 
 
+def declares_coordination_acceptance(function_name: str, arguments: object) -> bool:
+    """Return whether one parsed native tool call declares root acceptance."""
+    if function_name != "kanban_create" or not isinstance(arguments, dict):
+        return False
+    if not isinstance(arguments.get("coordination"), dict):
+        return False
+    report = arguments.get("report_to_origin")
+    return report is True or str(report).strip().lower() in {"true", "1", "yes"}
+
+
+def begin_declared_coordination_acceptance(*, declared: bool) -> CoordinationScope | None:
+    """Publish a parsed same-batch acceptance before tool workers start."""
+    if not declared:
+        return None
+    scope = _scope.get()
+    if scope is None:
+        return None
+    with scope.lock:
+        if scope.closed.is_set():
+            raise ValueError("coordination turn already ended")
+        scope.declared_acceptance_batches += 1
+    return scope
+
+
+def end_declared_coordination_acceptance(scope: CoordinationScope | None) -> None:
+    """Withdraw one executor-owned same-batch acceptance declaration."""
+    if scope is None:
+        return
+    with scope.lock:
+        if scope.declared_acceptance_batches <= 0:
+            raise RuntimeError("coordination acceptance declaration is unbalanced")
+        scope.declared_acceptance_batches -= 1
+
+
 @contextmanager
 def coordination_materialization_binding():
     """Fence task materialization against same-turn request acceptance.
@@ -91,7 +126,7 @@ def coordination_materialization_binding():
     """
     scope = _current_scope()
     if scope is None:
-        yield None, ("", "")
+        yield None, ("", ""), False
         return
     with scope.lock:
         if scope.closed.is_set():
@@ -104,7 +139,14 @@ def coordination_materialization_binding():
                 scope.task_id,
                 scope.purpose,
             )
-        yield execution, (scope.origin_session_id, scope.origin_message_id)
+        acceptance_pending = (
+            execution is None and scope.declared_acceptance_batches > 0
+        )
+        yield (
+            execution,
+            (scope.origin_session_id, scope.origin_message_id),
+            acceptance_pending,
+        )
 
 
 @dataclass

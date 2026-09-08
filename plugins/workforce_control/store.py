@@ -779,6 +779,7 @@ def materialize_plan(
     confirmed_execution_ready: bool, organization: WorkforceOrganization | None = None,
     coordination_context: tuple[str, str, str] | None = None,
     coordination_origin: tuple[str, str] | None = None,
+    coordination_acceptance_pending: bool = False,
 ) -> dict[str, Any]:
     org = organization or load_organization()
     if org.resolve_profile(actor).agent != "aurora":
@@ -850,7 +851,9 @@ def materialize_plan(
         coordination = _validated_materialization_coordination(
             conn, actor=actor, context=coordination_context, organization=org,
         )
-        acceptance_pending = coordination is None and coordination_origin is not None
+        acceptance_pending = coordination is None and coordination_acceptance_pending
+        if acceptance_pending and coordination_origin is None:
+            raise ValueError("pending coordination acceptance requires a current origin")
         origin_session_id, origin_message_id = coordination_origin or ("", "")
         if coordination is not None:
             if (origin_session_id, origin_message_id) not in {

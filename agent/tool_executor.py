@@ -1488,6 +1488,23 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots', print_fn=agent._print_fn)
         spinner.start()
 
+    from agent.coordination_budget import (
+        begin_declared_coordination_acceptance,
+        declares_coordination_acceptance,
+        end_declared_coordination_acceptance,
+    )
+
+    def _declares_acceptance(name, args, parse_error, scope_block):
+        if name != "kanban_create" or parse_error is not None or scope_block is not None:
+            return False
+        return declares_coordination_acceptance(name, args)
+
+    acceptance_declaration = begin_declared_coordination_acceptance(
+        declared=any(
+            _declares_acceptance(name, args, parse_error, scope_block)
+            for _tc, name, args, _trace, parse_error, scope_block in parsed_calls
+        )
+    )
     try:
         runnable_calls = [
             (i, tc, name, args, scope_block)
@@ -1683,6 +1700,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     cancel_futures=abandon_executor,
                 )
     finally:
+        end_declared_coordination_acceptance(acceptance_declaration)
         if spinner:
             # Build a summary message for the spinner stop
             completed = sum(1 for r in results if r is not None)
