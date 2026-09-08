@@ -1024,6 +1024,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         # Model-supplied free text stored durably on the event payload —
         # redact like summary / kanban_block's reason.
         reviewer = redact_sensitive_text(str(reviewer), force=True)
+    expected_run_id = _worker_run_id(tid)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1041,13 +1042,23 @@ def _handle_request_review(args: dict, **kw) -> str:
                 summary=summary,
                 metadata=metadata,
                 reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
                 with_reason=True,
             )
             if not ok:
                 detail = fail_reason or "unknown id or not in running/ready"
                 return tool_error(
                     f"could not request review for {tid}: {detail}"
+                )
+            if expected_run_id is not None:
+                # request_review validated this exact implementation run and
+                # atomically committed the review transition. A fast reviewer
+                # may claim the card before this handler builds its receipt;
+                # report the transition we performed, not that later run/state.
+                return _ok(
+                    task_id=tid,
+                    run_id=expected_run_id,
+                    status="review",
                 )
             run = kb.latest_run(conn, tid)
             landed = kb.get_task(conn, tid)
