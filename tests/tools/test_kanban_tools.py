@@ -1092,8 +1092,19 @@ def test_create_explicit_user_commitment_wakes_origin_without_global_opt_in(
     assert subs[0]["delivery_mode"] == "wake"
 
 
+@pytest.fixture
+def coordination_env(monkeypatch, worker_env, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
+    home = tmp_path / ".hermes" / "profiles" / "aurora"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return worker_env
+
+
 def test_create_accepts_coordination_root_and_inherits_within_origin_turn(
-    monkeypatch, worker_env,
+    monkeypatch, coordination_env,
 ):
     """The bound origin message, not model-supplied parent ids, scopes a turn."""
     from gateway.session_context import reset_session_vars, set_session_vars
@@ -1176,7 +1187,7 @@ def test_create_accepts_coordination_root_and_inherits_within_origin_turn(
 
 
 def test_create_coordination_root_rolls_back_without_final_route(
-    monkeypatch, worker_env,
+    monkeypatch, coordination_env,
 ):
     from gateway.session_context import reset_session_vars, set_session_vars
     from hermes_cli import kanban_db as kb
@@ -1214,7 +1225,7 @@ def test_create_coordination_root_rolls_back_without_final_route(
 
 
 def test_create_coordination_tool_cannot_raise_pilot_limits(
-    monkeypatch, worker_env,
+    monkeypatch, coordination_env,
 ):
     from gateway.session_context import reset_session_vars, set_session_vars
     from tools import kanban_tools as kt
@@ -1241,7 +1252,7 @@ def test_create_coordination_tool_cannot_raise_pilot_limits(
 
 
 def test_concurrent_origin_turns_inherit_only_their_own_coordination_root(
-    monkeypatch, worker_env,
+    monkeypatch, coordination_env,
 ):
     from threading import Barrier
 
@@ -1295,7 +1306,7 @@ def test_concurrent_origin_turns_inherit_only_their_own_coordination_root(
 
 
 def test_same_origin_coordination_retry_returns_existing_root(
-    monkeypatch, worker_env,
+    monkeypatch, coordination_env,
 ):
     from gateway.session_context import reset_session_vars, set_session_vars
     from hermes_cli import kanban_db as kb
@@ -1348,7 +1359,7 @@ def test_same_origin_coordination_retry_returns_existing_root(
 
 
 def test_same_origin_coordination_retry_settles_accepting_scope_calls(
-    monkeypatch, worker_env,
+    monkeypatch, coordination_env,
 ):
     from contextlib import contextmanager
 
@@ -1413,7 +1424,7 @@ def test_same_origin_coordination_retry_settles_accepting_scope_calls(
 
 
 def test_concurrent_child_committed_before_root_is_adopted_by_origin_message(
-    monkeypatch, worker_env,
+    monkeypatch, coordination_env,
 ):
     import time
     from threading import Barrier

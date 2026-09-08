@@ -698,7 +698,7 @@ def _handle_list(args: dict, **kw) -> str:
                     seen.add(agent_id)
                     agent = org.get(agent_id)
                     if agent.profile_path:
-                        scope_profiles.append(Path(agent.profile_path).name)
+                        scope_profiles.append(agent.agent)
                     if workforce_scope == "portfolio_outcomes":
                         pending.extend(agent.direct_reports)
                 rows = kb.list_owned_outcome_tasks(
@@ -1483,6 +1483,38 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(f"kanban_attachments: {e}")
 
 
+def _task_runtime_profile() -> str:
+    """Use the executing home before process/session labels in multiplex turns."""
+    from gateway.session_context import get_session_env
+    from hermes_constants import get_hermes_home, get_hermes_home_override
+
+    home = get_hermes_home().expanduser()
+    if home.parent.name == "profiles":
+        return home.name
+    if get_hermes_home_override() is not None:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name()
+    return (
+        get_session_env("HERMES_SESSION_PROFILE", "")
+        or os.environ.get("HERMES_PROFILE")
+        or ""
+    )
+
+
+def _task_creator() -> str:
+    """Stamp canonical workforce ownership without changing generic board authors."""
+    from hermes_cli.workforce_org import WorkforceOrganizationError, load_organization
+
+    runtime = _task_runtime_profile() or "worker"
+    try:
+        return load_organization().from_profile_path(runtime).agent
+    except (WorkforceOrganizationError, UnicodeError):
+        # Generic Kanban is usable without membership in a workforce. This
+        # fallback is attribution only, never coordination authorization.
+        return runtime
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -1704,15 +1736,12 @@ def _handle_create(args: dict, **kw) -> str:
                         raise ValueError(
                             "coordination root requires the origin message_id"
                         )
-                    from hermes_cli.workforce_org import load_organization
+                    from hermes_cli.workforce_org import active_workforce_agent, load_organization
 
                     org = load_organization()
-                    actor_name = (
-                        get_session_env("HERMES_SESSION_PROFILE", "")
-                        or os.environ.get("HERMES_PROFILE")
-                        or ""
+                    actor = org.validate_execution_profile(
+                        active_workforce_agent().agent
                     )
-                    actor = org.validate_execution_profile(actor_name)
                     target = org.validate_execution_profile(str(assignee))
                     if actor.agent != target.agent or not actor.direct_reports:
                         raise ValueError(
@@ -1792,7 +1821,7 @@ def _handle_create(args: dict, **kw) -> str:
                             if goal_max_turns is not None else None
                         ),
                         initial_status=str(initial_status),
-                        created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                        created_by=_task_creator(),
                         session_id=session_id,
                     )
                     new_task = kb.get_task(conn, new_tid)
@@ -1972,10 +2001,7 @@ def _maybe_auto_subscribe(
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         user_id_alt = get_session_env("HERMES_SESSION_USER_ID_ALT", "") or None
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
-        notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
-        )
+        notifier_profile = _task_runtime_profile()
         if not notifier_profile:
             try:
                 from hermes_cli.profiles import get_active_profile_name
