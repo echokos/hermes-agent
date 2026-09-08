@@ -21,7 +21,12 @@ from typing import Any, Iterable, Optional
 
 
 _TERMINAL_KANBAN_TOOLS = frozenset(
-    {"kanban_complete", "kanban_block", "kanban_request_review"}
+    {
+        "kanban_complete",
+        "kanban_block",
+        "kanban_request_review",
+        "kanban_request_changes",
+    }
 )
 
 _DEFAULT_MAX_ATTEMPTS = 2
@@ -72,6 +77,8 @@ def _successful_terminal_result(msg: Mapping[str, Any]) -> bool:
     status = str(payload.get("status") or "").strip().lower()
     if name == "kanban_request_review":
         return status == "review"
+    if name == "kanban_request_changes":
+        return status == "ready" and bool(str(payload.get("implementer") or "").strip())
     return status in {"blocked", "todo", "triage"}
 
 

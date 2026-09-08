@@ -311,6 +311,36 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     assert kwargs["outcome"] == "timed_out"
 
 
+def test_terminal_review_marker_does_not_mask_failed_exit(monkeypatch):
+    """A failed terminal-review turn must still take the timeout guard."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-terminal-review")
+    record = MagicMock(name="record_task_failure")
+    conn = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    agent = _LimitAgent()
+
+    result = finalize_turn(
+        agent,
+        final_response=None,
+        api_call_count=60,
+        interrupted=False,
+        failed=True,
+        messages=[{"role": "user", "content": "task"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="task",
+        original_user_message="task",
+        _should_review_memory=False,
+        _turn_exit_reason="terminal_review_verdict",
+    )
+
+    assert result["completed"] is False
+    record.assert_called_once()
+
+
 def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
     """When budget is exhausted and interrupted but no kanban task is
     active, the bounded fallback must NOT fire (#87096).
@@ -371,5 +401,4 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
     )
 
     record.assert_not_called()
-
 

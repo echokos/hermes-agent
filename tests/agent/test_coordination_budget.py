@@ -112,6 +112,33 @@ def test_origin_discovers_accepted_root(budget_request, monkeypatch):
     assert budget.charge_provider_attempt() is None
 
 
+def test_current_execution_reads_only_live_bound_context(budget_request, monkeypatch):
+    monkeypatch.setenv("HERMES_COORDINATION_REQUEST_ROOT", "env-root")
+    monkeypatch.setenv("HERMES_COORDINATION_TASK_ID", "env-task")
+    monkeypatch.setenv("HERMES_COORDINATION_PURPOSE", "terminal_review")
+
+    # Process environment alone is not proof of an active validated turn.
+    assert budget.current_coordination_execution() is None
+
+    with scope(budget_request, purpose="terminal_review"):
+        assert budget.current_coordination_execution() == (
+            budget_request.root,
+            budget_request.task,
+            "terminal_review",
+        )
+
+    # Closed scopes never remain observable to post-turn code.
+    assert budget.current_coordination_execution() is None
+
+
+def test_current_execution_rejects_unbound_capture_scope(budget_request, monkeypatch):
+    for key in ("REQUEST_ROOT", "TASK_ID", "PURPOSE"):
+        monkeypatch.delenv(f"HERMES_COORDINATION_{key}", raising=False)
+
+    with budget.scoped_coordination_budget(session_id="ordinary-session"):
+        assert budget.current_coordination_execution() is None
+
+
 def test_root_accepted_later_in_real_tool_thread_and_rotation_keeps_origin(budget_request, monkeypatch):
     from gateway import session_context
     from tools.thread_context import propagate_context_to_thread

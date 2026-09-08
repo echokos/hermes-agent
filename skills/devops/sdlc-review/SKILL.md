@@ -1,7 +1,7 @@
 ---
 name: sdlc-review
 description: Review Kanban handoffs and route verified outcomes.
-version: 1.1.0
+version: 1.2.0
 author: Jakub Wolniewicz (@frizikk) + Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -37,12 +37,14 @@ Do not use it for a separate downstream review card. A downstream card is ordina
 
 ## How to Run
 
-This skill is loaded automatically by the review dispatcher. Start with `kanban_show` before inspecting files or choosing a verdict.
+This skill is loaded automatically by the review dispatcher. Start with `kanban_show` before inspecting files or choosing a verdict unless the dispatcher query begins with the exact `[HERMES_HOST_TERMINAL_REVIEW_V1]` marker. That marker carries a host-observed, task/run-bound snapshot for a coordinated terminal review and replaces only the redundant opening discovery call. If it is absent, incomplete, or conflicts with later tool results, use `kanban_show` normally.
 
-1. Read the task specification and the latest `review_requested` handoff.
+1. Read the task specification and the latest `review_requested` handoff from `kanban_show` or the host-prefaced snapshot.
 2. Inspect the actual deliverable and run relevant verification.
 3. Choose exactly one verdict: approve, request changes, or escalate.
 4. Record concrete evidence in the terminal Kanban transition.
+
+For a host-prefaced review, treat the displayed model-call balance as an observation, not a promise; the host rechecks the authoritative balance before every physical call. Do not spend a call duplicating the snapshot. Read the exact listed artifact path first, use a later inspection response to verify any source path discovered inside it, and reserve the final available response for one safe terminal verdict. Never invent a path, assume the workspace is a Git repository, approve failed verification, or hide a failed check merely to fit the budget.
 
 ## Quick Reference
 
@@ -62,7 +64,7 @@ Determine the current round from the history the task record already gives you: 
 
 | Round | Lens | How to apply it |
 |---|---|---|
-| 1 | Artifact | Read the diff or deliverable cold, before the implementer's summary. Form an independent judgment, then compare it against the handoff narrative and investigate every mismatch. |
+| 1 | Artifact | Read the actual artifact before relying on the implementer's summary. A host-prefaced snapshot necessarily carries the summary for orientation; "cold" means forming the independent artifact judgment before using that claim to decide the verdict, not suppressing the host snapshot. Then compare and investigate every mismatch. |
 | 2 | Execution | Check out the work and actually run it via `terminal`: build, test, and exercise the reported behavior yourself. Verify each handoff claim empirically instead of re-reading the artifact. |
 | 3+ | Contract | Re-read the ORIGINAL task body and acceptance criteria, then audit the deliverable strictly against them. Also verify that every item from every prior `kanban_request_changes` round actually landed. |
 
@@ -76,7 +78,7 @@ The same principle applies outside the Kanban review lane. When spawning multipl
 
 ### 1. Orient from the durable task record
 
-Call `kanban_show` and identify:
+Call `kanban_show`, or use the current dispatcher query when it begins with `[HERMES_HOST_TERMINAL_REVIEW_V1]`, and identify:
 
 - the original task body and acceptance criteria;
 - the latest implementation summary and structured metadata;
@@ -84,7 +86,7 @@ Call `kanban_show` and identify:
 - comments and decisions from earlier runs;
 - findings from prior review rounds.
 
-Treat the handoff as a claim to verify, not as proof that the work is correct.
+Treat the handoff as a claim to verify, not as proof that the work is correct. In a host-prefaced snapshot, attachment locations and recovery event fields are host observations, while attachment contents, prior-run summaries, metadata, and comments still require independent verification.
 
 ### 2. Compare requested behavior with delivered behavior
 

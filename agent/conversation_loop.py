@@ -1688,6 +1688,49 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _terminal_review_tool_round_completed(tool_results: List[Dict[str, Any]]) -> bool:
+    """Return true only for a dispatcher-owned terminal-review verdict.
+
+    This is intentionally narrower than the normal Kanban stop guard.  The
+    active coordination ContextVar was established by the dispatcher before
+    the provider call; environment strings alone must not suppress a regular
+    conversation iteration.
+    """
+    try:
+        from agent.coordination_budget import current_coordination_execution
+        from agent.kanban_stop import session_called_kanban_terminal
+
+        execution = current_coordination_execution()
+    except Exception:
+        return False
+    if execution is None:
+        return False
+    request_root_id, task_id, purpose = execution
+    if not request_root_id or not task_id or purpose != "terminal_review":
+        return False
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() != task_id:
+        return False
+    if (os.environ.get("HERMES_SESSION_SOURCE") or "").strip() != "kanban":
+        return False
+    run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if not run_id.isdecimal() or int(run_id) < 1:
+        return False
+    # Requesting review is terminal for an ordinary implementation worker,
+    # but a source-acceptance reviewer must continue after that handoff. Only
+    # a verdict that closes, blocks, or returns actionable changes can spend
+    # the final reserved response without requesting another model turn.
+    verdict_results = [
+        result
+        for result in tool_results
+        if result.get("name") in {
+            "kanban_complete",
+            "kanban_block",
+            "kanban_request_changes",
+        }
+    ]
+    return session_called_kanban_terminal(verdict_results)
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -7207,6 +7250,7 @@ def run_conversation(
                     except Exception:
                         pass
 
+                _tool_results_start = len(messages)
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if getattr(agent, "_incremental_persistence_failed", False):
@@ -7259,6 +7303,16 @@ def run_conversation(
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass
+                    break
+
+                if _terminal_review_tool_round_completed(messages[_tool_results_start:]):
+                    # A dispatcher-owned terminal-review verdict is already
+                    # durably accepted by the host tool handler.  Do not make
+                    # an otherwise unnecessary model call merely to obtain a
+                    # text response after it consumes the final reserved call.
+                    agent._session_messages = messages
+                    _turn_exit_reason = "terminal_review_verdict"
+                    final_response = ""
                     break
 
                 # Reset per-turn retry counters after successful tool

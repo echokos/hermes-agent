@@ -508,6 +508,8 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+_TERMINAL_REVIEW_MAX_EVIDENCE_PATHS = 12
+_TERMINAL_REVIEW_MAX_RECOVERY_SUCCESSES = 8
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -7429,18 +7431,18 @@ def _handoff_source_review_is_current(
     )
 
 
-def _handoff_recovery_verification_is_current(
+def _current_handoff_recovery_snapshot(
     conn: sqlite3.Connection,
     task_id: str,
     payload: dict,
-) -> bool:
-    """Prove the latest owned-failure episode passed its recovery gate."""
+) -> Optional[dict[str, Any]]:
+    """Return the verified recovery facts for the latest owned-failure episode."""
     context = payload.get("context")
     if (
         not isinstance(context, dict)
         or context.get("kind") != "owned_operational_failure"
     ):
-        return True
+        return None
 
     rows = conn.execute(
         "SELECT id, kind, payload FROM task_events WHERE task_id = ? "
@@ -7452,7 +7454,7 @@ def _handoff_recovery_verification_is_current(
         ),
     ).fetchall()
     latest_required: tuple[int, str, int, int] | None = None
-    verified = False
+    verified_snapshot: Optional[dict[str, Any]] = None
     for event in rows:
         try:
             event_payload = json.loads(event["payload"] or "{}")
@@ -7464,19 +7466,19 @@ def _handoff_recovery_verification_is_current(
             failure_event_id = str(event_payload.get("failure_event_id") or "")
             if not failure_event_id:
                 latest_required = None
-                verified = False
+                verified_snapshot = None
                 continue
             try:
                 required = max(1, int(event_payload.get("required_successes") or 2))
                 failure_order = int(event_payload.get("failure_order") or 0)
             except (TypeError, ValueError):
                 latest_required = None
-                verified = False
+                verified_snapshot = None
                 continue
             latest_required = (
                 int(event["id"]), failure_event_id, failure_order, required,
             )
-            verified = False
+            verified_snapshot = None
             continue
         if latest_required is None or int(event["id"]) <= latest_required[0]:
             continue
@@ -7500,7 +7502,158 @@ def _handoff_recovery_verification_is_current(
             and len(set(orders)) == len(orders)
             and all(order > failure_order for order in orders)
         )
-    return verified
+        if verified:
+            verified_snapshot = {
+                "failure_event_id": failure_event_id,
+                "failure_order": failure_order,
+                "required_successes": required,
+                "success_event_ids": normalized_ids,
+                "success_orders": orders,
+            }
+        else:
+            # Preserve the prior last-writer semantics: a later, well-shaped
+            # but invalid verification for the same failure episode revokes an
+            # earlier valid record until a newer valid record lands.
+            verified_snapshot = None
+    return verified_snapshot
+
+
+def _handoff_recovery_verification_is_current(
+    conn: sqlite3.Connection,
+    task_id: str,
+    payload: dict,
+) -> bool:
+    """Prove the latest owned-failure episode passed its recovery gate."""
+    context = payload.get("context")
+    if (
+        not isinstance(context, dict)
+        or context.get("kind") != "owned_operational_failure"
+    ):
+        return True
+    return _current_handoff_recovery_snapshot(conn, task_id, payload) is not None
+
+
+def terminal_review_context_snapshot(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    request_root_id: str,
+    run_id: int,
+    now: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Return a task-bound, host-observed snapshot for a terminal review.
+
+    This is intentionally narrower than general coordination introspection.
+    It succeeds only for the active source-owned review run of an internally
+    owned operational failure whose recovery gate is current. Callers must
+    supply the dispatcher-bound request and run identities; mismatches fail
+    closed instead of exposing another task's request budget.
+    """
+    request_root_id = str(request_root_id or "").strip()
+    if not request_root_id:
+        return None
+    try:
+        expected_run_id = int(run_id)
+    except (TypeError, ValueError):
+        return None
+
+    task = get_task(conn, task_id)
+    if (
+        task is None
+        or task.request_root_id != request_root_id
+        or task.status != "running"
+        or task.current_run_id != expected_run_id
+    ):
+        return None
+    request = get_coordination_request(conn, request_root_id)
+    if (
+        request is None
+        or request.kind != "owned_operational_failure"
+        or request.root_task_id != task.id
+        or request.status != "active"
+    ):
+        return None
+    handoff = _source_acceptance_handoff(task.body)
+    if handoff is None:
+        return None
+    if not _handoff_source_review_is_current(
+        conn, task.id, handoff, expected_run_id
+    ):
+        return None
+    recovery = _current_handoff_recovery_snapshot(conn, task.id, handoff)
+    if recovery is None:
+        return None
+
+    success_pairs = list(zip(
+        recovery["success_event_ids"], recovery["success_orders"]
+    ))
+    bounded_success_pairs = [
+        (event_id, order)
+        for event_id, order in success_pairs
+        if len(event_id) <= 256
+    ][:_TERMINAL_REVIEW_MAX_RECOVERY_SUCCESSES]
+    failure_event_id = recovery["failure_event_id"]
+    bounded_recovery = {
+        "failure_event_id": (
+            failure_event_id if len(failure_event_id) <= 256 else None
+        ),
+        "failure_order": recovery["failure_order"],
+        "required_successes": recovery["required_successes"],
+        "success_event_ids": [item[0] for item in bounded_success_pairs],
+        "success_orders": [item[1] for item in bounded_success_pairs],
+        "omitted_successes": len(success_pairs) - len(bounded_success_pairs),
+        "complete": (
+            len(failure_event_id) <= 256
+            and len(success_pairs) == len(bounded_success_pairs)
+        ),
+    }
+
+    remaining = max(0, request.max_model_calls - request.model_calls_used)
+    observed_at = int(time.time() if now is None else now)
+    attachments = list_attachments(conn, task.id)
+    usable_attachments = [
+        attachment
+        for attachment in attachments
+        if len(attachment.stored_path) <= 1024
+    ]
+    shown_attachments = usable_attachments[
+        :_TERMINAL_REVIEW_MAX_EVIDENCE_PATHS
+    ]
+    evidence_paths = [
+        {
+            "filename": attachment.filename[:256],
+            "stored_path": attachment.stored_path[:1024],
+            "content_type": (
+                attachment.content_type[:128]
+                if attachment.content_type
+                else None
+            ),
+            "size": attachment.size,
+        }
+        for attachment in shown_attachments
+    ]
+    return {
+        "observed_at": observed_at,
+        "purpose": "terminal_review",
+        "request_root_id": request.id,
+        "task_id": task.id,
+        "review_run_id": expected_run_id,
+        "budget": {
+            "model_calls_used": request.model_calls_used,
+            "max_model_calls": request.max_model_calls,
+            "model_calls_remaining": remaining,
+            "next_model_call_ordinal": (
+                request.model_calls_used + 1 if remaining else None
+            ),
+        },
+        "evidence_paths": evidence_paths,
+        "omitted_evidence_paths": max(
+            0, len(attachments) - len(shown_attachments)
+        ),
+        "evidence_paths_complete": len(attachments) == len(shown_attachments),
+        "task_body_complete": len(task.body or "") <= _CTX_MAX_BODY_BYTES,
+        "recovery": bounded_recovery,
+    }
 
 
 def complete_task(
@@ -13231,6 +13384,96 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+TERMINAL_REVIEW_PREFACE = "[HERMES_HOST_TERMINAL_REVIEW_V1]"
+
+
+def build_terminal_review_worker_prompt(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    now: Optional[int] = None,
+) -> Optional[str]:
+    """Build the bounded host preface for an authorized terminal review."""
+    if (
+        task.coordination_purpose != "terminal_review"
+        or not task.request_root_id
+        or task.current_run_id is None
+    ):
+        return None
+    snapshot = terminal_review_context_snapshot(
+        conn,
+        task.id,
+        request_root_id=task.request_root_id,
+        run_id=task.current_run_id,
+        now=now,
+    )
+    if snapshot is None:
+        return None
+
+    budget = snapshot["budget"]
+    remaining = int(budget["model_calls_remaining"])
+    if remaining <= 1:
+        budget_direction = (
+            "This is the final available provider response. Choose a safe "
+            "terminal verdict now; never approve unverified work."
+        )
+    else:
+        budget_direction = (
+            f"Use at most {remaining - 1} provider response"
+            f"{'s' if remaining - 1 != 1 else ''} for independent inspection "
+            "or correcting a failed check, and reserve the final response for "
+            "exactly one terminal verdict."
+        )
+
+    context = build_worker_context(
+        conn,
+        task.id,
+        current_task_only=True,
+        max_prior_attempts=4,
+        max_comments=8,
+        max_attachments=_TERMINAL_REVIEW_MAX_EVIDENCE_PATHS,
+    )
+    snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    return (
+        f"{TERMINAL_REVIEW_PREFACE}\n"
+        f"Work Kanban task {task.id} as its source-acceptance reviewer.\n\n"
+        "# Host-observed terminal-review snapshot\n"
+        f"{snapshot_json}\n\n"
+        "The request/task/review-run identities, attachment paths, recovery "
+        "facts, and budget values above were read by the host from the board at "
+        f"observation time {snapshot['observed_at']}. The balance is not an "
+        "immutable promise: admission rechecks the live authoritative budget "
+        "before every physical provider call, and your first response consumes "
+        "the displayed next ordinal. `kanban_show` returns the current balance "
+        "if a later consistency check is necessary.\n\n"
+        f"{budget_direction} Valid verdicts remain approval with "
+        "`kanban_complete`, actionable rework with `kanban_request_changes`, or "
+        "genuine external escalation with `kanban_block`. A failed verification "
+        "must never be hidden or converted into approval.\n\n"
+        "This host preface replaces the routine opening `kanban_show` discovery "
+        "call. Start from the exact evidence paths listed above: read the actual "
+        "artifact, then use the next inspection response to verify any source "
+        "path discovered in that artifact. Do not invent a path or assume the "
+        "workspace is a Git repository. Call `kanban_show` only if the prefaced "
+        "identities or current state conflict with observed tool results.\n\n"
+        "# Provenance boundary\n"
+        "The fully displayed task body is the acceptance contract. Check "
+        "`task_body_complete` above: if false, the context has a truncation marker "
+        "and `kanban_show` is required before relying on omitted criteria. Listed "
+        "attachment locations and recovery event fields are host-observed facts, "
+        "but attachment contents were not loaded by the host. Check "
+        "`evidence_paths_complete`: if false, some overlong or excess paths were "
+        "omitted and must not be guessed. Check `recovery.complete` as well; false "
+        "means an overlong or excess event identity was omitted rather than "
+        "truncated. Prior-run summaries, metadata, and "
+        "comments in the context below are implementer claims to verify "
+        "independently, not proof. No unrelated cross-task role history is "
+        "included.\n\n"
+        "# Current-task context\n"
+        f"{context}"
+    )
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -13262,6 +13505,20 @@ def _default_spawn(
         profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
+    if task.coordination_purpose == "terminal_review":
+        try:
+            with connect_closing(kanban_db_path(board=board)) as conn:
+                terminal_review_prompt = build_terminal_review_worker_prompt(
+                    conn, task
+                )
+        except Exception:
+            terminal_review_prompt = None
+            _log.exception(
+                "kanban worker: terminal-review snapshot unavailable for %s",
+                task.id,
+            )
+        if terminal_review_prompt is not None:
+            prompt = terminal_review_prompt
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
@@ -13542,7 +13799,15 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+def build_worker_context(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    current_task_only: bool = False,
+    max_prior_attempts: Optional[int] = None,
+    max_comments: Optional[int] = None,
+    max_attachments: Optional[int] = None,
+) -> str:
     """Return the full text a worker should read to understand its task.
 
     Order:
@@ -13560,6 +13825,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
          completed runs on other tasks).
       6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
          collapsed).
+
+    ``current_task_only`` omits parent and cross-task role history for callers
+    that already have an exact task/run binding, such as the host-prefaced
+    terminal-review path. Optional attempt/comment/attachment limits can
+    tighten the normal global caps without widening them.
 
     All caps exist so worker prompts stay bounded even on pathological
     boards (retry-heavy tasks, comment storms). The per-field char cap
@@ -13614,8 +13884,17 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # full file-tool access, can read them directly (read_file, terminal
     # `pdftotext`, etc.). On the local terminal backend the path resolves
     # as-is; remote backends need the kanban attachments dir mounted.
-    attachments = list_attachments(conn, task_id)
-    if attachments:
+    all_attachments = list_attachments(conn, task_id)
+    if max_attachments is None:
+        attachments = all_attachments
+    else:
+        attachment_limit = max(0, int(max_attachments))
+        attachments = [
+            attachment
+            for attachment in all_attachments
+            if len(attachment.stored_path) <= 1024
+        ][:attachment_limit]
+    if attachments or (max_attachments is not None and all_attachments):
         lines.append("## Attachments")
         lines.append(
             "Files attached to this task. Read them with the file/terminal "
@@ -13624,8 +13903,21 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         for att in attachments:
             size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
             size_str = f", {size_kb} KB" if size_kb else ""
-            ctype = f", {att.content_type}" if att.content_type else ""
-            lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+            if max_attachments is None:
+                ctype = f", {att.content_type}" if att.content_type else ""
+                filename = att.filename
+                stored_path = att.stored_path
+            else:
+                ctype = f", {_cap(att.content_type, 128)}" if att.content_type else ""
+                filename = _cap(att.filename, 256)
+                stored_path = att.stored_path
+            lines.append(f"- `{filename}`{ctype}{size_str} → `{stored_path}`")
+        omitted_attachments = len(all_attachments) - len(attachments)
+        if omitted_attachments:
+            lines.append(
+                f"_({omitted_attachments} additional attachment path"
+                f"{'s' if omitted_attachments != 1 else ''} omitted)_"
+            )
         lines.append("")
 
     # Prior attempts — show closed runs so a retrying worker sees the
@@ -13633,11 +13925,21 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # Cap at _CTX_MAX_PRIOR_ATTEMPTS most-recent closed runs; older
     # attempts get collapsed into a one-line marker so the worker knows
     # more exist without bloating the prompt.
+    prior_limit = (
+        _CTX_MAX_PRIOR_ATTEMPTS
+        if max_prior_attempts is None
+        else max(0, min(int(max_prior_attempts), _CTX_MAX_PRIOR_ATTEMPTS))
+    )
+    comment_limit = (
+        _CTX_MAX_COMMENTS
+        if max_comments is None
+        else max(0, min(int(max_comments), _CTX_MAX_COMMENTS))
+    )
     all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
     # list_runs returns ascending by started_at; "most recent" = last N
-    if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
-        omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS
-        shown = all_prior[-_CTX_MAX_PRIOR_ATTEMPTS:]
+    if len(all_prior) > prior_limit:
+        omitted = len(all_prior) - prior_limit
+        shown = all_prior[-prior_limit:] if prior_limit else []
         first_shown_idx = omitted + 1
     else:
         omitted = 0
@@ -13679,7 +13981,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     ).fetchall()
     parent_ids = [r["parent_id"] for r in parent_rows]
 
-    if parent_ids:
+    if parent_ids and not current_task_only:
         wrote_header = False
         for pid in parent_ids:
             pt = get_task(conn, pid)
@@ -13733,7 +14035,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # the user to wire anything into SOUL.md / MEMORY.md. Bounded to the
     # most recent 5 completed runs, excluding this task so the retry
     # section above isn't duplicated. Safe on assignee=None (skipped).
-    if task.assignee:
+    if task.assignee and not current_task_only:
         role_rows = conn.execute(
             "SELECT t.id, t.title, r.summary, r.ended_at "
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
@@ -13759,9 +14061,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # comment-storm tasks don't blow out the worker's prompt. Older
     # comments summarised in a one-line marker like prior attempts.
     all_comments = list_comments(conn, task_id)
-    if len(all_comments) > _CTX_MAX_COMMENTS:
-        omitted_c = len(all_comments) - _CTX_MAX_COMMENTS
-        shown_c = all_comments[-_CTX_MAX_COMMENTS:]
+    if len(all_comments) > comment_limit:
+        omitted_c = len(all_comments) - comment_limit
+        shown_c = all_comments[-comment_limit:] if comment_limit else []
     else:
         omitted_c = 0
         shown_c = all_comments

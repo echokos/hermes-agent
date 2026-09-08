@@ -94,6 +94,26 @@ def test_no_nudge_after_successful_kanban_request_review(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_no_nudge_after_successful_kanban_request_changes(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "tool",
+            "name": "kanban_request_changes",
+            "tool_call_id": "1",
+            "content": {
+                "ok": True,
+                "task_id": "t_abc",
+                "status": "ready",
+                "implementer": "alina",
+            },
+        }
+    ]
+
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
 @pytest.mark.parametrize(
     "messages",
     [
@@ -134,6 +154,17 @@ def test_no_nudge_after_successful_kanban_request_review(clear_kanban_env):
         [
             {
                 "role": "tool",
+                "name": "kanban_request_changes",
+                "content": {
+                    "ok": True,
+                    "task_id": "t_abc",
+                    "status": "ready",
+                },
+            }
+        ],
+        [
+            {
+                "role": "tool",
                 "name": "kanban_request_review",
                 "content": {
                     "ok": True,
@@ -160,6 +191,7 @@ def test_no_nudge_after_successful_kanban_request_review(clear_kanban_env):
         "ok-false",
         "wrong-task",
         "wrong-status",
+        "request-changes-missing-implementer",
     ],
 )
 def test_failed_or_unobserved_terminal_call_still_nudges(
@@ -181,6 +213,5 @@ def test_failed_or_unobserved_terminal_call_still_nudges(
 # without a terminal call, the dispatcher's bounded retry (streak of 3)
 # handles it.  See also tests/hermes_cli/test_kanban_core_functionality.py
 # for the dispatcher-side streak tests.
-
 
 

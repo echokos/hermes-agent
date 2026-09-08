@@ -1188,6 +1188,92 @@ def _owned_failure_task(conn):
     )
 
 
+def _verified_terminal_review(conn, organization, *, work_calls: int = 17):
+    from datetime import datetime, timezone
+
+    from hermes_cli.workforce_handoffs import acknowledge_handoff, create_handoff
+
+    base = int(time.time())
+    iso = lambda value: datetime.fromtimestamp(value, timezone.utc).isoformat()
+    created = create_handoff(
+        conn,
+        source_agent="director",
+        target_agent="builder",
+        expected_outcome="Repair the failing scheduled workflow",
+        acceptance_test="Two distinct later executions succeed",
+        evidence_references=["workflow:scheduled-repair"],
+        acknowledgment_deadline=iso(base + 1_000),
+        checkpoint_at=iso(base + 2_000),
+        organization=organization,
+        context={
+            "kind": "owned_operational_failure",
+            "technical_owner": "builder",
+            "director": "director",
+            "workflow_id": "scheduled-repair",
+            "event_id": "failure-1",
+        },
+        requires_source_acceptance=True,
+    )
+    task_id = created["task_id"]
+    request = kb.create_owned_failure_coordination_request(
+        conn, root_task_id=task_id, organization=organization, now=base,
+    )
+    acknowledge_handoff(
+        conn, task_id, actor="builder", organization=organization, now=base + 1,
+    )
+    owner = kb.claim_task(conn, task_id, claimer="builder:test")
+    assert owner is not None
+    for ordinal in range(1, work_calls + 1):
+        assert kb.charge_coordination_model_call(
+            conn, request.id, purpose="work", task_id=task_id, now=base + 2,
+        ) == ordinal
+    kb.add_attachment(
+        conn,
+        task_id,
+        filename="repair-evidence.json",
+        stored_path="/evidence/repair-evidence.json",
+        content_type="application/json",
+        size=321,
+        uploaded_by="builder",
+    )
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn,
+            task_id,
+            "workforce_handoff_recovery_required",
+            {
+                "failure_event_id": "failure-1",
+                "failure_order": 10,
+                "required_successes": 2,
+            },
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "workforce_handoff_recovery_verified",
+            {
+                "failure_event_id": "failure-1",
+                "failure_order": 10,
+                "success_event_ids": ["success-1", "success-2"],
+                "success_orders": [11, 12],
+                "required_successes": 2,
+            },
+        )
+    assert kb.request_review(
+        conn,
+        task_id,
+        summary="Repair complete; verify the attached evidence",
+        metadata={"artifact": "/work/assigned.json"},
+        expected_run_id=owner.current_run_id,
+    )
+    reviewer, _ = kb.claim_task_for_dispatch(
+        conn, task_id, review=True, organization=organization, now=base + 200,
+    )
+    assert reviewer is not None
+    reviewer.coordination_purpose = "terminal_review"
+    return task_id, request, reviewer
+
+
 def test_owned_failure_factory_has_fixed_internal_caps_and_no_user_route(
     kanban_home, organization,
 ):
@@ -1273,6 +1359,293 @@ def test_owned_failure_factory_has_fixed_internal_caps_and_no_user_route(
             kb.charge_coordination_model_call(
                 conn, request.id, purpose="final_return", task_id=task_id,
             )
+
+
+def test_terminal_review_snapshot_and_spawn_query_are_host_bound(
+    kanban_home, organization, monkeypatch, tmp_path,
+):
+    import subprocess
+
+    with kb.connect_closing() as conn:
+        task_id, request, reviewer = _verified_terminal_review(conn, organization)
+        snapshot = kb.terminal_review_context_snapshot(
+            conn,
+            task_id,
+            request_root_id=request.id,
+            run_id=reviewer.current_run_id,
+            now=250,
+        )
+        assert snapshot is not None
+        assert snapshot["observed_at"] == 250
+        assert snapshot["budget"] == {
+            "model_calls_used": 17,
+            "max_model_calls": 20,
+            "model_calls_remaining": 3,
+            "next_model_call_ordinal": 18,
+        }
+        assert snapshot["evidence_paths"] == [{
+            "filename": "repair-evidence.json",
+            "stored_path": "/evidence/repair-evidence.json",
+            "content_type": "application/json",
+            "size": 321,
+        }]
+        assert snapshot["evidence_paths_complete"] is True
+        assert snapshot["recovery"]["success_event_ids"] == [
+            "success-1", "success-2",
+        ]
+
+        prompt = kb.build_terminal_review_worker_prompt(conn, reviewer, now=250)
+        assert prompt is not None
+        assert prompt.startswith(kb.TERMINAL_REVIEW_PREFACE)
+        assert '"model_calls_remaining": 3' in prompt
+        assert "/evidence/repair-evidence.json" in prompt
+        assert "implementer claims to verify independently" in prompt
+        assert "Do not invent a path" in prompt
+        assert "## Recent work by" not in prompt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(reviewer.current_run_id))
+    monkeypatch.setenv("HERMES_COORDINATION_REQUEST_ROOT", request.id)
+    monkeypatch.setenv("HERMES_COORDINATION_TASK_ID", task_id)
+    monkeypatch.setenv("HERMES_COORDINATION_PURPOSE", "terminal_review")
+    from tools import kanban_tools
+
+    shown = json.loads(kanban_tools._handle_show({}))
+    assert shown["coordination_budget"]["model_calls_used"] == 17
+    assert shown["coordination_budget"]["model_calls_remaining"] == 3
+    with kb.connect_closing() as conn:
+        assert kb.charge_coordination_model_call(
+            conn,
+            request.id,
+            purpose="terminal_review",
+            task_id=task_id,
+            now=251,
+        ) == 18
+    shown = json.loads(kanban_tools._handle_show({}))
+    assert shown["coordination_budget"]["model_calls_used"] == 18
+    assert shown["coordination_budget"]["model_calls_remaining"] == 2
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "review-workspace"
+    workspace.mkdir()
+    assert kb._default_spawn(reviewer, str(workspace)) == 4242
+    query = captured["cmd"][captured["cmd"].index("-q") + 1]
+    assert query.startswith(kb.TERMINAL_REVIEW_PREFACE)
+    assert captured["env"]["HERMES_COORDINATION_REQUEST_ROOT"] == request.id
+    assert captured["env"]["HERMES_COORDINATION_TASK_ID"] == task_id
+    assert captured["env"]["HERMES_COORDINATION_PURPOSE"] == "terminal_review"
+
+
+def test_terminal_review_prompt_reports_low_live_balance_without_forcing_approval(
+    kanban_home, organization,
+):
+    with kb.connect_closing() as conn:
+        task_id, request, reviewer = _verified_terminal_review(conn, organization)
+        for ordinal in (18, 19):
+            assert kb.charge_coordination_model_call(
+                conn,
+                request.id,
+                purpose="terminal_review",
+                task_id=task_id,
+                now=220,
+            ) == ordinal
+
+        prompt = kb.build_terminal_review_worker_prompt(conn, reviewer, now=221)
+        assert prompt is not None
+        assert '"model_calls_used": 19' in prompt
+        assert '"model_calls_remaining": 1' in prompt
+        assert "final available provider response" in prompt
+        assert "never approve unverified work" in prompt
+        assert "kanban_request_changes" in prompt
+        assert "kanban_block" in prompt
+
+
+def test_terminal_review_snapshot_fails_closed_on_missing_or_cross_task_scope(
+    kanban_home, organization, monkeypatch,
+):
+    with kb.connect_closing() as conn:
+        task_id, request, reviewer = _verified_terminal_review(conn, organization)
+        other_id = kb.create_task(conn, title="unrelated", assignee="director")
+
+        assert kb.terminal_review_context_snapshot(
+            conn,
+            other_id,
+            request_root_id=request.id,
+            run_id=reviewer.current_run_id,
+        ) is None
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(reviewer.current_run_id))
+        monkeypatch.setenv("HERMES_COORDINATION_REQUEST_ROOT", request.id)
+        monkeypatch.setenv("HERMES_COORDINATION_TASK_ID", task_id)
+        monkeypatch.setenv("HERMES_COORDINATION_PURPOSE", "terminal_review")
+        from tools import kanban_tools
+
+        cross_task_show = json.loads(
+            kanban_tools._handle_show({"task_id": other_id})
+        )
+        assert "coordination_budget" not in cross_task_show
+        assert kb.terminal_review_context_snapshot(
+            conn,
+            task_id,
+            request_root_id="wrong-root",
+            run_id=reviewer.current_run_id,
+        ) is None
+        assert kb.terminal_review_context_snapshot(
+            conn,
+            task_id,
+            request_root_id=request.id,
+            run_id=int(reviewer.current_run_id) + 1,
+        ) is None
+
+        conn.execute(
+            "UPDATE task_runs SET profile = 'builder' WHERE id = ?",
+            (reviewer.current_run_id,),
+        )
+        conn.commit()
+        assert kb.build_terminal_review_worker_prompt(conn, reviewer) is None
+
+        conn.execute(
+            "UPDATE task_runs SET profile = 'director' WHERE id = ?",
+            (reviewer.current_run_id,),
+        )
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id = ? "
+            "AND kind = 'workforce_handoff_recovery_verified'",
+            (task_id,),
+        )
+        conn.commit()
+        assert kb.build_terminal_review_worker_prompt(conn, reviewer) is None
+
+
+def test_non_owned_coordination_never_gets_terminal_review_preface(
+    kanban_home, organization,
+):
+    with kb.connect_closing() as conn:
+        task_id, request = _accept_request(conn, organization)
+        task = kb.claim_task(conn, task_id, claimer="aurora:test")
+        assert task is not None
+        task.coordination_purpose = "terminal_review"
+
+        assert request.kind == "origin_request"
+        assert kb.terminal_review_context_snapshot(
+            conn,
+            task_id,
+            request_root_id=request.id,
+            run_id=task.current_run_id,
+        ) is None
+        assert kb.build_terminal_review_worker_prompt(conn, task) is None
+
+
+def test_later_invalid_recovery_event_revokes_prior_verification(
+    kanban_home,
+):
+    with kb.connect_closing() as conn:
+        task_id = _owned_failure_task(conn)
+        handoff = json.loads(kb.get_task(conn, task_id).body)
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                task_id,
+                "workforce_handoff_recovery_required",
+                {
+                    "failure_event_id": "failure-1",
+                    "failure_order": 10,
+                    "required_successes": 2,
+                },
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "workforce_handoff_recovery_verified",
+                {
+                    "failure_event_id": "failure-1",
+                    "success_event_ids": ["success-1", "success-2"],
+                    "success_orders": [11, 12],
+                },
+            )
+        assert kb._handoff_recovery_verification_is_current(
+            conn, task_id, handoff
+        )
+
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                task_id,
+                "workforce_handoff_recovery_verified",
+                {
+                    "failure_event_id": "failure-1",
+                    "success_event_ids": ["same", "same"],
+                    "success_orders": [13, 14],
+                },
+            )
+        assert not kb._handoff_recovery_verification_is_current(
+            conn, task_id, handoff
+        )
+
+
+def test_terminal_review_snapshot_omits_overlong_identities_without_truncating(
+    kanban_home, organization,
+):
+    with kb.connect_closing() as conn:
+        task_id, request, reviewer = _verified_terminal_review(conn, organization)
+        for index in range(12):
+            kb.add_attachment(
+                conn,
+                task_id,
+                filename=f"evidence-{index}.json",
+                stored_path=f"/evidence/evidence-{index}.json",
+            )
+        overlong_path = "/evidence/" + ("x" * 1100)
+        kb.add_attachment(
+            conn,
+            task_id,
+            filename="overlong.json",
+            stored_path=overlong_path,
+        )
+        long_success_id = "s" * 300
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                task_id,
+                "workforce_handoff_recovery_verified",
+                {
+                    "failure_event_id": "failure-1",
+                    "success_event_ids": [long_success_id, "success-3"],
+                    "success_orders": [13, 14],
+                },
+            )
+
+        snapshot = kb.terminal_review_context_snapshot(
+            conn,
+            task_id,
+            request_root_id=request.id,
+            run_id=reviewer.current_run_id,
+        )
+        assert snapshot is not None
+        assert len(snapshot["evidence_paths"]) == 12
+        assert snapshot["omitted_evidence_paths"] == 2
+        assert snapshot["evidence_paths_complete"] is False
+        assert all(
+            item["stored_path"] != overlong_path
+            and not item["stored_path"].endswith("…")
+            for item in snapshot["evidence_paths"]
+        )
+        assert snapshot["recovery"]["success_event_ids"] == ["success-3"]
+        assert snapshot["recovery"]["omitted_successes"] == 1
+        assert snapshot["recovery"]["complete"] is False
+        assert long_success_id not in json.dumps(snapshot)
 
 
 def test_owned_failure_review_waits_for_recovery_then_launches_after_checkpoint(
