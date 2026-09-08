@@ -184,6 +184,54 @@ def test_sync_runbook_cron_jobs_persists_runtime_budgets() -> None:
     assert job["runtime_tool_budget"] == metadata["runtime"]["tool_budget"]
 
 
+def test_sync_runbook_cron_jobs_projects_trusted_dependency_ownership() -> None:
+    _save_runbook()
+    metadata = _metadata()
+    schedule = metadata["schedules"][0]
+    schedule["required_tool_dependencies"] = ["mcp__nirvana__get_tasks"]
+    schedule["failure_ownership"] = {
+        "technical_owner": "root",
+        "director": "aurora",
+        "return_outcome_to_origin": True,
+    }
+    runbook_store.save_runbook(
+        metadata,
+        "# Daily Brief\n\n## Procedure\n\n1. Collect context.\n",
+        approved_by="dashboard",
+    )
+
+    job = sync_runbook_cron_jobs("daily-brief")[0]
+
+    assert job["required_tool_dependencies"] == ["mcp__nirvana__get_tasks"]
+    assert job["failure_ownership"] == schedule["failure_ownership"]
+
+
+def test_omitted_runbook_ownership_does_not_clear_existing_metadata() -> None:
+    _save_runbook()
+    first_metadata = _metadata()
+    first_metadata["schedules"][0]["failure_ownership"] = {
+        "technical_owner": "root",
+        "director": "aurora",
+        "return_outcome_to_origin": True,
+    }
+    runbook_store.save_runbook(
+        first_metadata,
+        "# Daily Brief\n",
+        approved_by="dashboard",
+    )
+    first = sync_runbook_cron_jobs("daily-brief")[0]
+
+    runbook_store.save_runbook(
+        _metadata(),
+        "# Daily Brief\n",
+        approved_by="dashboard",
+    )
+    second = sync_runbook_cron_jobs("daily-brief")[0]
+
+    assert second["id"] == first["id"]
+    assert second["failure_ownership"] == first["failure_ownership"]
+
+
 def test_link_existing_cron_job_only_adds_registry_identity() -> None:
     _save_runbook()
     from cron import jobs as cron_jobs

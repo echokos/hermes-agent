@@ -5715,14 +5715,50 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     ``handler(args_dict, **kwargs) -> str``
     """
 
+    dependency_name = mcp_prefixed_tool_name(server_name, tool_name)
+
+    def _dependency_failure(result: str, attempt: Any, reason: str) -> str:
+        from tools.required_dependency_runtime import mark_failure
+
+        mark_failure(attempt, reason)
+        return result
+
+    def _dependency_result(
+        result: str,
+        attempt: Any,
+        typed_outcome: Optional[str],
+        fallback_reason: str,
+    ) -> str:
+        from tools.required_dependency_runtime import mark_failure, mark_success
+
+        if typed_outcome == "success":
+            mark_success(attempt)
+        else:
+            mark_failure(
+                attempt,
+                typed_outcome or fallback_reason,
+            )
+        return result
+
     def _handler(args: dict, **kwargs) -> str:
+        from tools.required_dependency_runtime import mark_pending
+
+        dependency_attempt = mark_pending(dependency_name, args)
+        typed_outcome: List[Optional[str]] = [None]
+
+        def _typed(result: str, outcome: str) -> str:
+            typed_outcome[0] = outcome
+            return result
+
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
         # first-use spawn below. A denied call never touches the server.
         gate_error = _trust_gate_check(server_name, tool_name)
         if gate_error is not None:
-            return gate_error
+            return _dependency_failure(
+                gate_error, dependency_attempt, "policy_denied"
+            )
 
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
@@ -5739,19 +5775,27 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             age = time.monotonic() - opened_at
             if age < _CIRCUIT_BREAKER_COOLDOWN_SEC:
                 remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
-                return tool_error(
-                    f"MCP server '{server_name}' is unreachable after "
-                    f"{_server_error_counts[server_name]} consecutive "
-                    f"failures. Auto-retry available in ~{remaining}s. "
-                    f"Do NOT retry this tool yet — use alternative "
-                    f"approaches or ask the user to check the MCP server."
+                return _dependency_failure(
+                    tool_error(
+                        f"MCP server '{server_name}' is unreachable after "
+                        f"{_server_error_counts[server_name]} consecutive "
+                        f"failures. Auto-retry available in ~{remaining}s. "
+                        f"Do NOT retry this tool yet — use alternative "
+                        f"approaches or ask the user to check the MCP server."
+                    ),
+                    dependency_attempt,
+                    "circuit_open",
                 )
             # Cooldown elapsed → fall through as a half-open probe.
 
         server = _get_connected_server_for_call(server_name)
         if not server:
             _bump_server_error(server_name)
-            return tool_error(f"MCP server '{server_name}' is not connected")
+            return _dependency_failure(
+                tool_error(f"MCP server '{server_name}' is not connected"),
+                dependency_attempt,
+                "transport_unavailable",
+            )
 
         if not server.session:
             # No live session. A reconnect may already be completing (the
@@ -5776,12 +5820,20 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # _reset_server_error).
                 _bump_server_error(server_name)
                 if _signal_reconnect(server):
-                    return tool_error(
-                        f"MCP server '{server_name}' transport is down; "
-                        f"reconnect requested. Do NOT retry this tool "
-                        f"immediately — give it a few seconds to come back."
+                    return _dependency_failure(
+                        tool_error(
+                            f"MCP server '{server_name}' transport is down; "
+                            f"reconnect requested. Do NOT retry this tool "
+                            f"immediately — give it a few seconds to come back."
+                        ),
+                        dependency_attempt,
+                        "transport_unavailable",
                     )
-                return tool_error(f"MCP server '{server_name}' is not connected")
+                return _dependency_failure(
+                    tool_error(f"MCP server '{server_name}' is not connected"),
+                    dependency_attempt,
+                    "transport_unavailable",
+                )
 
         async def _call():
             _mark_server_call_started(server)
@@ -5815,9 +5867,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     res_text = getattr(getattr(block, "resource", None), "text", None)
                     if res_text:
                         error_text += str(res_text)
-                return tool_error(_sanitize_error(
-                    error_text or "MCP tool returned an error"
-                ))
+                return _typed(
+                    tool_error(_sanitize_error(
+                        error_text or "MCP tool returned an error"
+                    )),
+                    "tool_error",
+                )
 
             # Collect text from content blocks. MCP tool results can also
             # include ImageContent blocks (screenshot / Blockbench / Playwright
@@ -5900,14 +5955,21 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 if "result" not in payload:
                     payload["result"] = text_result
                 try:
-                    return json.dumps(payload, ensure_ascii=False)
+                    return _typed(json.dumps(payload, ensure_ascii=False), "success")
                 except (TypeError, ValueError):
                     # Non-serializable metadata: drop the extras rather than
                     # failing the whole tool call.
-                    return json.dumps({"result": text_result}, ensure_ascii=False)
-            return json.dumps({"result": text_result}, ensure_ascii=False)
+                    return _typed(
+                        json.dumps({"result": text_result}, ensure_ascii=False),
+                        "success",
+                    )
+            return _typed(
+                json.dumps({"result": text_result}, ensure_ascii=False),
+                "success",
+            )
 
         def _call_once():
+            typed_outcome[0] = None
             return _run_on_mcp_loop(_call, timeout=tool_timeout)
 
         try:
@@ -5921,9 +5983,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     _reset_server_error(server_name)  # success — reset
             except (json.JSONDecodeError, TypeError):
                 _reset_server_error(server_name)  # non-JSON = success
-            return result
+            return _dependency_result(
+                result, dependency_attempt, typed_outcome[0], "untyped_result"
+            )
         except InterruptedError:
-            return _interrupted_call_result()
+            return _dependency_failure(
+                _interrupted_call_result(), dependency_attempt, "interrupted"
+            )
         except Exception as exc:
             # Auth-specific recovery path: consult the manager, signal
             # reconnect if viable, retry once. Returns None to fall
@@ -5933,7 +5999,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
-                return recovered
+                return _dependency_result(
+                    recovered, dependency_attempt, typed_outcome[0], "auth_error"
+                )
 
             # Transport session expiry (#13383): same reconnect flow
             # but skips OAuth recovery because the access token is
@@ -5943,16 +6011,22 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
-                return recovered
+                return _dependency_result(
+                    recovered, dependency_attempt, typed_outcome[0], "session_error"
+                )
 
             _bump_server_error(server_name)
             logger.error(
                 "MCP tool %s/%s call failed: %s",
                 server_name, tool_name, exc,
             )
-            return tool_error(_sanitize_error(
-                f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
-            ))
+            return _dependency_failure(
+                tool_error(_sanitize_error(
+                    f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
+                )),
+                dependency_attempt,
+                "transport_error",
+            )
 
     return _handler
 

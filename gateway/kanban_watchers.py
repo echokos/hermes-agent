@@ -309,6 +309,33 @@ class GatewayKanbanWatchersMixin:
                 self._kanban_pickup_owned_failure(pickup),
                 name=f"kanban-handoff-pickup:{profile}",
             )
+        from gateway.operational_outcomes import operational_outcome_profiles
+        outcome_profiles = await asyncio.to_thread(operational_outcome_profiles, idle_profiles.difference(jobs))
+        for profile in sorted(outcome_profiles):
+            jobs[profile] = asyncio.create_task(
+                self._kanban_deliver_operational_outcomes(profile),
+                name=f"kanban-operational-outcomes:{profile}",
+            )
+
+    async def _kanban_deliver_operational_outcomes(self, profile: str) -> None:
+        from gateway.config import Platform
+        from gateway.operational_outcomes import collect_operational_outcomes, deliver_operational_outcome
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.profiles import get_profile_dir
+
+        cursors = getattr(self, "_operational_outcome_cursors", None)
+        if cursors is None:
+            cursors = self._operational_outcome_cursors = {}
+        with _profile_runtime_scope(get_profile_dir(profile)):
+            outcomes, cursor = await asyncio.to_thread(collect_operational_outcomes, profile, cursors.get(profile, 0))
+            for outcome in outcomes[:8]:
+                try:
+                    adapter = self._authorization_adapter(Platform(outcome["route"]["platform"]), profile)
+                    if adapter is not None:
+                        await deliver_operational_outcome(outcome, adapter)
+                except Exception:
+                    logger.warning("operational outcome delivery withheld for profile %s", profile)
+            cursors[profile] = cursor
 
     async def _kanban_pickup_owned_failure(self, pickup: dict) -> None:
         from hermes_cli.workforce_handoff_pickup import run_workforce_handoff_pickup

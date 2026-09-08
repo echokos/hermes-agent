@@ -156,7 +156,8 @@ def _ledger_intake_events(
     append fails but the scheduler later terminalizes its execution row, this
     projection recovers the event on the next monitor pass. Event identity is
     execution-scoped, so a normally appended row and its ledger projection
-    collapse to one event.
+    collapse to one event. Dependency-aware recovery requires producer intake:
+    the execution ledger records artifact completion, not dependency health.
     """
     database = profile / "cron" / "executions.db"
     if not database.is_file():
@@ -224,6 +225,10 @@ def _ledger_intake_events(
     for row in rows:
         values = dict(row)
         status = str(values.get("status") or "")
+        if status == "completed" and job.get("required_tool_dependencies"):
+            # The cursor above still advances across skipped completion rows.
+            # Only the producer's frozen dependency observation proves recovery.
+            continue
         outcome = "recovered" if status == "completed" else "failure"
         error = (
             "scheduler execution completed"
@@ -550,6 +555,8 @@ def _record_intake_failure(
         ),
         "ownership_errors": ownership_errors + list(event.get("missing_fields") or []),
     }
+    if isinstance(event.get("outcome_notice"), dict):
+        context["outcome_notice"] = event["outcome_notice"]
     ack_deadline = int(event.get("ack_deadline") or int(time.time()) + 900)
     checkpoint_at = int(event.get("checkpoint_at") or int(time.time()) + 3600)
     if checkpoint_at <= ack_deadline:
@@ -979,7 +986,11 @@ def run(*, organization: Path, database: Path, state_path: Path) -> dict[str, An
                         row["last_seen_at"] = now
                     continue
 
-                if row.get("status") == "active" and _two_recent_successes(profile, job_id):
+                if (
+                    row.get("status") == "active"
+                    and not job.get("required_tool_dependencies")
+                    and _two_recent_successes(profile, job_id)
+                ):
                     task_id = str(row.get("task_id") or "")
                     task = kanban_db.get_task(conn, task_id) if task_id else None
                     if task:
