@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - exercised on POSIX CI
     msvcrt = None
 
 from agent.redact import redact_sensitive_text
+from hermes_constants import get_default_hermes_root
 
 
 INTAKE_FILENAME = "operational-failures.jsonl"
@@ -258,12 +259,21 @@ def append_profile_failure(
     failure_type: str = "execution",
     dependency_outcome: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    profile_path = Path(profile_home).expanduser()
+    try:
+        source_scope = (
+            "default"
+            if profile_path.resolve() == get_default_hermes_root().expanduser().resolve()
+            else profile_path.name
+        )
+    except (OSError, RuntimeError):
+        source_scope = profile_path.name
     event = profile_failure_event(
         job,
         error,
         execution_id=execution_id,
         outcome=outcome,
-        source_scope=Path(profile_home).name,
+        source_scope=source_scope,
         occurred_at=occurred_at,
         failure_type=failure_type,
         dependency_outcome=dependency_outcome,
