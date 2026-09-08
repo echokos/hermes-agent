@@ -6273,6 +6273,10 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if ctx.direct_agent_photo_request_text is not None:
+                _conversation_kwargs["direct_agent_photo_request_text"] = (
+                    ctx.direct_agent_photo_request_text
+                )
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -19996,6 +20000,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                direct_agent_photo_request_text=(
+                    getattr(event, "agent_photo_request_text", None)
+                    if (
+                        not getattr(event, "internal", False)
+                        and getattr(event, "allow_gateway_control", True)
+                        and not getattr(source, "is_bot", False)
+                        and source.platform
+                        in {Platform.TELEGRAM, Platform.MATRIX, Platform.VOICE}
+                    )
+                    else None
+                ),
                 message_type=event.message_type,
                 coordination_context=_final_return_context,
             )
@@ -27741,6 +27756,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        direct_agent_photo_request_text: Optional[str] = None,
         message_type: Optional[str] = None,
         coordination_context: Optional[dict[str, str]] = None,
     ) -> Dict[str, Any]:
@@ -27762,6 +27778,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                direct_agent_photo_request_text=direct_agent_photo_request_text,
                 message_type=message_type,
                 coordination_context=coordination_context,
             )
@@ -27776,6 +27793,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                direct_agent_photo_request_text=direct_agent_photo_request_text,
                 message_type=message_type,
                 coordination_context=coordination_context,
             )
@@ -27920,6 +27938,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        direct_agent_photo_request_text: Optional[str] = None,
         message_type: Optional[str] = None,
         coordination_context: Optional[dict[str, str]] = None,
     ) -> Dict[str, Any]:
@@ -28250,6 +28269,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            direct_agent_photo_request_text=direct_agent_photo_request_text,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         turn_ctx.coordination_context = coordination_context

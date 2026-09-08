@@ -3232,6 +3232,10 @@ class AIAgent:
                     )
             event.set()
 
+        from agent.agent_photo_request import revoke_agent_photo_request_runs
+
+        revoke_agent_photo_request_runs(self)
+
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
             with _redirect_lock:
@@ -3403,6 +3407,9 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        from agent.agent_photo_request import revoke_agent_photo_request_runs
+
+        revoke_agent_photo_request_runs(self)
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
@@ -3410,12 +3417,13 @@ class AIAgent:
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
-            return True
-        with _lock:
-            if self._pending_steer:
-                self._pending_steer = self._pending_steer + "\n" + cleaned
-            else:
-                self._pending_steer = cleaned
+        else:
+            with _lock:
+                if self._pending_steer:
+                    self._pending_steer = self._pending_steer + "\n" + cleaned
+                else:
+                    self._pending_steer = cleaned
+
         return True
 
     def redirect(self, text: str) -> bool:
@@ -3450,10 +3458,17 @@ class AIAgent:
                 elif self._interrupt_requested:
                     return False
                 try:
-                    return bool(_native_steer(cleaned))
+                    accepted = bool(_native_steer(cleaned))
                 except Exception:
                     logger.debug("Codex app-server turn/steer failed", exc_info=True)
                     return False
+                if accepted:
+                    from agent.agent_photo_request import (
+                        revoke_agent_photo_request_runs,
+                    )
+
+                    revoke_agent_photo_request_runs(self)
+                return accepted
 
         # Never kill a tool merely to deliver conversational guidance. The
         # existing steer drain puts it on the final tool result before the next
@@ -3469,6 +3484,9 @@ class AIAgent:
             existing = getattr(self, "_pending_redirect", None)
             if self._interrupt_requested and not existing:
                 return False
+            from agent.agent_photo_request import revoke_agent_photo_request_runs
+
+            revoke_agent_photo_request_runs(self)
             self._pending_redirect = (
                 f"{existing}\n\n[Additional user correction]\n{cleaned}"
                 if existing
@@ -3484,6 +3502,9 @@ class AIAgent:
                     return False
                 if self._interrupt_requested and not self._pending_redirect:
                     return False
+                from agent.agent_photo_request import revoke_agent_photo_request_runs
+
+                revoke_agent_photo_request_runs(self)
                 if self._pending_redirect:
                     self._pending_redirect = (
                         f"{self._pending_redirect}\n\n"
@@ -8359,6 +8380,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        direct_agent_photo_request_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -8405,6 +8427,14 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        from agent.agent_photo_request import (
+            finish_agent_photo_request_run,
+            start_agent_photo_request_run,
+        )
+
+        agent_photo_request_run, agent_photo_request_token = (
+            start_agent_photo_request_run(self)
+        )
 
         def _stop_durable_turn_lease_refresher() -> None:
             nonlocal durable_turn_lease_turn_active
@@ -8730,6 +8760,8 @@ class AIAgent:
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
+                        direct_agent_photo_request_text=direct_agent_photo_request_text,
+                        _agent_photo_request_run=agent_photo_request_run,
                     )
                 finally:
                     # The lease remains held through relay/task finalization, but
@@ -8771,6 +8803,11 @@ class AIAgent:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            finish_agent_photo_request_run(
+                self,
+                agent_photo_request_run,
+                agent_photo_request_token,
+            )
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(

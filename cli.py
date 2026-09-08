@@ -4810,6 +4810,40 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _InteractiveCLIInputMessage(str):
+    """Typed TTY input carrying its pre-enrichment authorization text."""
+
+    def __new__(cls, text: str, agent_photo_request_text: str):
+        instance = super().__new__(cls, text)
+        instance.agent_photo_request_text = agent_photo_request_text
+        return instance
+
+
+def _interactive_cli_agent_photo_request_text(text: Any, *, has_images: bool) -> Optional[str]:
+    """Return raw typed text only for a genuine interactive chat submission."""
+    if not isinstance(text, str) or not text.strip() or has_images:
+        return None
+    if getattr(sys.stdin, "isatty", lambda: False)() is not True:
+        return None
+    if getattr(sys.stdout, "isatty", lambda: False)() is not True:
+        return None
+    if os.environ.get("HERMES_SINGLE_QUERY_SESSION") == "1":
+        return None
+    clean = text.strip()
+    if clean.startswith("!") or _looks_like_slash_command(clean):
+        return None
+    if re.search(r"\[Pasted text #\d+:", clean):
+        return None
+    return clean
+
+
+def _coalesce_interrupted_cli_inputs(parts: list[Any]) -> Any:
+    """Preserve one typed input's origin marker; merged inputs are synthetic."""
+    if len(parts) == 1:
+        return parts[0]
+    return "\n".join(str(part) for part in parts)
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -15326,7 +15360,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: list = None,
+        voice_input: bool = False,
+        _direct_agent_photo_request_text: Optional[str] = None,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -15688,6 +15728,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
+                        direct_agent_photo_request_text=(
+                            _direct_agent_photo_request_text
+                            if not voice_input
+                            and not getattr(self, "_single_query_mode", False)
+                            else None
+                        ),
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
@@ -16133,9 +16179,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             all_parts.append(extra)
                     except queue.Empty:
                         break
-                combined = "\n".join(all_parts)
                 n = len(all_parts)
-                preview = combined[:50] + ("..." if len(combined) > 50 else "")
+                combined = _coalesce_interrupted_cli_inputs(all_parts)
+                combined_text = str(combined)
+                preview = combined_text[:50] + (
+                    "..." if len(combined_text) > 50 else ""
+                )
                 if n > 1:
                     print(f"\n⚡ Sending {n} messages after interrupt: '{preview}'")
                 else:
@@ -17104,7 +17153,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._attached_images.clear()
                 event.app.invalidate()
                 # Bundle text + images as a tuple when images are present
-                payload = (text, images) if images else text
+                direct_agent_photo_request_text = (
+                    _interactive_cli_agent_photo_request_text(
+                        text,
+                        has_images=bool(images),
+                    )
+                    if not getattr(self, "_single_query_mode", False)
+                    else None
+                )
+                queued_text = (
+                    _InteractiveCLIInputMessage(
+                        text,
+                        direct_agent_photo_request_text,
+                    )
+                    if direct_agent_photo_request_text is not None
+                    else text
+                )
+                payload = (queued_text, images) if images else queued_text
                 # A bang command is treated like a slash command while the
                 # agent is busy: it must never be routed into steer/redirect
                 # (which would inject `!git status` into the model's context as
@@ -19072,6 +19137,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if is_voice_input:
                         user_input = user_input.text
 
+                    direct_agent_photo_request_text = None
+
                     if not user_input:
                         continue
 
@@ -19083,6 +19150,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     submit_images = []
                     if isinstance(user_input, tuple):
                         user_input, submit_images = user_input
+
+                    if isinstance(user_input, _InteractiveCLIInputMessage):
+                        direct_agent_photo_request_text = (
+                            user_input.agent_photo_request_text
+                        )
+                        user_input = str(user_input)
 
                     if isinstance(user_input, str):
                         user_input = _strip_leaked_bracketed_paste_wrappers(user_input)
@@ -19186,7 +19259,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            _direct_agent_photo_request_text=(
+                                direct_agent_photo_request_text
+                            ),
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

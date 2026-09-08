@@ -3726,7 +3726,13 @@ class MatrixAdapter(BasePlatformAdapter):
             )
         elif msgtype in ("m.text", "m.notice"):
             await self._handle_text_message(
-                room_id, sender, event_id, event_ts, source_content, relates_to
+                room_id,
+                sender,
+                event_id,
+                event_ts,
+                source_content,
+                relates_to,
+                msgtype=msgtype,
             )
 
     async def _resolve_message_context(
@@ -4079,6 +4085,8 @@ class MatrixAdapter(BasePlatformAdapter):
         event_ts: float,
         source_content: dict,
         relates_to: dict,
+        *,
+        msgtype: str = "m.text",
     ) -> None:
         """Process a text message event."""
         body = source_content.get("body", "") or ""
@@ -4128,6 +4136,22 @@ class MatrixAdapter(BasePlatformAdapter):
         # is treated as a command, matching how ``/command`` is recognized below.
         body = _normalize_matrix_bang_command(body)
 
+        agent_photo_request_text = None
+        coordination_senders = {
+            str(peer.get("matrixUserId") or "")
+            for peer in self._coordination_participants()
+            if isinstance(peer, dict)
+        }
+        if (
+            msgtype == "m.text"
+            and not body.startswith("/")
+            and sender not in coordination_senders
+            and not self._is_self_sender(sender)
+            and not self._is_system_or_bridge_sender(sender)
+            and not self._matches_ignored_user_pattern(sender)
+        ):
+            agent_photo_request_text = body.strip() or None
+
         formatted_body = source_content.get("formatted_body")
         mentions_block = source_content.get("m.mentions") or {}
         mention_user_ids = (
@@ -4174,6 +4198,7 @@ class MatrixAdapter(BasePlatformAdapter):
             # top-level fields. Mirror them so matrix matches signal/slack.
             user_id=sender,
             user_name=display_name,
+            agent_photo_request_text=agent_photo_request_text,
         )
 
         msg_event = self._apply_matrix_group_observe_attribution(msg_event)
@@ -5017,6 +5042,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 existing.text = (
                     f"{existing.text}\n{event.text}" if existing.text else event.text
                 )
+            existing.agent_photo_request_text = None
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)

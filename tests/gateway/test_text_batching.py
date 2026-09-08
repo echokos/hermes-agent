@@ -134,10 +134,14 @@ class TestMatrixTextBatching:
     @pytest.mark.asyncio
     async def test_split_messages_aggregated(self):
         adapter = _make_matrix_adapter()
+        first = _make_event("first part", Platform.MATRIX)
+        first.agent_photo_request_text = "first part"
+        second = _make_event("second part", Platform.MATRIX)
+        second.agent_photo_request_text = "second part"
 
-        adapter._enqueue_text_event(_make_event("first part", Platform.MATRIX))
+        adapter._enqueue_text_event(first)
         await asyncio.sleep(0.02)
-        adapter._enqueue_text_event(_make_event("second part", Platform.MATRIX))
+        adapter._enqueue_text_event(second)
 
         adapter.handle_message.assert_not_called()
         await asyncio.sleep(0.2)
@@ -146,6 +150,7 @@ class TestMatrixTextBatching:
         text = adapter.handle_message.call_args[0][0].text
         assert "first part" in text
         assert "second part" in text
+        assert adapter.handle_message.call_args[0][0].agent_photo_request_text is None
 
 
 # =====================================================================
@@ -272,5 +277,4 @@ class TestFeishuAdaptiveDelay:
 
         await asyncio.sleep(0.15)
         adapter._handle_message_with_guards.assert_called_once()
-
 

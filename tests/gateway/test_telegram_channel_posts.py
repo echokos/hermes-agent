@@ -145,5 +145,5 @@ def test_build_message_event_uses_channel_identity_for_channel_posts(telegram_ad
     assert event.source.user_id == "-1003950368353"
     assert event.source.user_name == "wzrd"
     assert event.platform_update_id == 12345
-
+    assert event.agent_photo_request_text is None
 

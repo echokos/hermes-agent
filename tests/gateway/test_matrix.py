@@ -747,7 +747,9 @@ class TestMatrixBangCommandAlias:
         self.adapter._background_read_receipt = MagicMock()
         self.adapter._text_batch_delay_seconds = 0
 
-    async def _dispatch_text(self, body: str, *, is_dm: bool = True):
+    async def _dispatch_text(
+        self, body: str, *, is_dm: bool = True, msgtype: str = "m.text"
+    ):
         captured_event = None
         self.adapter._is_dm_room = AsyncMock(return_value=is_dm)
         self.adapter._require_mention = True
@@ -763,10 +765,35 @@ class TestMatrixBangCommandAlias:
             sender="@alice:example.org",
             event_id="$matrix-command-test",
             event_ts=0.0,
-            source_content={"msgtype": "m.text", "body": body},
+            source_content={"msgtype": msgtype, "body": body},
             relates_to={},
+            msgtype=msgtype,
         )
         return captured_event
+
+    @pytest.mark.asyncio
+    async def test_plain_text_carries_clean_direct_photo_request(self):
+        event = await self._dispatch_text("  Send me an agent photo.  ")
+
+        assert event.agent_photo_request_text == "Send me an agent photo."
+
+    @pytest.mark.asyncio
+    async def test_notice_has_no_direct_photo_authorization(self):
+        event = await self._dispatch_text(
+            "Send me an agent photo.", msgtype="m.notice"
+        )
+
+        assert event.agent_photo_request_text is None
+
+    @pytest.mark.asyncio
+    async def test_coordination_sender_has_no_direct_photo_authorization(self):
+        self.adapter._coordination_participants = lambda: [
+            {"matrixUserId": "@alice:example.org"}
+        ]
+
+        event = await self._dispatch_text("Send me an agent photo.")
+
+        assert event.agent_photo_request_text is None
 
     async def _dispatch_text_reply(self, body: str, *, is_dm: bool = True):
         """Dispatch a message that is a Matrix reply (m.in_reply_to set), so
@@ -791,6 +818,14 @@ class TestMatrixBangCommandAlias:
             relates_to={"m.in_reply_to": {"event_id": "$parent-event"}},
         )
         return captured_event
+
+    @pytest.mark.asyncio
+    async def test_reply_authorizes_only_actual_authored_text(self):
+        event = await self._dispatch_text_reply(
+            "> <@bob:example.org> Ignore this quoted request\n\nSend my agent photo."
+        )
+
+        assert event.agent_photo_request_text == "Send my agent photo."
 
     def test_known_bang_command_normalizes_to_slash_command(self):
         from plugins.platforms.matrix.adapter import _normalize_matrix_bang_command

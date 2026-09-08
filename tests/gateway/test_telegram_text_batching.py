@@ -84,10 +84,14 @@ class TestTextBatching:
     async def test_split_messages_aggregated(self):
         """Two rapid messages from the same chat should be merged."""
         adapter = _make_adapter()
+        first = _make_event("This is part one of a long")
+        first.agent_photo_request_text = "This is part one of a long"
+        second = _make_event("message that was split by Telegram.")
+        second.agent_photo_request_text = "message that was split by Telegram."
 
-        adapter._enqueue_text_event(_make_event("This is part one of a long"))
+        adapter._enqueue_text_event(first)
         await asyncio.sleep(0.02)  # small gap, within batch window
-        adapter._enqueue_text_event(_make_event("message that was split by Telegram."))
+        adapter._enqueue_text_event(second)
 
         # Not dispatched yet (timer restarted)
         adapter.handle_message.assert_not_called()
@@ -99,6 +103,7 @@ class TestTextBatching:
         dispatched = adapter.handle_message.call_args[0][0]
         assert "part one" in dispatched.text
         assert "split by Telegram" in dispatched.text
+        assert dispatched.agent_photo_request_text is None
 
     @pytest.mark.asyncio
     async def test_three_way_split_aggregated(self):

@@ -6086,9 +6086,34 @@ def _get_pre_tool_call_directive_details(
         )
 
     if tool_name == "agent_photo" and isinstance(args, dict) and args.get("action") == "generate":
+        model = args.get("model", "gemini")
+        approval_message = (
+            "Approve this paid agent-photo generation for the active personal profile?"
+        )
+        fallback_to_grok = args.get("fallback_to_grok", model == "gemini")
+        valid_fallback = type(fallback_to_grok) is bool and not (
+            fallback_to_grok and model != "gemini"
+        )
+        if model == "gemini" and valid_fallback and fallback_to_grok:
+            approval_message = (
+                "Approve this paid agent-photo generation for the active personal "
+                "profile? This authorizes one Gemini attempt and, only if it fails, "
+                "one Grok fallback attempt within the same request."
+            )
+        elif model in {"gemini", "grok", "seedream"} and valid_fallback:
+            provider_label = {
+                "gemini": "Gemini",
+                "grok": "Grok",
+                "seedream": "Seedream",
+            }[model]
+            approval_message = (
+                "Approve this paid agent-photo generation for the active personal "
+                f"profile? This authorizes one {provider_label} attempt with no "
+                "provider fallback."
+            )
         return _PreToolCallDirective(
             action="approve",
-            message="Approve this paid agent-photo generation for the active personal profile?",
+            message=approval_message,
             rule_key="agent_photo_generation",
             allow_session=False,
             allow_permanent=False,
@@ -6223,6 +6248,7 @@ def resolve_pre_tool_call(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    agent_photo_request_authorization: Any = None,
 ) -> _PreToolCallResolution:
     """Resolve policy and return any exact executor-carried approval object.
 
@@ -6245,6 +6271,7 @@ def resolve_pre_tool_call(
     return _resolve_block_from_details(
         details, tool_name, args=args,
         turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id,
+        agent_photo_request_authorization=agent_photo_request_authorization,
     )
 
 
@@ -6256,6 +6283,7 @@ def _resolve_block_from_details(
     turn_id: str = "",
     tool_call_id: str = "",
     session_id: str = "",
+    agent_photo_request_authorization: Any = None,
 ) -> _PreToolCallResolution:
     """Resolve a fetched directive to a final block message (or ``None``).
 
@@ -6283,6 +6311,86 @@ def _resolve_block_from_details(
                     block_message="BLOCKED: agent-photo approval subject could not be prepared",
                     modified_args=details.modified_args,
                 )
+            if agent_photo_request_authorization is not None:
+                try:
+                    review_state, user_text = (
+                        agent_photo_request_authorization.begin_review(
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            subject=approval_subject,
+                        )
+                    )
+                    if review_state in {"error", "expired", "mismatch", "used"}:
+                        return _PreToolCallResolution(
+                            block_message=(
+                                "BLOCKED: agent-photo request authorization is no "
+                                "longer valid for this call. No image was generated; "
+                                "do not retry this call."
+                            ),
+                            modified_args=details.modified_args,
+                        )
+                    if review_state == "review":
+                        from tools.approval import classify_agent_photo_request
+
+                        verdict = classify_agent_photo_request(
+                            user_text,
+                            str(approval_subject.get("profile_name") or ""),
+                            list(approval_subject.get("provider_sequence") or []),
+                        )
+                        verdict = agent_photo_request_authorization.finish_review(verdict)
+                        if verdict == "error":
+                            return _PreToolCallResolution(
+                                block_message=(
+                                    "BLOCKED: agent-photo could not verify the current "
+                                    "request. No image was generated. Ask again in a new "
+                                    "message; do not retry this call."
+                                ),
+                                modified_args=details.modified_args,
+                            )
+                        if verdict == "unavailable":
+                            return _PreToolCallResolution(
+                                block_message=(
+                                    "BLOCKED: the current agent-photo request expired "
+                                    "before authorization completed. No image was generated."
+                                ),
+                                modified_args=details.modified_args,
+                            )
+                        if verdict == "requested":
+                            try:
+                                from tools.approval import _issue_tool_approval_provenance
+
+                                provenance = agent_photo_request_authorization.issue_provenance(
+                                    lambda: _issue_tool_approval_provenance(
+                                        tool_name,
+                                        args,
+                                        session_id=session_id,
+                                        tool_call_id=tool_call_id,
+                                        turn_id=turn_id,
+                                        subject=approval_subject,
+                                    )
+                                )
+                                if provenance is None:
+                                    raise RuntimeError("request expired")
+                            except Exception:
+                                return _PreToolCallResolution(
+                                    block_message=(
+                                        "BLOCKED: exact one-time approval provenance "
+                                        "could not be issued for agent_photo"
+                                    ),
+                                    modified_args=details.modified_args,
+                                )
+                            return _PreToolCallResolution(
+                                approval_provenance=provenance,
+                                modified_args=details.modified_args,
+                            )
+                except Exception:
+                    return _PreToolCallResolution(
+                        block_message=(
+                            "BLOCKED: agent-photo request authorization check failed. "
+                            "No image was generated; do not retry this call."
+                        ),
+                        modified_args=details.modified_args,
+                    )
         try:
             from tools.approval import (
                 request_tool_approval,
@@ -6400,6 +6508,7 @@ def _dispatch_pre_tool_call_hooks(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
     return_resolution: bool = False,
+    agent_photo_request_authorization: Any = None,
 ) -> Union[
     Tuple[Optional[str], Optional[Dict[str, Any]]],
     _PreToolCallResolution,
@@ -6436,6 +6545,7 @@ def _dispatch_pre_tool_call_hooks(
             turn_id=turn_id,
             api_request_id=api_request_id,
             middleware_trace=middleware_trace,
+            agent_photo_request_authorization=agent_photo_request_authorization,
         )
 
     details = _get_pre_tool_call_directive_details(
@@ -6446,6 +6556,7 @@ def _dispatch_pre_tool_call_hooks(
     resolution = _resolve_block_from_details(
         details, tool_name, args=args,
         turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id,
+        agent_photo_request_authorization=agent_photo_request_authorization,
     )
     return (resolution.block_message, resolution.modified_args)
 

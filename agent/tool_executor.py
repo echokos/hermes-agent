@@ -609,6 +609,9 @@ def _run_agent_tool_execution_middleware(
             def _resolve_pre_tool_call():
                 nonlocal final_args
                 try:
+                    from agent.agent_photo_request import (
+                        get_current_agent_photo_request_authorization,
+                    )
                     from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
 
                     resolution = _dispatch_pre_tool_call_hooks(
@@ -622,6 +625,9 @@ def _run_agent_tool_execution_middleware(
                         or "",
                         middleware_trace=list(state["middleware_trace"]),
                         return_resolution=True,
+                        agent_photo_request_authorization=(
+                            get_current_agent_photo_request_authorization()
+                        ),
                     )
                     # Preserve the historical tuple contract for plugin/test
                     # interceptors while production receives the structured
