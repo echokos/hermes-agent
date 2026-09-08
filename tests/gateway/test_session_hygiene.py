@@ -728,6 +728,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = async_session_db
+    runner._evict_cached_agent = MagicMock()
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
@@ -779,6 +780,9 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     assert agent is not None
     async_session_db.get_session.assert_awaited_once_with("sess-1")
     agent.context_compressor.bind_session_state.assert_called_once_with(fake_db, "sess-1")
+    runner._evict_cached_agent.assert_called_once_with(
+        runner.session_store.get_or_create_session.return_value.session_key
+    )
     # In-place compaction already persisted via archive_and_compact() —
     # rewrite_transcript would replace_messages(active_only=False) and DELETE
     # the just-archived rows (#61145). The hygiene handler must skip it.
@@ -1076,6 +1080,84 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
         message_id="1",
     )
     return runner, adapter, event
+
+
+@pytest.mark.asyncio
+async def test_blocked_hygiene_preserves_main_compressor_recovery_clock(
+    monkeypatch, tmp_path, caplog
+):
+    from agent import context_compressor as compressor_module
+    from hermes_state import SessionDB
+    import time
+
+    session_id = "sess-recovery-clock"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    now = [1000.0]
+    monkeypatch.setattr(
+        compressor_module, "time",
+        SimpleNamespace(monotonic=lambda: now[0], time=time.time),
+    )
+
+    def new_compressor():
+        compressor = compressor_module.ContextCompressor(
+            model="test-model", provider="test", quiet_mode=True,
+            config_context_length=200_000,
+        )
+        compressor.threshold_tokens = 150_000
+        compressor.bind_session_state(db, session_id)
+        return compressor
+
+    class BlockedHygieneAgent:
+        instances = 0
+
+        def __init__(self, **kwargs):
+            type(self).instances += 1
+            self.session_id = kwargs["session_id"]
+            self._session_db = kwargs["session_db"]
+            self._last_compaction_in_place = False
+            self.context_compressor = new_compressor()
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            assert self.context_compressor._automatic_compression_blocked()
+            return messages, None
+
+    try:
+        db.create_session(session_id, "telegram")
+        db.set_compression_ineffective_count(session_id, 2)
+        runner, _, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, BlockedHygieneAgent, db, session_id,
+        )
+        key = runner.session_store.get_or_create_session.return_value.session_key
+        main = new_compressor()
+        cache = {key: main}
+        runner._evict_cached_agent = MagicMock(side_effect=lambda key: cache.pop(key, None))
+        probes = []
+
+        async def run_main(*_args, **_kwargs):
+            if key not in cache:
+                cache[key] = new_compressor()
+            probes.append(cache[key].should_compress(183_310))
+            return {
+                "final_response": "ok", "messages": [], "tools": [],
+                "history_offset": 0, "last_prompt_tokens": 0,
+            }
+
+        runner._run_agent = AsyncMock(side_effect=run_main)
+        assert await runner._handle_message(event) == "ok"
+        now[0] += main._ANTI_THRASH_RECOVERY_SECONDS + 1
+        assert await runner._handle_message(event) == "ok"
+        assert BlockedHygieneAgent.instances == 2
+        assert probes == [False, True]
+        assert cache[key] is main
+        runner._evict_cached_agent.assert_not_called()
+        assert db.get_compression_ineffective_count(session_id) == 1
+        assert "no committed compaction" in caplog.text
+        assert "no session_db on the hygiene agent" not in caplog.text
+        runner.session_store.rewrite_transcript.assert_not_called()
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

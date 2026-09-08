@@ -40,7 +40,7 @@ from agent.model_metadata import (
     estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
-from agent.turn_context import drop_stale_api_content
+from agent.turn_context import drop_stale_api_content, substitute_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -1311,7 +1311,11 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
     Default ``True`` preserves the conservative full charge for callers
     without turn-position context.
     """
-    content = msg.get("content") or ""
+    # Size the same content the transport replays, without changing persisted
+    # display text or the cache-stable sidecar on the original message.
+    wire_message = dict(msg)
+    substitute_api_content(wire_message)
+    content = wire_message.get("content") or ""
     if isinstance(content, str):
         tokens = estimate_tokens_rough(content) + 10  # +10 for role/key overhead
     else:
