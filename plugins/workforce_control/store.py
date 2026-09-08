@@ -655,10 +655,45 @@ def _require_fresh_evidence(evidence: list[str], evidence_at: str | int | None) 
     return timestamp
 
 
+def _validated_materialization_coordination(
+    conn: sqlite3.Connection,
+    *,
+    actor: str,
+    context: tuple[str, str, str] | None,
+    organization: WorkforceOrganization,
+) -> dict[str, Any] | None:
+    if context is None:
+        return None
+    try:
+        request_root_id, source_task_id, purpose = context
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid current coordination execution context") from exc
+    request_root_id = str(request_root_id or "").strip()
+    source_task_id = str(source_task_id or "").strip()
+    if not request_root_id or not source_task_id or purpose != "work":
+        raise ValueError("materialization requires a current coordination work context")
+    request = kanban_db.get_coordination_request(conn, request_root_id)
+    source = kanban_db.get_task(conn, source_task_id)
+    actor_id = organization.resolve_profile(actor).agent
+    if request is None or request.status != "active":
+        raise ValueError("materialization requires an active accepted coordination request")
+    if request.responsible_agent != actor_id:
+        raise PermissionError("current coordination request is owned by another manager")
+    if source is None or source.request_root_id != request.id:
+        raise ValueError("current coordination task is not bound to the accepted request")
+    return {
+        "request_root_id": request.id,
+        "source_task_id": source.id,
+        "origin_session_id": request.origin_session_id,
+        "origin_message_id": request.origin_message_id,
+    }
+
+
 def materialize_plan(
     conn: sqlite3.Connection, *, actor: str, plan_id: str,
     current_state_evidence: list[str], current_state_evidence_at: str | int,
     confirmed_execution_ready: bool, organization: WorkforceOrganization | None = None,
+    coordination_context: tuple[str, str, str] | None = None,
 ) -> dict[str, Any]:
     org = organization or load_organization()
     if org.resolve_profile(actor).agent != "aurora":
@@ -673,7 +708,23 @@ def materialize_plan(
     if plan is None:
         raise ValueError("unknown workforce plan")
     if plan["state"] == "materialized":
-        return {"plan_id": plan_id, "root_task_id": plan["materialized_root_task_id"], "created": False}
+        coordination = _validated_materialization_coordination(
+            conn, actor=actor, context=coordination_context, organization=org,
+        )
+        if coordination is not None:
+            root = kanban_db.get_task(conn, plan["materialized_root_task_id"])
+            if root is None or root.request_root_id != coordination["request_root_id"]:
+                raise ValueError(
+                    "materialized plan is not bound to the current coordination request"
+                )
+        result = {
+            "plan_id": plan_id,
+            "root_task_id": plan["materialized_root_task_id"],
+            "created": False,
+        }
+        if coordination is not None:
+            result["request_root_id"] = coordination["request_root_id"]
+        return result
     if plan["state"] != "draft":
         raise ValueError(f"plan cannot be materialized from {plan['state']}")
     if plan["goal_ref"].strip().casefold() == "unknown":
@@ -693,6 +744,14 @@ def materialize_plan(
     by_key: dict[str, str] = {}
     remaining = {str(node["key"]): node for node in nodes}
     with write_txn(conn):
+        coordination = _validated_materialization_coordination(
+            conn, actor=actor, context=coordination_context, organization=org,
+        )
+        task_context = {
+            "session_id": coordination["origin_session_id"] if coordination else None,
+            "coordination_source_task_id": coordination["source_task_id"] if coordination else None,
+            "coordination_origin_message_id": coordination["origin_message_id"] if coordination else None,
+        }
         while remaining:
             progressed = False
             for key, node in list(remaining.items()):
@@ -713,6 +772,7 @@ def materialize_plan(
                     project_id=node.get("project_id"), workspace_kind=str(node.get("workspace_kind") or "scratch"),
                     parents=[by_key[parent] for parent in parents],
                     idempotency_key=f"workforce-plan:{plan_id}:{key}", goal_mode=bool(node.get("goal_mode", True)),
+                    **task_context,
                 )
                 stable_key = stable_identity(
                     item_kind="execution", desired_outcome=str(node["title"]),
@@ -735,6 +795,7 @@ def materialize_plan(
             body=json.dumps({"kind": "workforce_outcome", "plan_id": plan_id, "desired_outcome": plan["desired_outcome"], "acceptance_test": plan["acceptance_test"]}, indent=2, sort_keys=True),
             assignee="aurora", created_by="aurora", tenant="company", parents=list(by_key.values()),
             idempotency_key=f"workforce-outcome:{plan['stable_key']}", workspace_kind="scratch", goal_mode=False,
+            **task_context,
         )
         outcome_key = stable_identity(item_kind="outcome", desired_outcome=plan["desired_outcome"], action_class="outcome", target_ref=plan["goal_ref"])
         conn.execute(
@@ -748,7 +809,15 @@ def materialize_plan(
                 (child_id, root_id, _json(current_state_evidence), now),
             )
         conn.execute("UPDATE wc_plans SET state='materialized',materialized_root_task_id=?,updated_at=? WHERE plan_id=?", (root_id, now, plan_id))
-    return {"plan_id": plan_id, "root_task_id": root_id, "execution_tasks": by_key, "created": True}
+    result = {
+        "plan_id": plan_id,
+        "root_task_id": root_id,
+        "execution_tasks": by_key,
+        "created": True,
+    }
+    if coordination is not None:
+        result["request_root_id"] = coordination["request_root_id"]
+    return result
 
 
 def propose_reconciliation(

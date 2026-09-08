@@ -9,6 +9,7 @@ import subprocess
 import time
 from typing import Any
 
+from agent.coordination_budget import current_coordination_execution
 from hermes_cli import kanban_db
 from hermes_cli.workforce_org import active_workforce_agent
 from plugins.workforce_control.store import (
@@ -49,12 +50,14 @@ def _plan(args: dict[str, Any], **_kwargs: Any) -> str:
 
 def _materialize(args: dict[str, Any], **_kwargs: Any) -> str:
     try:
+        coordination_context = current_coordination_execution()
         with kanban_db.connect_closing() as conn:
             result = materialize_plan(
                 conn, actor=_actor(), plan_id=str(args.get("plan_id") or ""),
                 current_state_evidence=list(args.get("current_state_evidence") or []),
                 current_state_evidence_at=args.get("current_state_evidence_at"),
                 confirmed_execution_ready=bool(args.get("confirmed_execution_ready")),
+                coordination_context=coordination_context,
             )
         return tool_result(success=True, **result)
     except Exception as exc:

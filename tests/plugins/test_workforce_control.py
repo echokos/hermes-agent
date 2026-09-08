@@ -33,7 +33,13 @@ ROOT = Path(__file__).parents[2]
 
 @pytest.fixture
 def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    home = tmp_path / "hermes"
+    organization_dir = home / "organization"
+    organization_dir.mkdir(parents=True)
+    (organization_dir / "organization.yaml").write_text(
+        (ROOT / "workforce" / "organization.yaml").read_text()
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
     conn = kanban_db.connect(tmp_path / "kanban.db")
     runtime_state(conn)
     try:
@@ -320,6 +326,156 @@ def test_bounded_graph_materializes_atomically_and_idempotently(board, organizat
     assert len(first["execution_tasks"]) == 1
     root = kanban_db.get_task(board, first["root_task_id"])
     assert root is not None and root.status == "todo"
+
+
+def test_materialization_inherits_active_coordination_budget_and_origin(board, organization):
+    payload = plan_payload()
+    payload["desired_outcome"] += " inside one accepted request"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+
+    request_root_id = kanban_db.create_task(
+        board,
+        title="Return the verified workforce outcome",
+        assignee="aurora",
+        session_id="aurora-buzz-session",
+    )
+    kanban_db.add_notify_sub(
+        board,
+        task_id=request_root_id,
+        platform="buzz",
+        chat_id="private-origin",
+        notifier_profile="aurora",
+        delivery_mode="wake",
+    )
+    request = kanban_db.create_coordination_request(
+        board,
+        root_task_id=request_root_id,
+        origin_session_id="aurora-buzz-session",
+        origin_message_id="root-request-message",
+        max_leaf_launches=2,
+        max_concurrent_leaf=1,
+        max_model_calls=8,
+        organization=organization,
+    )
+
+    materialized = materialize_plan(
+        board,
+        actor="aurora",
+        plan_id=plan["plan_id"],
+        current_state_evidence=["kanban:current"],
+        current_state_evidence_at=int(time.time()),
+        confirmed_execution_ready=True,
+        organization=organization,
+        coordination_context=(request.id, request_root_id, "work"),
+    )
+
+    assert materialized["request_root_id"] == request.id
+    task_ids = [*materialized["execution_tasks"].values(), materialized["root_task_id"]]
+    for task_id in task_ids:
+        task = kanban_db.get_task(board, task_id)
+        assert task is not None
+        assert task.request_root_id == request.id
+        assert task.session_id == request.origin_session_id
+        created = board.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='created' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert json.loads(created["payload"])["coordination_origin_message_id"] == request.origin_message_id
+    assert kanban_db.get_coordination_request(board, request.id).max_model_calls == 8
+
+
+@pytest.mark.parametrize("request_status", [None, "completed"])
+def test_invalid_coordination_context_rejects_before_materializing_tasks(
+    board, organization, request_status,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += f" with invalid request {request_status}"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    source_id = kanban_db.create_task(
+        board,
+        title="Claimed coordination source",
+        assignee="aurora",
+        session_id="aurora-buzz-session",
+    )
+    request_id = "cr_missing"
+    if request_status is not None:
+        kanban_db.add_notify_sub(
+            board,
+            task_id=source_id,
+            platform="buzz",
+            chat_id="private-origin",
+            notifier_profile="aurora",
+            delivery_mode="wake",
+        )
+        request = kanban_db.create_coordination_request(
+            board,
+            root_task_id=source_id,
+            origin_session_id="aurora-buzz-session",
+            origin_message_id="closed-request-message",
+            organization=organization,
+        )
+        request_id = request.id
+        board.execute(
+            "UPDATE coordination_requests SET status=? WHERE id=?",
+            (request_status, request.id),
+        )
+
+    with pytest.raises(ValueError, match="active accepted coordination request"):
+        materialize_plan(
+            board,
+            actor="aurora",
+            plan_id=plan["plan_id"],
+            current_state_evidence=["kanban:current"],
+            current_state_evidence_at=int(time.time()),
+            confirmed_execution_ready=True,
+            organization=organization,
+            coordination_context=(request_id, source_id, "work"),
+        )
+
+    assert board.execute(
+        "SELECT state FROM wc_plans WHERE plan_id=?", (plan["plan_id"],)
+    ).fetchone()[0] == "draft"
+    assert board.execute(
+        "SELECT COUNT(*) FROM wc_items WHERE item_kind IN ('execution','outcome')"
+    ).fetchone()[0] == 0
+
+
+def test_materialize_tool_forwards_only_the_trusted_runtime_coordination(monkeypatch):
+    expected = ("cr_current", "t_current", "work")
+    captured = {}
+
+    class ConnectionContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(workforce_tools, "current_coordination_execution", lambda: expected)
+    monkeypatch.setattr(workforce_tools.kanban_db, "connect_closing", ConnectionContext)
+    monkeypatch.setattr(workforce_tools, "_actor", lambda: "aurora")
+
+    def fake_materialize(_conn, **kwargs):
+        captured.update(kwargs)
+        return {"plan_id": kwargs["plan_id"], "created": False}
+
+    monkeypatch.setattr(workforce_tools, "materialize_plan", fake_materialize)
+    result = json.loads(workforce_tools._materialize({
+        "plan_id": "plan_current",
+        "current_state_evidence": ["kanban:current"],
+        "current_state_evidence_at": "2026-09-08T13:00:00-05:00",
+        "confirmed_execution_ready": True,
+    }))
+
+    assert result["success"] is True
+    assert captured["coordination_context"] == expected
 
 
 def test_plan_rejects_more_than_eight_execution_nodes(board, organization):
