@@ -141,6 +141,8 @@ def profile_failure_event(
     outcome: str = "failure",
     source_scope: str | None = None,
     occurred_at: Any = None,
+    failure_type: str = "execution",
+    dependency_outcome: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Normalize an opted-in Cron failure without selecting a chat target."""
     ownership = job.get("failure_ownership")
@@ -177,7 +179,7 @@ def profile_failure_event(
     )
     condition = "\0".join((workflow_id, source_id, status, safe_error))
     ownership_value = "\0".join((technical_owner, director))
-    return {
+    event = {
         "schema_version": 1,
         "event_id": event_id,
         "execution_id": execution,
@@ -198,9 +200,15 @@ def profile_failure_event(
         "checkpoint_at": checkpoint_at,
         "recovery_successes_required": recovery_successes,
         "status": status,
+        "failure_type": _text(failure_type) or "execution",
         "missing_fields": missing,
         "recorded_at": order // 1_000_000_000,
     }
+    if dependency_outcome is not None:
+        # This structure contains only configured tool identities and bounded
+        # host classifications. Raw MCP/provider payloads never enter intake.
+        event["dependency_outcome"] = dependency_outcome
+    return event
 
 
 def append_event(path: Path, event: dict[str, Any]) -> None:
@@ -247,6 +255,8 @@ def append_profile_failure(
     execution_id: str,
     outcome: str = "failure",
     occurred_at: Any = None,
+    failure_type: str = "execution",
+    dependency_outcome: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     event = profile_failure_event(
         job,
@@ -255,8 +265,26 @@ def append_profile_failure(
         outcome=outcome,
         source_scope=Path(profile_home).name,
         occurred_at=occurred_at,
+        failure_type=failure_type,
+        dependency_outcome=dependency_outcome,
     )
     if event is not None:
+        if outcome != "recovered":
+            try:
+                from cron.operational_outcomes import capture_outcome_notice
+
+                notice = capture_outcome_notice(
+                    job,
+                    source_profile=event["source_scope"],
+                    execution_id=event["execution_id"],
+                )
+                if notice is not None:
+                    event["outcome_notice"] = notice
+            except Exception:
+                # Route capture is subordinate to owned failure intake. The
+                # typed failure must persist even when no return route can be
+                # resolved safely.
+                pass
         append_event(profile_home / "cron" / INTAKE_FILENAME, event)
     return event
 
