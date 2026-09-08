@@ -2051,6 +2051,26 @@ def get_active_env(task_id: str):
         return _active_environments.get(lookup) or _active_environments.get(task_id)
 
 
+def _resolve_task_environment_cwd(
+    config: Dict[str, Any], task_id: Optional[str], overrides: Dict[str, Any],
+) -> tuple[str, Optional[str]]:
+    """Apply the same workspace/mount policy to eager and lazy creation."""
+    cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+    host_cwd = _resolve_task_host_cwd(config, task_id)
+    # Config paths are already sanitized, but session/workspace overrides may
+    # still be host-only paths. Mounted workspaces appear at /workspace.
+    if config["env_type"] in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+        remapped = "/workspace" if host_cwd else config["cwd"]
+        if cwd != remapped:
+            logger.info(
+                "Remapping host/relative cwd override %r for %s backend "
+                "(won't exist in sandbox). Using %r instead.",
+                cwd, config["env_type"], remapped,
+            )
+        cwd = remapped
+    return cwd, host_cwd
+
+
 def ensure_task_env(task_id: Optional[str] = None, *, include_local: bool = False):
     """Lazily create and cache the sandbox env for *task_id* if none is active.
 
@@ -2082,7 +2102,7 @@ def ensure_task_env(task_id: Optional[str] = None, *, include_local: bool = Fals
         return existing
 
     overrides = resolve_task_overrides(task_id)
-    cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+    cwd, host_cwd = _resolve_task_environment_cwd(config, task_id, overrides)
     if env_type == "docker":
         image = overrides.get("docker_image") or config["docker_image"]
     elif env_type == "singularity":
@@ -2118,7 +2138,7 @@ def ensure_task_env(task_id: Optional[str] = None, *, include_local: bool = Fals
                 ),
                 local_config={"persistent": config.get("local_persistent", False)} if env_type == "local" else None,
                 task_id=effective_task_id,
-                host_cwd=_resolve_task_host_cwd(config, task_id),
+                host_cwd=host_cwd,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort bring-up
             logger.warning(
@@ -2689,33 +2709,7 @@ def terminal_tool(
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
-        # Session-scoped mount resolution (single owner: _resolve_task_host_cwd).
-        # Under per-session isolation a fresh session must not inherit the
-        # process-global TERMINAL_CWD mount left behind by a previous session.
-        host_cwd = _resolve_task_host_cwd(config, task_id)
-        # A per-task cwd override (registered by the gateway/TUI for workspace
-        # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
-        # config["cwd"] was already sanitized for container backends in
-        # _get_env_config() while the override is raw. On a container backend a
-        # raw host path (e.g. a Windows desktop session's C:\Users\<user>, or a
-        # POSIX /home/<user>) reaches `docker run -w <host-path>` and the
-        # container fails to start (exit 125). Re-apply the same host/relative
-        # path guard to the *resolved* cwd so the override can't bypass it.
-        # When the host path IS this session's mounted workspace, remap it to
-        # /workspace (where the mount lands) instead of discarding it.
-        # Valid in-container override paths (RL/benchmark sandboxes that set
-        # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
-        # through untouched.
-        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
-            remapped = "/workspace" if host_cwd else config["cwd"]
-            if cwd != remapped:
-                logger.info(
-                    "Remapping host/relative cwd override %r for %s backend "
-                    "(won't exist in sandbox). Using %r instead.",
-                    cwd, env_type, remapped,
-                )
-            cwd = remapped
+        cwd, host_cwd = _resolve_task_environment_cwd(config, task_id, overrides)
         default_timeout = config["timeout"]
 
         # Validate an explicit timeout before it flows into deadline math.

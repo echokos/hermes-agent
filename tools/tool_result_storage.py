@@ -113,9 +113,13 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     storage_dir = os.path.dirname(remote_path)
     directory = shlex.quote(storage_dir)
     destination = shlex.quote(remote_path)
+    # SDK backends append a heredoc to the final command, including one extra
+    # newline. Keep the reader last and retain exactly the original byte count.
+    byte_count = len(content.encode("utf-8", "surrogateescape"))
     cmd = (
         f"umask 077 && mkdir -p {directory} && chmod 700 {directory} "
-        f"&& cat > {destination} && chmod 600 {destination}"
+        f"&& touch {destination} && chmod 600 {destination} "
+        f"&& head -c {byte_count} > {destination}"
     )
     result = env.execute(cmd, timeout=30, stdin_data=content)
     return result.get("returncode", 1) == 0

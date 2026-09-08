@@ -1,6 +1,7 @@
 """Exercise real cold-start result persistence without model/provider calls."""
 
 import hashlib
+import importlib
 import json
 from pathlib import Path
 import re
@@ -83,6 +84,47 @@ def test_first_large_json_result_uses_real_local_stdin_and_is_retrievable(cold_l
     restored = json.loads(path.read_text())["structuredContent"]["note"]
     assert restored["updateSequenceNumber"] == 123
     assert restored["attributes"]["sourceURL"] == "https://example.invalid/source"
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("backend,class_name", [
+    ("modal", "ModalEnvironment"),
+    ("daytona", "DaytonaEnvironment"),
+    ("vercel_sandbox", "VercelSandboxEnvironment"),
+])
+@pytest.mark.parametrize("suffix", ["", "\n"])
+def test_sdk_heredoc_command_preserves_exact_large_payload(
+    tmp_path, monkeypatch, backend, class_name, suffix
+):
+    from tools.environments.base import BaseEnvironment, _popen_bash
+
+    environment_class = getattr(importlib.import_module(f"tools.environments.{backend}"), class_name)
+    environment = environment_class.__new__(environment_class)
+    temporary = tmp_path / "sandbox temporary"
+    temporary.mkdir()
+    monkeypatch.setattr(environment, "get_temp_dir", lambda: str(temporary))
+    BaseEnvironment.__init__(environment, cwd=str(tmp_path), timeout=10)
+    monkeypatch.setattr(environment, "_before_execute", lambda: None)
+
+    def run_bash(command, *, login=False, timeout=120, stdin_data=None):
+        # Replace only the external SDK execution boundary. The real backend
+        # stdin mode, heredoc embedding, wrapping and process draining all run.
+        assert stdin_data is None
+        return _popen_bash(
+            ["bash"], stdin_data=command, start_new_session=True,
+        )
+
+    monkeypatch.setattr(environment, "_run_bash", run_bash)
+    payload = large_result() + suffix
+    result = maybe_persist_tool_result(payload, "fixture", "sdk-note", env=environment)
+    path = temporary / "hermes-results" / "sdk-note.txt"
+    assert f"Full output saved to: {path}" in result
+    assert path.read_bytes() == payload.encode("utf-8")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    readback = environment.execute(f"sha256sum {shlex.quote(str(path))}")
+    assert readback["returncode"] == 0
+    assert readback["output"].split()[0] == hashlib.sha256(payload.encode()).hexdigest()
 
 
 def test_small_result_and_small_turn_never_create_environment(monkeypatch):
