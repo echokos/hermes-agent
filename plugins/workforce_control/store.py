@@ -738,14 +738,25 @@ def _materialized_plan_result(
         organization=organization,
     )
     root_task_id = str(plan["materialized_root_task_id"] or "")
+    root = kanban_db.get_task(conn, root_task_id)
     if coordination is not None:
-        root = kanban_db.get_task(conn, root_task_id)
         if root is None or root.request_root_id != coordination["request_root_id"]:
             raise ValueError(
                 "materialized plan is not bound to the current coordination request"
             )
-    elif coordination_origin is not None:
-        root = kanban_db.get_task(conn, root_task_id)
+    else:
+        root_body = _loads(root.body if root is not None else None, {})
+        pending_adoption = (
+            root is not None
+            and root.request_root_id is None
+            and isinstance(root_body, dict)
+            and root_body.get("coordination_acceptance_pending") is True
+        )
+    if coordination is None and pending_adoption:
+        if coordination_origin is None:
+            raise ValueError(
+                "materialized plan is pending adoption by its coordination origin"
+            )
         created = conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
             "ORDER BY id DESC LIMIT 1",

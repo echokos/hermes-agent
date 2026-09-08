@@ -574,9 +574,6 @@ def test_materialized_plan_cannot_claim_pending_adoption_by_another_origin(
         board, actor="aurora", payload=payload, organization=organization,
     )
     set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
-    request, source_id = accepted_coordination_request(
-        board, organization, suffix="original-materialization",
-    )
     materialize_plan(
         board,
         actor="aurora",
@@ -585,7 +582,8 @@ def test_materialized_plan_cannot_claim_pending_adoption_by_another_origin(
         current_state_evidence_at=int(time.time()),
         confirmed_execution_ready=True,
         organization=organization,
-        coordination_context=(request.id, source_id, "work"),
+        coordination_origin=("original-origin", "original-message"),
+        coordination_acceptance_pending=True,
     )
 
     with pytest.raises(ValueError, match="not pending adoption"):
@@ -599,6 +597,47 @@ def test_materialized_plan_cannot_claim_pending_adoption_by_another_origin(
             organization=organization,
             coordination_origin=("different-origin", "different-message"),
         )
+
+
+def test_uncoordinated_materialized_plan_is_idempotent_across_origins(
+    board, organization,
+):
+    payload = plan_payload()
+    payload["desired_outcome"] += " with ordinary cross-turn idempotency"
+    plan = record_plan(
+        board, actor="aurora", payload=payload, organization=organization,
+    )
+    set_runtime_mode(board, mode="apply", kill_switch=False, reason="isolated test")
+    first = materialize_plan(
+        board,
+        actor="aurora",
+        plan_id=plan["plan_id"],
+        current_state_evidence=["kanban:current"],
+        current_state_evidence_at=int(time.time()),
+        confirmed_execution_ready=True,
+        organization=organization,
+        coordination_origin=("ordinary-origin-one", "ordinary-message-one"),
+    )
+
+    second = materialize_plan(
+        board,
+        actor="aurora",
+        plan_id=plan["plan_id"],
+        current_state_evidence=["kanban:still-current"],
+        current_state_evidence_at=int(time.time()),
+        confirmed_execution_ready=True,
+        organization=organization,
+        coordination_origin=("ordinary-origin-two", "ordinary-message-two"),
+    )
+
+    assert second == {
+        "plan_id": plan["plan_id"],
+        "root_task_id": first["root_task_id"],
+        "created": False,
+    }
+    root = kanban_db.get_task(board, first["root_task_id"])
+    assert root.request_root_id is None
+    assert "coordination_acceptance_pending" not in json.loads(root.body)
 
 
 @pytest.mark.parametrize("source_kind", ["unbound", "other_request"])
