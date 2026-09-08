@@ -6,7 +6,10 @@ import time
 import yaml
 
 from hermes_cli import kanban_db
-from hermes_cli.workforce_handoffs import acknowledge_handoff
+from hermes_cli.workforce_handoffs import (
+    acknowledge_handoff,
+    claim_owned_failure_handoff_pickup,
+)
 from hermes_cli.workforce_org import load_organization
 from cron.operational_failures import (
     append_host_failure, append_profile_failure, append_profile_recovery,
@@ -62,6 +65,16 @@ def _fixture(tmp_path: Path):
     with kanban_db.connect_closing(database):
         pass
     return organization, database, tmp_path / "state.json", profiles / "worker"
+
+
+def _acknowledge_owned_failure(conn, task_id: str, organization: Path):
+    org = load_organization(organization)
+    pickup = claim_owned_failure_handoff_pickup(
+        conn, target_agent="worker", organization=org,
+    )
+    assert pickup is not None and pickup["task_id"] == task_id
+    assert kanban_db.get_task(conn, task_id).request_root_id == pickup["request_root_id"]
+    return acknowledge_handoff(conn, task_id, actor="worker", organization=org)
 
 
 def _write_failure(profile: Path):
@@ -261,12 +274,7 @@ def test_owned_repair_requires_two_actual_successes_before_director_completion(
 
     with kanban_db.connect_closing(database) as conn:
         task_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
-        acknowledge_handoff(
-            conn,
-            task_id,
-            actor="worker",
-            organization=load_organization(organization),
-        )
+        _acknowledge_owned_failure(conn, task_id, organization)
         owner_run = kanban_db.claim_task(conn, task_id, claimer="worker:test")
         assert owner_run is not None
         assert kanban_db.request_review(
@@ -347,12 +355,7 @@ def test_owned_repair_requires_two_actual_successes_before_director_completion(
 
 def _accept_owner_repair(database: Path, task_id: str, organization: Path):
     with kanban_db.connect_closing(database) as conn:
-        acknowledge_handoff(
-            conn,
-            task_id,
-            actor="worker",
-            organization=load_organization(organization),
-        )
+        _acknowledge_owned_failure(conn, task_id, organization)
         owner_run = kanban_db.claim_task(conn, task_id, claimer="worker:test")
         assert owner_run is not None
         assert kanban_db.request_review(
@@ -661,12 +664,7 @@ def test_human_input_block_creates_one_actionable_aurora_handoff_without_chloe(
     run(organization=organization, database=database, state_path=state)
     with kanban_db.connect_closing(database) as conn:
         incident_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
-        acknowledge_handoff(
-            conn,
-            incident_id,
-            actor="worker",
-            organization=load_organization(organization),
-        )
+        _acknowledge_owned_failure(conn, incident_id, organization)
         owner_run = kanban_db.claim_task(conn, incident_id, claimer="worker:test")
         assert owner_run is not None
         assert kanban_db.block_task(
