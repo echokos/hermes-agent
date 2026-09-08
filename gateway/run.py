@@ -19296,6 +19296,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # deliberately stale for every real gateway surface.
                                 _hyg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
                                 _hyg_cleanup_deferred = False
+                                _hyg_rotated = False
+                                _hyg_in_place = False
                                 try:
                                     # Gateway hygiene runs before the user turn
                                     # starts and already owns the session binding.
@@ -19611,7 +19613,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         logger.warning(
                                             "Gateway hygiene compression for session %s "
                                             "did not rotate or compact in place "
-                                            "(no session_db on the hygiene agent) — "
+                                            "(no committed compaction) — "
                                             "preserving the original transcript instead "
                                             "of overwriting it with the summary (#21301).",
                                             session_entry.session_id,
@@ -19740,10 +19742,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _werr,
                                             )
                                 finally:
-                                    # Evict the cached agent so the next turn
-                                    # rebuilds its system prompt from current
-                                    # SOUL.md, memory, and skills.
-                                    self._evict_cached_agent(session_key)
+                                    # A no-op must retain the main compressor's
+                                    # anti-thrash recovery clock. Rebuilding it
+                                    # on every blocked hygiene pass postpones
+                                    # the recovery probe forever.
+                                    if (
+                                        _hyg_rotated
+                                        or _hyg_in_place
+                                        or getattr(_hyg_agent, "_last_compaction_in_place", False)
+                                    ):
+                                        self._evict_cached_agent(session_key)
                                     if not _hyg_cleanup_deferred:
                                         await self._cleanup_agent_resources_off_loop(
                                             _hyg_agent, context="session hygiene"
