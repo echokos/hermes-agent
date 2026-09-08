@@ -2314,7 +2314,7 @@ class TestMatrixDiagnostics:
         from plugins.platforms.matrix.adapter import MatrixAdapter
 
         output_path = tmp_path / "matrix-recovery-key.txt"
-        output_path.write_text("existing\n")
+        output_path.write_text("existing\n", encoding="utf-8")
         monkeypatch.delenv("MATRIX_RECOVERY_KEY", raising=False)
         monkeypatch.setenv("MATRIX_RECOVERY_KEY_OUTPUT_FILE", str(output_path))
         config = PlatformConfig(
@@ -2373,7 +2373,7 @@ class TestMatrixDiagnostics:
         mock_olm.generate_recovery_key.assert_not_called()
         assert "already exists" in caplog.text
         assert "super-secret-key" not in caplog.text
-        assert output_path.read_text() == "existing\n"
+        assert output_path.read_text(encoding="utf-8") == "existing\n"
         await adapter.disconnect()
 
     def test_matrix_diagnostics_redacts_recovery_key(self, monkeypatch):

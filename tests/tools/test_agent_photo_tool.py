@@ -197,8 +197,11 @@ def test_personal_profiles_can_discover_skill_and_use_no_spend_actions(
         assert command[0] == f"/proc/self/fd/{kwargs['pass_fds'][0]}"
         profile_fd = kwargs["pass_fds"][1]
         assert kwargs == {
+            "stdin": agent_photo_tool.subprocess.DEVNULL,
             "capture_output": True,
             "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
             "timeout": agent_photo_tool._wrapper_timeout("preview"),
             "env": agent_photo_tool._wrapper_environment(profile, profile_fd=profile_fd),
             "pass_fds": kwargs["pass_fds"],
@@ -619,15 +622,15 @@ def test_paid_timeout_reaps_wrapper_and_child(monkeypatch, tmp_path):
     script = (
         "import pathlib,subprocess,sys,time; "
         "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
-        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(30)"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid),encoding='utf-8'); time.sleep(30)"
     )
     with pytest.raises(agent_photo_tool._GenerationStopped, match="timeout"):
         agent_photo_tool._execute_paid_command(
             [sys.executable, "-c", script, str(marker)], env={}, pass_fds=(), timeout=1,
         )
-    child_pid = int(marker.read_text())
+    child_pid = int(marker.read_text(encoding="utf-8"))
     state_path = Path(f"/proc/{child_pid}/stat")
-    assert not state_path.exists() or state_path.read_text().split()[2] == "Z"
+    assert not state_path.exists() or state_path.read_text(encoding="utf-8").split()[2] == "Z"
 
 
 def test_unverified_process_group_cleanup_is_not_a_reaped_timeout(monkeypatch):

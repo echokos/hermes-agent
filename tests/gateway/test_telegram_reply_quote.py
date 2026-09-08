@@ -117,3 +117,23 @@ def test_forwarded_or_inline_bot_text_is_not_direct_photo_authorization(extra):
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
     assert event.agent_photo_request_text is None
+
+
+@pytest.mark.parametrize("text", [None, 7, MagicMock()])
+def test_non_text_payload_does_not_authorize_photo(text):
+    from gateway.platforms.base import MessageType
+
+    event = _make_adapter()._build_message_event(_make_message(text=text), MessageType.TEXT)
+
+    assert event.agent_photo_request_text is None
+
+
+@pytest.mark.parametrize("bot", [None, MagicMock(), SimpleNamespace(username="@MyBot")])
+def test_photo_request_capture_handles_optional_bot_identity(bot):
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    adapter._bot = bot
+    event = adapter._build_message_event(_make_message(text="send an agent photo"), MessageType.TEXT)
+
+    assert event.agent_photo_request_text == "send an agent photo"

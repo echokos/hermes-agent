@@ -8743,9 +8743,10 @@ class TelegramAdapter(BasePlatformAdapter):
         window without an extra Bot API round-trip.
         """
         observed = getattr(self, "_bot_username_observed", None)
-        if observed:
+        if isinstance(observed, str) and observed:
             return observed
-        return (getattr(self._bot, "username", None) or "").lstrip("@").lower()
+        username = getattr(getattr(self, "_bot", None), "username", None)
+        return username.lstrip("@").lower() if isinstance(username, str) else ""
 
     def _note_bot_username(self, username: Optional[str]) -> None:
         """Record the bot's current @username, logging real renames."""
@@ -10565,9 +10566,9 @@ class TelegramAdapter(BasePlatformAdapter):
         _agent_photo_request_text = None
         if user is not None and not getattr(user, "is_bot", False) and not _forwarded:
             if getattr(message, "via_bot", None) is None:
-                _agent_photo_request_text = self._clean_bot_trigger_text(
-                    message.text or message.caption or ""
-                )
+                _authored_text = message.text or getattr(message, "caption", None)
+                if isinstance(_authored_text, str):
+                    _agent_photo_request_text = self._clean_bot_trigger_text(_authored_text)
 
         return MessageEvent(
             text=message.text or "",

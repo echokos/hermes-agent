@@ -397,7 +397,7 @@ def _process_group_running(group_id: int) -> bool:
         try:
             if os.getpgid(int(entry.name)) != group_id:
                 continue
-            state = (entry / "stat").read_text().rpartition(")")[2].split()[0]
+            state = (entry / "stat").read_text(encoding="utf-8", errors="replace").rpartition(")")[2].split()[0]
             if state != "Z":
                 return True
         except ProcessLookupError:
@@ -411,13 +411,17 @@ def _execute_paid_command(
     command: list[str], *, env: dict[str, str], pass_fds: tuple[int, ...], timeout: float
 ) -> subprocess.CompletedProcess:
     """Reap the wrapper and its generator before allowing a fallback attempt."""
+    _require_secure_descriptor_capability()
     if _generation_cancelled():
         raise _GenerationStopped("cancelled")
     process = subprocess.Popen(
         command,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         pass_fds=pass_fds,
         start_new_session=True,
@@ -440,7 +444,7 @@ def _execute_paid_command(
     except BaseException:
         cleanup_deadline = time.monotonic() + _GENERATION_CLEANUP_TIMEOUT_SECONDS
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX capability checked before launch
         except ProcessLookupError:
             pass
         try:
@@ -502,7 +506,10 @@ def _run_wrapper(
         if action == "generate":
             completed = _execute_paid_command(argv, **kwargs)
         else:
-            completed = subprocess.run(argv, capture_output=True, text=True, **kwargs)
+            completed = subprocess.run(
+                argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", **kwargs
+            )
     except _GenerationStopped as exc:
         return tool_error(
             f"agent-photo {action} stopped: {exc.reason}",
