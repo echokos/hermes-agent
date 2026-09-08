@@ -550,6 +550,8 @@ def _record_intake_failure(
         ),
         "ownership_errors": ownership_errors + list(event.get("missing_fields") or []),
     }
+    if isinstance(event.get("outcome_notice"), dict):
+        context["outcome_notice"] = event["outcome_notice"]
     ack_deadline = int(event.get("ack_deadline") or int(time.time()) + 900)
     checkpoint_at = int(event.get("checkpoint_at") or int(time.time()) + 3600)
     if checkpoint_at <= ack_deadline:

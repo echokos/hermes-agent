@@ -77,6 +77,7 @@ RECOVERED_MARKER = (
 # redelivery.  A crash while a platform send is in flight is unknowable; never
 # let the generic startup sweeper silently replay one of these rows.
 COORDINATION_FINAL_RETURN_PURPOSE = "final_return"
+OPERATIONAL_OUTCOME_PURPOSE = "operational_outcome"
 _COORDINATION_FINAL_RETURN_STATES = frozenset({
     "pending", "sending", "acknowledged", "uncertain",
 })
@@ -583,6 +584,15 @@ def mark_coordination_final_return_acknowledged(
     returned_message_id: str,
 ) -> CoordinationFinalReturnDelivery:
     """Persist the only acceptable terminal outcome: a concrete receipt."""
+    obligation_id = coordination_final_return_obligation_id(request_root_id, event_id)
+    return _acknowledge_protected_delivery(
+        obligation_id, COORDINATION_FINAL_RETURN_PURPOSE, returned_message_id,
+    )
+
+
+def _acknowledge_protected_delivery(
+    obligation_id: str, purpose: str, returned_message_id: str,
+) -> CoordinationFinalReturnDelivery:
     receipt = str(returned_message_id or "").strip()
     if not (
         receipt.startswith("session-message:")
@@ -591,13 +601,12 @@ def mark_coordination_final_return_acknowledged(
         char in receipt for char in "\x00\r\n"
     ):
         raise ValueError("coordination final-return receipt is invalid")
-    obligation_id = coordination_final_return_obligation_id(request_root_id, event_id)
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             "SELECT obligation_id, state, coordination_root_id, "
             "coordination_event_id, returned_message_id, last_error, claim_token "
             "FROM delivery_obligations WHERE obligation_id = ? AND delivery_purpose = ?",
-            (obligation_id, COORDINATION_FINAL_RETURN_PURPOSE),
+            (obligation_id, purpose),
         ).fetchone()
         if row is None:
             raise ValueError("coordination final-return delivery was never claimed")
@@ -663,15 +672,30 @@ def _set_coordination_final_return_state(
     claim_token: str = "",
     only_unstarted: bool = False,
 ) -> CoordinationFinalReturnDelivery:
+    obligation_id = coordination_final_return_obligation_id(request_root_id, event_id)
+    return _set_protected_delivery_state(
+        obligation_id, COORDINATION_FINAL_RETURN_PURPOSE,
+        state=state, error=error, claim_token=claim_token, only_unstarted=only_unstarted,
+    )
+
+
+def _set_protected_delivery_state(
+    obligation_id: str,
+    purpose: str,
+    *,
+    state: str,
+    error: str,
+    claim_token: str = "",
+    only_unstarted: bool = False,
+) -> CoordinationFinalReturnDelivery:
     if state not in {"pending", "uncertain"}:  # pragma: no cover - private guard
         raise ValueError("invalid coordination final-return state")
-    obligation_id = coordination_final_return_obligation_id(request_root_id, event_id)
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             "SELECT obligation_id, state, coordination_root_id, "
             "coordination_event_id, returned_message_id, last_error, claim_token "
             "FROM delivery_obligations WHERE obligation_id = ? AND delivery_purpose = ?",
-            (obligation_id, COORDINATION_FINAL_RETURN_PURPOSE),
+            (obligation_id, purpose),
         ).fetchone()
         if row is None:
             raise ValueError("coordination final-return delivery was never claimed")
@@ -719,6 +743,121 @@ def reconcile_coordination_final_return(
         return record
     return mark_coordination_final_return_acknowledged(
         request_root_id, event_id, returned_message_id=returned_message_id,
+    )
+
+
+def operational_outcome_obligation_id(root: str, event_id: int, route_key: str) -> str:
+    """Use a distinct protected purpose for each reviewed event and destination."""
+    coordination_final_return_obligation_id(root, event_id)
+    if len(route_key) != 64 or any(char not in "0123456789abcdef" for char in route_key):
+        raise ValueError("invalid operational outcome route key")
+    return f"coordination:{str(root).strip()}:{OPERATIONAL_OUTCOME_PURPOSE}:{int(event_id)}:{route_key}"
+
+
+def get_operational_outcome_delivery(
+    root: str, event_id: int, route_key: str,
+) -> Optional[CoordinationFinalReturnDelivery]:
+    obligation_id = operational_outcome_obligation_id(root, event_id, route_key)
+    with _DB_LOCK, _transaction() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM delivery_obligations WHERE obligation_id = ? AND delivery_purpose = ?",
+            (obligation_id, OPERATIONAL_OUTCOME_PURPOSE),
+        ).fetchone()
+    return _coordination_row(row) if row is not None else None
+
+
+def claim_operational_outcome_delivery(outcome: dict[str, Any]) -> CoordinationFinalReturnDelivery:
+    """Claim one direct, source-reviewed notice, without admitting an agent turn."""
+    from gateway.operational_outcomes import validate_operational_outcome_authority
+
+    bound = validate_operational_outcome_authority(outcome)
+    root, event_id = bound["request_root_id"], bound["event_id"]
+    route = bound["route"]
+    obligation_id = operational_outcome_obligation_id(root, event_id, route["route_key"])
+    now = time.time()
+    pid, started = _owner_stamp()
+    token = _coordination_claim_token()
+    with _DB_LOCK, _transaction(immediate=True) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM delivery_obligations WHERE obligation_id = ?",
+            (obligation_id,),
+        ).fetchone()
+        if row is not None:
+            if (
+                row["delivery_purpose"] != OPERATIONAL_OUTCOME_PURPOSE
+                or row["coordination_root_id"] != root
+                or row["coordination_event_id"] != event_id
+                or row["platform"] != route["platform"]
+                or row["chat_id"] != route["chat_id"]
+                or (row["thread_id"] or "") != route["thread_id"]
+                or row["content"] != bound["content"]
+            ):
+                raise RuntimeError("operational outcome delivery identity conflict")
+            record = _coordination_row(row)
+            if record.state == "sending" and not _owner_alive(row["owner_pid"], row["owner_started_at"]):
+                conn.execute(
+                    "UPDATE delivery_obligations SET state='uncertain',last_error='sender_restarted',updated_at=? "
+                    "WHERE obligation_id=? AND state='sending'",
+                    (now, obligation_id),
+                )
+                return CoordinationFinalReturnDelivery(**{**record.__dict__, "state": "uncertain"})
+            if record.state != "pending":
+                return record
+            attempts = int(row["attempts"])
+            if attempts >= MAX_ATTEMPTS or now - float(row["created_at"]) >= STALE_AFTER_SECONDS:
+                conn.execute(
+                    "UPDATE delivery_obligations SET last_error='retry_limit_reached' WHERE obligation_id=? "
+                    "AND (last_error IS NULL OR last_error!='retry_limit_reached')",
+                    (obligation_id,),
+                )
+                return CoordinationFinalReturnDelivery(**{**record.__dict__, "last_error": "retry_limit_reached"})
+            if now - float(row["updated_at"]) < 30 * (2 ** max(0, attempts - 1)):
+                return record
+            conn.execute(
+                "UPDATE delivery_obligations SET state='sending',attempts=attempts+1,updated_at=?,"
+                "owner_pid=?,owner_started_at=?,claim_token=?,last_error=NULL WHERE obligation_id=? AND state='pending'",
+                (now, pid, started, token, obligation_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO delivery_obligations "
+                "(obligation_id,session_key,platform,chat_id,thread_id,content,state,attempts,created_at,updated_at,"
+                "owner_pid,owner_started_at,delivery_purpose,coordination_root_id,coordination_event_id,claim_token) "
+                "VALUES (?,?,?,?,?,?,'sending',1,?,?,?,?,?,?,?,?)",
+                (obligation_id, f"operational:{root}", route["platform"], route["chat_id"],
+                 route["thread_id"] or None, bound["content"], now, now, pid, started,
+                 OPERATIONAL_OUTCOME_PURPOSE, root, event_id, token),
+            )
+        row = conn.execute(
+            "SELECT * FROM delivery_obligations WHERE obligation_id=?", (obligation_id,),
+        ).fetchone()
+    record = _coordination_row(row)
+    return CoordinationFinalReturnDelivery(**{**record.__dict__, "send_claimed": True})
+
+
+def acknowledge_operational_outcome_delivery(
+    root: str, event_id: int, route_key: str, *, returned_message_id: str,
+) -> CoordinationFinalReturnDelivery:
+    parts = str(returned_message_id).split(":", 2)
+    if len(parts) != 3 or parts[0] != "platform-message" or not all(parts[1:]) or len(returned_message_id) > 512:
+        raise ValueError("operational outcome requires a platform receipt")
+    return _acknowledge_protected_delivery(
+        operational_outcome_obligation_id(root, event_id, route_key),
+        OPERATIONAL_OUTCOME_PURPOSE, returned_message_id,
+    )
+
+
+def settle_operational_outcome_send(
+    root: str, event_id: int, route_key: str, *, claim_token: str,
+    definitely_rejected: bool = False, error: str = "send_uncertain",
+) -> CoordinationFinalReturnDelivery:
+    return _set_protected_delivery_state(
+        operational_outcome_obligation_id(root, event_id, route_key),
+        OPERATIONAL_OUTCOME_PURPOSE,
+        state="pending" if definitely_rejected else "uncertain",
+        error=error, claim_token=claim_token,
     )
 
 
