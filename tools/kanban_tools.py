@@ -677,12 +677,14 @@ def _handle_list(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Match CLI list: dependencies that cleared since the last
-            # dispatcher tick should be visible to orchestrators immediately.
-            promoted = kb.recompute_ready(conn)
+            # Ordinary listing matches the CLI's dependency promotion. Bounded
+            # workforce discovery remains read-only, including signal intake.
+            promoted = kb.recompute_ready(conn) if workforce_scope is None else 0
             # Fetch one extra row so model-facing output can report that
             # a bounded listing was truncated without dumping the board.
             scope_profiles = None
+            signal_ids: set[str] = set()
+            signal_owner = None
             if workforce_scope in {"owned_outcomes", "portfolio_outcomes"}:
                 from hermes_cli.workforce_org import (
                     WorkforceOrganizationError,
@@ -724,6 +726,17 @@ def _handle_list(args: dict, **kw) -> str:
                     include_archived=include_archived,
                     limit=limit + 1,
                 )
+                if workforce_scope == "portfolio_outcomes":
+                    signal_owner = actor.agent
+                    signals = kb.list_unresolved_workforce_signal_tasks(
+                        conn, decision_owner=signal_owner, status=status, tenant=tenant,
+                        limit=limit + 1,
+                    )
+                    signal_ids = {task.id for task in signals}
+                    # One shared candidate budget, not twelve outcomes plus
+                    # twelve signals. Ownership classes remain explicit below.
+                    by_id = {task.id: task for task in [*rows, *signals]}
+                    rows = sorted(by_id.values(), key=lambda task: (-task.priority, task.created_at, task.id))
             else:
                 rows = kb.list_tasks(
                     conn,
@@ -735,8 +748,17 @@ def _handle_list(args: dict, **kw) -> str:
                 )
             truncated = len(rows) > limit
             tasks = rows[:limit]
+            summaries = []
+            for task in tasks:
+                summary = _task_summary_dict(kb, conn, task)
+                if task.id in signal_ids:
+                    summary.update({
+                        "workforce_record_kind": "unresolved_signal", "triage_only": True,
+                        "decision_owner": signal_owner, "launch_authorized": False,
+                    })
+                summaries.append(summary)
             result = {
-                "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
+                "tasks": summaries,
                 "count": len(tasks),
                 "limit": limit,
                 "truncated": truncated,
@@ -2217,7 +2239,11 @@ KANBAN_LIST_SCHEMA = {
                     "Canonical decomposed root outcomes explicitly owned by the current "
                     "workforce profile (`owned_outcomes`) or by that profile and every "
                     "direct and indirect report (`portfolio_outcomes`). Ordinary task "
-                    "assignment is not ownership. Mutually exclusive with assignee."
+                    "assignment is not ownership. Portfolio results also include canonical "
+                    "unresolved workforce signals for the current actor's decision, explicitly "
+                    "marked triage_only and launch_authorized=false; visibility does not "
+                    "authorize execution. One shared limit covers both record classes. "
+                    "Mutually exclusive with assignee."
                 ),
             },
         },

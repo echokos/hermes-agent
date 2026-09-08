@@ -5863,6 +5863,53 @@ def list_owned_outcome_tasks(
     return [Task.from_row(row) for row in rows]
 
 
+def list_unresolved_workforce_signal_tasks(
+    conn: sqlite3.Connection,
+    *,
+    decision_owner: str,
+    status: Optional[str] = None,
+    tenant: Optional[str] = None,
+    limit: int = 100,
+) -> list[Task]:
+    """Read canonical non-executing signals for their exact decision owner.
+
+    The optional workforce-control classification table is authoritative for
+    signal identity. Listing never creates its schema, changes a task, grants
+    execution authority, or guesses ownership from ordinary assignment.
+    """
+    owner = _canonical_assignee(decision_owner)
+    if status is not None and status not in VALID_STATUSES:
+        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+    if not owner or status not in {None, "blocked"}:
+        return []
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'wc_items'",
+    ).fetchone() is None:
+        return []
+    body = "CASE WHEN json_valid(t.body) THEN t.body ELSE '{}' END"
+    clauses = [
+        "i.item_kind = 'signal'", "i.current_state = 'open'",
+        "t.status = 'blocked'", "t.current_run_id IS NULL", "t.claim_lock IS NULL",
+        "t.assignee = ?",
+        f"json_extract({body}, '$.kind') = 'workforce_signal'",
+        f"json_extract({body}, '$.decision_owner') = ?",
+        f"json_type({body}, '$.launch_authorized') = 'false'",
+        f"json_extract({body}, '$.stable_key') = i.stable_key",
+        f"json_extract({body}, '$.source_agent') = t.created_by",
+    ]
+    params: list[Any] = [owner, owner]
+    if tenant is not None:
+        clauses.append("t.tenant = ?")
+        params.append(tenant)
+    params.append(int(limit))
+    rows = conn.execute(
+        "SELECT t.* FROM tasks t JOIN wc_items i ON i.task_id = t.id "
+        f"WHERE {' AND '.join(clauses)} "
+        "ORDER BY t.priority DESC, t.created_at ASC, t.id ASC LIMIT ?", tuple(params),
+    ).fetchall()
+    return [Task.from_row(row) for row in rows]
+
+
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
