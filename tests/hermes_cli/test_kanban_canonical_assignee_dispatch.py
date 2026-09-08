@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import builtins
+from dataclasses import replace
 import json
 import os
 import subprocess
@@ -14,10 +16,12 @@ from hermes_cli import kanban_db as kb
 
 @pytest.fixture
 def canonical_root_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Create root→main and personal-only canonical workforce identities."""
+    """Create root->main plus a colliding, unrelated root profile directory."""
     home = tmp_path / ".hermes"
     (home / "profiles" / "main").mkdir(parents=True)
+    (home / "profiles" / "root").mkdir(parents=True)
     (home / "profiles" / "amy").mkdir(parents=True)
+    (home / "profiles" / "legacy").mkdir(parents=True)
     organization = tmp_path / "organization.yaml"
     organization.write_text(
         """
@@ -110,6 +114,8 @@ def _park_in_review(conn, task_id: str) -> None:
 def test_canonical_root_is_spawnable_in_ready_and_review_lanes(
     canonical_root_home: Path,
 ) -> None:
+    assert kb._resolve_dispatch_profile("root") == "main"
+    assert (canonical_root_home / "profiles" / "root").is_dir()
     with kb.connect() as conn:
         ready_id = kb.create_task(conn, title="ready", assignee="root")
         review_id = kb.create_task(conn, title="review", assignee="root")
@@ -200,13 +206,165 @@ def test_actual_review_dispatch_runs_root_on_main_profile(
 def test_direct_profiles_stay_spawnable_and_unknown_lanes_stay_skipped(
     canonical_root_home: Path,
 ) -> None:
+    assert kb._resolve_dispatch_profile("main") == "main"
+    assert kb._resolve_dispatch_profile("legacy") == "legacy"
     with kb.connect() as conn:
         direct_id = kb.create_task(conn, title="direct", assignee="main")
+        legacy_id = kb.create_task(conn, title="legacy", assignee="legacy")
         unknown_id = kb.create_task(conn, title="control plane", assignee="orion-cc")
         result = kb.dispatch_once(conn, dry_run=True)
 
     assert direct_id in [task_id for task_id, _assignee, _workspace in result.spawned]
+    assert legacy_id in [task_id for task_id, _assignee, _workspace in result.spawned]
     assert unknown_id in result.skipped_nonspawnable
+
+
+def test_dispatch_profile_refuses_inactive_profileless_and_ambiguous_agents(
+    canonical_root_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.workforce_org as workforce_org
+
+    organization = workforce_org.load_organization()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ambiguous runtime", assignee="root")
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert kb._resolve_dispatch_profile("amy") is None
+
+    profileless = replace(
+        organization.agents["root"],
+        agent="profileless",
+        display_name="Profileless",
+        profile_path=None,
+    )
+    profileless_org = replace(
+        organization,
+        agents={**organization.agents, "profileless": profileless},
+    )
+    (canonical_root_home / "profiles" / "profileless").mkdir()
+    monkeypatch.setattr(
+        workforce_org,
+        "load_organization",
+        lambda *args, **kwargs: profileless_org,
+    )
+    assert kb._resolve_dispatch_profile("profileless") is None
+
+    duplicate = replace(
+        organization.agents["root"],
+        agent="duplicate",
+        display_name="Duplicate Runtime",
+    )
+    ambiguous_org = replace(
+        organization,
+        agents={**organization.agents, "duplicate": duplicate},
+    )
+    monkeypatch.setattr(
+        workforce_org,
+        "load_organization",
+        lambda *args, **kwargs: ambiguous_org,
+    )
+    assert kb._resolve_dispatch_profile("root") is None
+    assert kb._resolve_dispatch_profile("main") is None
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("ambiguous task reached Popen"),
+    )
+    with pytest.raises(ValueError, match="no launchable Hermes profile"):
+        kb._default_spawn(task, str(canonical_root_home))
+
+
+def test_dispatch_profile_distinguishes_absent_invalid_and_unavailable_org(
+    canonical_root_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization_path = Path(os.environ["HERMES_WORKFORCE_ORG"])
+
+    organization_path.unlink()
+    assert kb._resolve_dispatch_profile("legacy") == "legacy"
+    assert kb._resolve_dispatch_profile("missing") is None
+
+    organization_path.write_text("not: [valid", encoding="utf-8")
+    assert kb._resolve_dispatch_profile("legacy") is None
+
+    original_import = builtins.__import__
+
+    def unavailable_workforce(name, *args, **kwargs):
+        if name == "hermes_cli.workforce_org":
+            raise ImportError("workforce organization unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", unavailable_workforce)
+    assert kb._resolve_dispatch_profile("legacy") is None
+    monkeypatch.setattr(builtins, "__import__", original_import)
+
+    def unavailable_profiles(name, *args, **kwargs):
+        if name == "hermes_cli.profiles":
+            raise ImportError("profiles unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", unavailable_profiles)
+    assert kb._resolve_dispatch_profile("root") == "root"
+
+
+def test_default_spawn_refuses_missing_declared_runtime_without_popen(
+    canonical_root_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="missing declared runtime", assignee="root")
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    (canonical_root_home / "profiles" / "main").rmdir()
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("refused task reached Popen"),
+    )
+
+    with kb.connect() as conn:
+        assert kb.has_spawnable_ready(conn) is False
+        result = kb.dispatch_once(conn)
+    assert result.spawned == []
+    assert result.skipped_nonspawnable == [task_id]
+    with pytest.raises(ValueError, match="no launchable Hermes profile"):
+        kb._default_spawn(task, str(tmp_path))
+
+
+def test_default_spawn_only_keeps_missing_org_legacy_fallback(
+    canonical_root_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy late profile", assignee="late-profile")
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    organization_path = Path(os.environ["HERMES_WORKFORCE_ORG"])
+    organization_path.unlink()
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured: dict = {}
+
+    class FakeProc:
+        pid = 4244
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    assert kb._default_spawn(task, str(tmp_path)) == 4244
+    assert captured["cmd"][1:3] == ["-p", "late-profile"]
+    assert captured["env"]["HERMES_PROFILE"] == "late-profile"
+
+    organization_path.write_text("not: [valid", encoding="utf-8")
+    captured.clear()
+    with pytest.raises(ValueError, match="no launchable Hermes profile"):
+        kb._default_spawn(task, str(tmp_path))
+    assert captured == {}
 
 
 def test_non_operational_workforce_assignees_are_rejected_at_create(

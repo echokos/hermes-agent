@@ -37,6 +37,7 @@ agents:
     authority: []
     prohibited_actions: []
     buzz_rooms: []
+    profile_path: /profiles/aurora
   - agent: director
     display_name: Director
     status: active
@@ -49,6 +50,7 @@ agents:
     authority: []
     prohibited_actions: []
     buzz_rooms: []
+    profile_path: /profiles/director
   - agent: builder
     display_name: Builder
     status: active
@@ -61,6 +63,7 @@ agents:
     authority: []
     prohibited_actions: []
     buzz_rooms: []
+    profile_path: /profiles/builder
   - agent: qa
     display_name: QA
     status: active
@@ -73,6 +76,7 @@ agents:
     authority: []
     prohibited_actions: []
     buzz_rooms: []
+    profile_path: /profiles/qa
 """
 
 
@@ -80,6 +84,8 @@ agents:
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    for profile in ("aurora", "director", "builder", "qa"):
+        (home / "profiles" / profile).mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     organization_dir = home / "organization"

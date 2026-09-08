@@ -12390,20 +12390,30 @@ def check_respawn_guard(
     return None
 
 
-def _resolve_dispatch_profile(assignee: Optional[str]) -> Optional[str]:
+def _resolve_dispatch_profile(
+    assignee: Optional[str],
+    *,
+    allow_missing_legacy_profile: bool = False,
+) -> Optional[str]:
     """Return the real Hermes profile used to launch an assignee's worker.
 
     Kanban keeps the task's canonical workforce assignee intact for ownership,
     events, and historical reporting.  At the dispatch boundary, though, an
     agent id may map to a differently named profile directory (for example,
-    canonical ``root`` runs from the ``main`` profile).  Direct profile names
-    remain supported unchanged; names that resolve neither way are control
-    plane lanes and must not be auto-spawned.
+    canonical ``root`` runs from the ``main`` profile). Exact canonical
+    identities take precedence over same-named profile directories. Direct
+    profile names remain supported when no canonical identity owns that name;
+    names that resolve neither way are control-plane lanes and must not be
+    auto-spawned.
 
     A known workforce identity must satisfy the canonical execution policy
     before its local profile is considered. If profile discovery is unavailable
     in a partial installation, preserve the legacy fail-open dispatch behavior
     by returning the supplied assignee.
+
+    ``allow_missing_legacy_profile`` preserves the low-level spawn helper's
+    historical normalize-and-try behavior only when the organization file is
+    genuinely absent. A loaded or broken organization remains authoritative.
     """
     if not isinstance(assignee, str) or not assignee.strip():
         return None
@@ -12418,19 +12428,54 @@ def _resolve_dispatch_profile(assignee: Optional[str]) -> Optional[str]:
         profile = normalize_profile_name(assignee)
     except (TypeError, ValueError):
         return None
-    if profile_exists(profile):
-        return profile
-
     try:
-        from hermes_cli.workforce_org import load_organization
-
-        agent = load_organization().resolve_profile(assignee)
-        if not agent.profile_path:
-            return None
-        profile = normalize_profile_name(Path(agent.profile_path).name)
+        from hermes_cli.workforce_org import (
+            WorkforceOrganizationAbsentError,
+            load_organization,
+        )
     except Exception:
         return None
-    return profile if profile_exists(profile) else None
+
+    try:
+        organization = load_organization()
+    except WorkforceOrganizationAbsentError:
+        if allow_missing_legacy_profile or profile_exists(profile):
+            return profile
+        return None
+    except Exception:
+        return None
+
+    canonical = organization.agents.get(profile)
+    if canonical is not None:
+        try:
+            agent = organization.validate_execution_profile(canonical.agent)
+            if not agent.profile_path:
+                return None
+            declared_profile = normalize_profile_name(Path(agent.profile_path).name)
+            declared = organization.from_profile_path(declared_profile)
+        except Exception:
+            return None
+        if declared.agent != agent.agent:
+            return None
+        return declared_profile if profile_exists(declared_profile) else None
+
+    declared_aliases = [
+        agent
+        for agent in organization.agents.values()
+        if agent.profile_path
+        and Path(agent.profile_path).name.casefold() == profile
+    ]
+    if declared_aliases:
+        try:
+            declared = organization.from_profile_path(profile)
+            organization.validate_execution_profile(declared.agent)
+        except Exception:
+            return None
+        return profile if profile_exists(profile) else None
+
+    if not profile_exists(profile):
+        return None
+    return profile
 
 
 def _record_non_operational_dispatch_rejection(
@@ -13923,13 +13968,15 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
-    profile_arg = _resolve_dispatch_profile(task.assignee)
+    profile_arg = _resolve_dispatch_profile(
+        task.assignee,
+        allow_missing_legacy_profile=True,
+    )
     if profile_arg is None:
-        # Dispatch eligibility already rejects unknown lanes.  Preserve the
-        # direct-call contract of this low-level helper for test harnesses and
-        # integrations that supply a profile created immediately afterward.
-        from hermes_cli.profiles import normalize_profile_name
-        profile_arg = normalize_profile_name(task.assignee)
+        raise ValueError(
+            f"task {task.id} assignee {task.assignee!r} has no launchable "
+            "Hermes profile"
+        )
 
     prompt = f"work kanban task {task.id}"
     if task.coordination_purpose == "terminal_review":
