@@ -1,7 +1,7 @@
 import asyncio
 from copy import deepcopy
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -146,6 +146,22 @@ def test_real_gateway_tick_delivers_reviewed_outcome(accepted):
     assert adapter.send.await_count == 1
     record = dl.get_operational_outcome_delivery(outcome["request_root_id"], outcome["event_id"], outcome["route"]["route_key"])
     assert record.returned_message_id == "platform-message:telegram:tick-receipt"
+
+
+def test_outcome_profile_probe_finds_route_without_writable_open(accepted):
+    with patch.object(kb, "connect", wraps=kb.connect) as spy_connect:
+        assert notices.operational_outcome_profiles({"aurora", "builder"}) == {"aurora"}
+    spy_connect.assert_not_called()
+
+
+def test_outcome_profile_probe_tolerates_legacy_schema(tmp_path, monkeypatch):
+    path = tmp_path / "legacy.db"
+    path.touch()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(path))
+
+    with patch.object(kb, "connect", wraps=kb.connect) as spy_connect:
+        assert notices.operational_outcome_profiles({"aurora"}) == set()
+    spy_connect.assert_not_called()
 
 
 def test_missing_profile_adapter_does_not_borrow_another(accepted):

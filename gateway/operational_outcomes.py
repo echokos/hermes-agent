@@ -6,6 +6,7 @@ import asyncio
 from copy import deepcopy
 import json
 import re
+import sqlite3
 from pathlib import Path
 
 from hermes_cli import kanban_db as kb
@@ -15,14 +16,20 @@ def operational_outcome_profiles(profiles: set[str]) -> set[str]:
     path = kb.kanban_db_path(kb.DEFAULT_BOARD).resolve()
     if not profiles or not path.exists():
         return set()
-    with kb.connect_closing(path) as conn:
+    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
         rows = conn.execute(
             "SELECT DISTINCT CASE WHEN json_valid(t.body) THEN "
             "json_extract(t.body,'$.context.outcome_notice.source_profile') END AS profile "
             "FROM tasks t WHERE EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=t.id "
             "AND e.kind IN ('workforce_handoff_decision_accepted','completed'))",
         ).fetchall()
-    return {row["profile"] for row in rows if row["profile"] in profiles}
+        return {row["profile"] for row in rows if row["profile"] in profiles}
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        conn.close()
 
 
 def _source_event(home: Path, context: dict, notice: dict) -> bool:
