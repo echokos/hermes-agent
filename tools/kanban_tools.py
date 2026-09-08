@@ -684,7 +684,11 @@ def _handle_list(args: dict, **kw) -> str:
             # a bounded listing was truncated without dumping the board.
             scope_profiles = None
             if workforce_scope in {"owned_outcomes", "portfolio_outcomes"}:
-                from hermes_cli.workforce_org import active_workforce_agent, load_organization
+                from hermes_cli.workforce_org import (
+                    WorkforceOrganizationError,
+                    active_workforce_agent,
+                    load_organization,
+                )
 
                 org = load_organization()
                 actor = active_workforce_agent()
@@ -699,6 +703,17 @@ def _handle_list(args: dict, **kw) -> str:
                     agent = org.get(agent_id)
                     if agent.profile_path:
                         scope_profiles.append(agent.agent)
+                        runtime = Path(agent.profile_path).name.casefold()
+                        if runtime != agent.agent:
+                            try:
+                                alias_owner = org.resolve_profile(runtime)
+                            except WorkforceOrganizationError:
+                                pass
+                            else:
+                                # Preserve historical owners without treating
+                                # another canonical agent as a runtime alias.
+                                if alias_owner.agent == agent.agent:
+                                    scope_profiles.append(runtime)
                     if workforce_scope == "portfolio_outcomes":
                         pending.extend(agent.direct_reports)
                 rows = kb.list_owned_outcome_tasks(

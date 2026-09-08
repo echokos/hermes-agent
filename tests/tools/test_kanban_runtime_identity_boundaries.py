@@ -112,6 +112,85 @@ def test_runtime_outcome_scope_filters_canonical_owners(
     assert set(result["scope_profiles"]) == expected_owners
 
 
+@pytest.mark.parametrize(
+    ("scope", "expected_owners"),
+    [
+        ("owned_outcomes", {"root", "main"}),
+        ("portfolio_outcomes", {"root", "main", "leaf", "worker"}),
+    ],
+)
+def test_runtime_outcome_scope_includes_unambiguous_legacy_owner_aliases(
+    runtime_identity_home, scope, expected_owners,
+):
+    organization = runtime_identity_home.parent / "organization.yaml"
+    data = yaml.safe_load(organization.read_text(encoding="utf-8"))
+    data["agents"] = [
+        agent for agent in data["agents"]
+        if agent["agent"] not in {"main", "foreignleaf"}
+    ]
+    next(agent for agent in data["agents"] if agent["agent"] == "elliott")[
+        "direct_reports"
+    ] = ["root"]
+    leaf = next(agent for agent in data["agents"] if agent["agent"] == "leaf")
+    (runtime_identity_home / "profiles" / "worker").mkdir()
+    leaf["profile_path"] = str(runtime_identity_home / "profiles" / "worker")
+    organization.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    outcomes = {}
+    with kb.connect_closing() as conn:
+        for owner in ("root", "main", "leaf", "worker", "unrelated"):
+            task = kb.create_task(
+                conn, title=f"{owner} legacy outcome", assignee=owner, triage=True,
+            )
+            assert kb.decompose_triage_task(
+                conn, task, root_assignee="orchestrator",
+                children=[{"title": "Execution", "assignee": "leaf", "parents": []}],
+                author="test", auto_promote=False,
+            )
+            outcomes[owner] = task
+
+    result = json.loads(kt._handle_list({"workforce_scope": scope}))
+    assert "error" not in result
+    assert {task["id"] for task in result["tasks"]} == {
+        outcomes[owner] for owner in expected_owners
+    }
+    assert set(result["scope_profiles"]) == expected_owners
+
+
+def test_portfolio_outcomes_excludes_ambiguous_and_canonical_aliases(
+    runtime_identity_home,
+):
+    organization = runtime_identity_home.parent / "organization.yaml"
+    data = yaml.safe_load(organization.read_text(encoding="utf-8"))
+    (runtime_identity_home / "profiles" / "worker").mkdir()
+    for agent in data["agents"]:
+        if agent["agent"] in {"leaf", "foreignleaf"}:
+            agent["profile_path"] = str(
+                runtime_identity_home / "profiles" / "worker"
+            )
+    organization.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    outcomes = {}
+    with kb.connect_closing() as conn:
+        for owner in ("root", "main", "leaf", "worker", "foreignleaf"):
+            task = kb.create_task(
+                conn, title=f"{owner} ambiguous outcome", assignee=owner, triage=True,
+            )
+            assert kb.decompose_triage_task(
+                conn, task, root_assignee="orchestrator",
+                children=[{"title": "Execution", "assignee": "leaf", "parents": []}],
+                author="test", auto_promote=False,
+            )
+            outcomes[owner] = task
+
+    result = json.loads(kt._handle_list({"workforce_scope": "portfolio_outcomes"}))
+    assert "error" not in result
+    assert {task["id"] for task in result["tasks"]} == {
+        outcomes["root"], outcomes["leaf"],
+    }
+    assert set(result["scope_profiles"]) == {"root", "leaf"}
+
+
 def test_secondary_api_creation_and_subscription_use_actual_runtime(
     runtime_identity_home, monkeypatch,
 ):
