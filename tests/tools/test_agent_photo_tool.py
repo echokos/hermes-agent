@@ -633,6 +633,7 @@ def test_paid_timeout_reaps_wrapper_and_child(monkeypatch, tmp_path):
     assert not state_path.exists() or state_path.read_text(encoding="utf-8").split()[2] == "Z"
 
 
+@pytest.mark.live_system_guard_bypass  # cleanup may kill a helper reparented to init
 @pytest.mark.parametrize("wrapper_exit", [0, 1])
 def test_normal_wrapper_exit_stops_detached_stdio_child_before_fallback(
     monkeypatch, personal_profile, tmp_path, wrapper_exit
@@ -649,14 +650,26 @@ def test_normal_wrapper_exit_stops_detached_stdio_child_before_fallback(
         "import pathlib,subprocess,sys; "
         "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],"
         "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
-        "pathlib.Path(sys.argv[1]).write_text(str(child.pid),encoding='utf-8'); "
+        "fields=pathlib.Path(f'/proc/{child.pid}/stat').read_text().rpartition(')')[2].split(); "
+        "pathlib.Path(sys.argv[1]).write_text(f'{child.pid} {fields[19]}',encoding='utf-8'); "
         "sys.exit(int(sys.argv[2]))"
     )
 
-    def assert_child_stopped():
-        child_pid = int(marker.read_text(encoding="utf-8"))
+    def matching_child_state():
+        child_pid_text, child_start_text = marker.read_text(encoding="utf-8").split()
+        child_pid = int(child_pid_text)
         state_path = Path(f"/proc/{child_pid}/stat")
-        assert not state_path.exists() or state_path.read_text(encoding="utf-8").split()[2] == "Z"
+        try:
+            fields = state_path.read_text(encoding="utf-8").rpartition(")")[2].split()
+        except FileNotFoundError:
+            return child_pid, None
+        if int(fields[19]) != int(child_start_text):
+            return child_pid, None
+        return child_pid, fields[0]
+
+    def assert_child_stopped():
+        _child_pid, state = matching_child_state()
+        assert state in {None, "Z"}
 
     def execute(command, **kwargs):
         if command[3] == "gemini":
@@ -678,10 +691,12 @@ def test_normal_wrapper_exit_stops_detached_stdio_child_before_fallback(
         assert_child_stopped()
     finally:
         if marker.exists():
-            try:
-                os.kill(int(marker.read_text(encoding="utf-8")), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            child_pid, state = matching_child_state()
+            if state not in {None, "Z"}:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 def test_normal_failed_wrapper_cannot_return_with_unverified_group_cleanup(monkeypatch):
