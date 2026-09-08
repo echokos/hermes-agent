@@ -189,6 +189,7 @@ def test_sync_runbook_cron_jobs_projects_trusted_dependency_ownership() -> None:
     metadata = _metadata()
     schedule = metadata["schedules"][0]
     schedule["required_tool_dependencies"] = ["mcp__nirvana__get_tasks"]
+    schedule["required_tool_dependency_mode"] = "when_invoked"
     schedule["failure_ownership"] = {
         "technical_owner": "root",
         "director": "aurora",
@@ -203,12 +204,14 @@ def test_sync_runbook_cron_jobs_projects_trusted_dependency_ownership() -> None:
     job = sync_runbook_cron_jobs("daily-brief")[0]
 
     assert job["required_tool_dependencies"] == ["mcp__nirvana__get_tasks"]
+    assert job["required_tool_dependency_mode"] == "when_invoked"
     assert job["failure_ownership"] == schedule["failure_ownership"]
 
 
 def test_omitted_runbook_ownership_does_not_clear_existing_metadata() -> None:
     _save_runbook()
     first_metadata = _metadata()
+    first_metadata["schedules"][0]["required_tool_dependency_mode"] = "when_invoked"
     first_metadata["schedules"][0]["failure_ownership"] = {
         "technical_owner": "root",
         "director": "aurora",
@@ -230,6 +233,7 @@ def test_omitted_runbook_ownership_does_not_clear_existing_metadata() -> None:
 
     assert second["id"] == first["id"]
     assert second["failure_ownership"] == first["failure_ownership"]
+    assert second["required_tool_dependency_mode"] == "when_invoked"
 
 
 def test_link_existing_cron_job_only_adds_registry_identity() -> None:

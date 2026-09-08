@@ -232,6 +232,8 @@ class TestUpdateJob:
                         "name": "new-name",
                         "evil_field": "malicious",
                         "__proto__": "hack",
+                        "required_tool_dependency_mode": "when_invoked",
+                        "required_tool_dependencies": ["mcp__nirvana__get_tasks"],
                     },
                 )
                 assert resp.status == 200
@@ -240,6 +242,8 @@ class TestUpdateJob:
                 assert "name" in sanitized
                 assert "evil_field" not in sanitized
                 assert "__proto__" not in sanitized
+                assert "required_tool_dependency_mode" not in sanitized
+                assert "required_tool_dependencies" not in sanitized
 
 
 # ---------------------------------------------------------------------------
@@ -497,4 +501,3 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
-

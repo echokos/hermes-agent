@@ -2021,6 +2021,16 @@ def _normalize_required_tool_dependencies(value: Any) -> Optional[List[str]]:
     return normalized
 
 
+def _normalize_required_tool_dependency_mode(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in {"always", "when_invoked"}:
+        raise ValueError(
+            "required_tool_dependency_mode must be 'always' or 'when_invoked'"
+        )
+    return value
+
+
 def _normalize_failure_ownership(value: Any) -> Optional[Dict[str, Any]]:
     if value is None:
         return None
@@ -2105,6 +2115,7 @@ def create_job(
     workflow_schedule_id: Optional[str] = None,
     runbook_slug: Optional[str] = None,
     track_workflow_status: bool = False,
+    required_tool_dependency_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2197,6 +2208,9 @@ def create_job(
     normalized_runtime_tool_budget = _normalize_runtime_tool_budget(runtime_tool_budget)
     normalized_required_tool_dependencies = _normalize_required_tool_dependencies(
         required_tool_dependencies
+    )
+    normalized_required_tool_dependency_mode = _normalize_required_tool_dependency_mode(
+        required_tool_dependency_mode
     )
     normalized_failure_ownership = _normalize_failure_ownership(failure_ownership)
     normalized_workdir = _normalize_workdir(workdir)
@@ -2311,6 +2325,8 @@ def create_job(
     }
     if normalized_required_tool_dependencies is not None:
         job["required_tool_dependencies"] = normalized_required_tool_dependencies
+    if normalized_required_tool_dependency_mode is not None:
+        job["required_tool_dependency_mode"] = normalized_required_tool_dependency_mode
     if normalized_failure_ownership is not None:
         job["failure_ownership"] = normalized_failure_ownership
     if normalized_workflow_id:
@@ -2427,6 +2443,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     if "required_tool_dependencies" in updates:
         updates["required_tool_dependencies"] = _normalize_required_tool_dependencies(
             updates["required_tool_dependencies"]
+        )
+    if "required_tool_dependency_mode" in updates:
+        updates["required_tool_dependency_mode"] = _normalize_required_tool_dependency_mode(
+            updates["required_tool_dependency_mode"]
         )
     if "failure_ownership" in updates:
         updates["failure_ownership"] = _normalize_failure_ownership(
@@ -2837,7 +2857,7 @@ def _mark_job_run_locked(
                         )
                     job["last_workflow_status"] = workflow_status
                 if dependency_status is not None:
-                    if dependency_status not in {"healthy", "degraded"}:
+                    if dependency_status not in {"healthy", "degraded", "not_observed"}:
                         raise ValueError(
                             f"Invalid dependency status: {dependency_status!r}"
                         )

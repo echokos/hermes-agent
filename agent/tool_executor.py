@@ -1811,6 +1811,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_use_id=tc.id,
             env=get_active_env(effective_task_id),
             config=_tool_budget,
+            task_id=effective_task_id,
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
@@ -1907,7 +1908,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     num_tools = len(parsed_calls)
     if finalize and num_tools > 0:
         turn_tool_msgs = messages[-num_tools:]
-        enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
+        enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget, task_id=effective_task_id)
 
     # ── /steer injection ──────────────────────────────────────────────
     # Append any pending user steer text to the last tool result so the
@@ -2692,6 +2693,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_use_id=tool_call.id,
             env=get_active_env(effective_task_id),
             config=_tool_budget,
+            task_id=effective_task_id,
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
         # Discover subdirectory context files from tool arguments
@@ -2808,7 +2810,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # be discarded when aggregate budget enforcement replaces a tool result.
     num_tools_seq = len(assistant_message.tool_calls)
     if finalize and num_tools_seq > 0:
-        enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
+        enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget, task_id=effective_task_id)
 
     # ── /steer injection ──────────────────────────────────────────────
     # See _execute_tool_calls_parallel for the rationale. Same hook,
@@ -2892,6 +2894,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             messages[-total_tools:],
             env=get_active_env(effective_task_id),
             config=_tool_budget,
+            task_id=effective_task_id,
         )
         agent._apply_pending_steer_to_tool_results(messages, total_tools)
 

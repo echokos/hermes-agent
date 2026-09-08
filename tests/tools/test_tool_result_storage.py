@@ -229,7 +229,7 @@ class TestMaybePersistToolResult:
             threshold=30_000,
         )
         cmd = env.execute.call_args[0][0]
-        target = cmd.split("cat > ", 1)[1].split(" <<", 1)[0]
+        target = cmd.rsplit(" > ", 1)[1]
 
         assert "Full output saved to: /tmp/hermes-results/outside_whoami_x_" in result
         assert "/tmp/hermes-results/../" not in result
