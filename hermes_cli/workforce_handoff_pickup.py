@@ -37,6 +37,30 @@ def _canonical_agent(value: str, *, field: str) -> str:
     return load_organization().validate_execution_profile(candidate).agent
 
 
+def _canonical_execution_profile(
+    value: str | None, *, target_agent: str,
+) -> str:
+    """Validate the concrete profile directory for a canonical target actor."""
+    from hermes_cli.profiles import normalize_profile_name
+
+    organization = load_organization()
+    target = organization.validate_execution_profile(target_agent)
+    if value is None:
+        if not target.profile_path:
+            raise ValueError("target workforce agent has no execution profile")
+        candidate = normalize_profile_name(Path(target.profile_path).name)
+    else:
+        candidate = normalize_profile_name(value)
+    declared = organization.from_profile_path(candidate)
+    resolved = organization.validate_execution_profile(declared.agent)
+    declared_profile = (
+        Path(resolved.profile_path).name.casefold() if resolved.profile_path else ""
+    )
+    if resolved.agent != target_agent or declared_profile != candidate:
+        raise ValueError("execution_profile does not match the target workforce agent")
+    return candidate
+
+
 def _bounded_identifier(value: str, *, prefix: str) -> str:
     candidate = str(value or "").strip()
     if not candidate.startswith(prefix) or len(candidate) > 160:
@@ -105,8 +129,10 @@ def _pickup_env(
     task_id: str,
     request_root_id: str,
     target_agent: str,
+    execution_profile: str | None = None,
     source_agent: str,
 ) -> dict[str, str]:
+    profile = execution_profile or target_agent
     env = dict(os.environ)
     from gateway.session_context import _VAR_MAP
 
@@ -117,8 +143,8 @@ def _pickup_env(
             env.pop(key, None)
 
     env.update({
-        "HERMES_HOME": resolve_profile_env(target_agent),
-        "HERMES_PROFILE": target_agent,
+        "HERMES_HOME": resolve_profile_env(profile),
+        "HERMES_PROFILE": profile,
         # This must exist before cmd_chat resolves --continue/create-if-missing.
         "HERMES_SESSION_SOURCE": "tool",
         "HERMES_KANBAN_DB": str(database_path.resolve()),
@@ -133,10 +159,17 @@ def _pickup_env(
     return env
 
 
-def _pickup_command(*, target_agent: str, request_root_id: str, task_id: str) -> list[str]:
+def _pickup_command(
+    *,
+    target_agent: str,
+    request_root_id: str,
+    task_id: str,
+    execution_profile: str | None = None,
+) -> list[str]:
+    profile = execution_profile or target_agent
     return [
         *_resolve_hermes_argv(),
-        "-p", target_agent,
+        "-p", profile,
         "--cli",
         "chat",
         "-Q",
@@ -206,6 +239,7 @@ async def run_workforce_handoff_pickup(
     task_id: str,
     request_root_id: str,
     target_agent: str,
+    execution_profile: str | None = None,
     source_agent: str,
     database_path: Path,
 ) -> WorkforceHandoffPickupResult:
@@ -214,6 +248,10 @@ async def run_workforce_handoff_pickup(
     request_root_id = _bounded_identifier(request_root_id, prefix="cr_")
     target_agent = _canonical_agent(target_agent, field="target_agent")
     source_agent = _canonical_agent(source_agent, field="source_agent")
+    execution_profile = _canonical_execution_profile(
+        execution_profile,
+        target_agent=target_agent,
+    )
     db_path = Path(database_path).expanduser()
     if not db_path.is_absolute() or not db_path.is_file():
         raise ValueError("database_path must be an existing absolute file")
@@ -222,10 +260,14 @@ async def run_workforce_handoff_pickup(
         task_id=task_id,
         request_root_id=request_root_id,
         target_agent=target_agent,
+        execution_profile=execution_profile,
         source_agent=source_agent,
     )
     command = _pickup_command(
-        target_agent=target_agent, request_root_id=request_root_id, task_id=task_id
+        target_agent=target_agent,
+        execution_profile=execution_profile,
+        request_root_id=request_root_id,
+        task_id=task_id,
     )
     log_path, log_file = _open_pickup_log(db_path, task_id)
     with log_file:

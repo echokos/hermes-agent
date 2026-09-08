@@ -128,6 +128,79 @@ def _task_body_forbids_launch(body: Optional[str]) -> bool:
         return False
     return isinstance(payload, dict) and payload.get("launch_authorized") is False
 
+
+def _workforce_handoff_launch_refusal(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    body: Optional[str],
+    request_root_id: Optional[str],
+    assignee: Optional[str],
+    launch_phase: str,
+) -> Optional[str]:
+    """Return why a structured workforce handoff is not launchable.
+
+    Every handoff must be accepted, current, and routed to the actor authorized
+    for the phase that will actually launch. An owned operational failure also
+    must be linked to its own bounded coordination request.
+    """
+    if not isinstance(body, str) or not body.strip():
+        return None
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("kind") != "workforce_handoff":
+        return None
+    state = payload.get("state")
+    if not isinstance(state, str) or state not in {"accepted", "active"}:
+        return "workforce handoff state is not launchable"
+
+    def route_actor(field: str) -> Optional[str]:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            return _canonical_assignee(value)
+        except (TypeError, ValueError):
+            return None
+
+    target = route_actor("target_agent")
+    if target is None:
+        return "workforce handoff target agent is invalid"
+    source = route_actor("source_agent")
+    if source is None:
+        return "workforce handoff source agent is invalid"
+    try:
+        current_actor = _canonical_assignee(assignee)
+    except (TypeError, ValueError):
+        current_actor = None
+    if launch_phase == "work":
+        if current_actor != target:
+            return "workforce handoff work is not assigned to its target"
+    elif launch_phase == "review":
+        if (
+            payload.get("requires_source_acceptance") is True
+            and current_actor != source
+        ):
+            return "workforce handoff review is not assigned to its source"
+    else:
+        return "workforce handoff launch phase is invalid"
+
+    context = payload.get("context")
+    if not isinstance(context, dict) or context.get("kind") != "owned_operational_failure":
+        return None
+    if not request_root_id:
+        return "owned-failure handoff has no coordination request"
+    request = get_coordination_request(conn, request_root_id)
+    if request is None:
+        return "owned-failure handoff coordination request is missing"
+    if request.kind != "owned_operational_failure":
+        return "owned-failure handoff coordination request has the wrong kind"
+    if request.root_task_id != task_id:
+        return "owned-failure handoff coordination request belongs to another task"
+    return None
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -1350,6 +1423,29 @@ class CoordinationLaunchDeferred(RuntimeError):
         self.request_root_id = request_root_id
         self.reason = reason
         super().__init__(f"coordination request {request_root_id}: {reason}")
+
+
+class CoordinationLaunchRefused(RuntimeError):
+    """A task's typed admission invariant rejected launch without writes."""
+
+    def __init__(self, task_id: str, reason: str):
+        self.task_id = task_id
+        self.reason = reason
+        super().__init__(f"task {task_id}: {reason}")
+
+
+class _DispatchProfileCapacityDeferred(RuntimeError):
+    """A concrete execution profile has no dispatch capacity this tick."""
+
+    def __init__(self, task_id: str, assignee: str, profile: str, current: int):
+        self.task_id = task_id
+        self.assignee = assignee
+        self.profile = profile
+        self.current = current
+        super().__init__(
+            f"task {task_id}: execution profile {profile!r} has "
+            f"{current} running tasks"
+        )
 
 
 @dataclass
@@ -4724,6 +4820,7 @@ def has_coordination_tick_work(
     *,
     board: Optional[str] = None,
     notifier_profiles: Optional[Iterable[str]] = None,
+    notifier_agents: Optional[Iterable[str]] = None,
     include_unowned: bool = False,
 ) -> bool:
     """Cheap read-only probe for final-return or owned-failure intake work.
@@ -4741,6 +4838,15 @@ def has_coordination_tick_work(
             str(profile).strip()
             for profile in notifier_profiles
             if str(profile).strip()
+        }
+    )
+    agents = (
+        profiles
+        if notifier_agents is None
+        else {
+            str(agent).strip()
+            for agent in notifier_agents
+            if str(agent).strip()
         }
     )
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
@@ -4762,7 +4868,7 @@ def has_coordination_tick_work(
                 "AND status IN ('active', 'return_pending')"
             ).fetchall()
             for request in requests:
-                if profiles is not None and request["responsible_agent"] not in profiles:
+                if agents is not None and request["responsible_agent"] not in agents:
                     continue
                 routes = conn.execute(
                     "SELECT notifier_profile, delivery_mode FROM kanban_notify_subs "
@@ -4780,15 +4886,15 @@ def has_coordination_tick_work(
 
             params: list[Any] = []
             assignee_clause = ""
-            if profiles is not None:
-                if not profiles:
+            if agents is not None:
+                if not agents:
                     return False
                 assignee_clause = (
                     " AND assignee IN ("
-                    + ",".join("?" for _ in profiles)
+                    + ",".join("?" for _ in agents)
                     + ")"
                 )
-                params.extend(sorted(profiles))
+                params.extend(sorted(agents))
             candidates = conn.execute(
                 "SELECT assignee, body FROM tasks WHERE status = 'triage' "
                 "AND body LIKE '%\"kind\": \"workforce_handoff\"%'"
@@ -4829,6 +4935,7 @@ def prepare_coordination_final_return_deliveries(
     conn: sqlite3.Connection,
     *,
     notifier_profiles: Optional[Iterable[str]] = None,
+    notifier_agents: Optional[Iterable[str]] = None,
     include_unowned: bool = False,
     now: Optional[int] = None,
 ) -> list[dict[str, Any]]:
@@ -4849,6 +4956,15 @@ def prepare_coordination_final_return_deliveries(
             if str(profile).strip()
         }
     )
+    agents = (
+        profiles
+        if notifier_agents is None
+        else {
+            str(agent).strip()
+            for agent in notifier_agents
+            if str(agent).strip()
+        }
+    )
     rows = conn.execute(
         "SELECT id FROM coordination_requests WHERE kind = 'origin_request' "
         "AND status IN ('active', 'return_pending') ORDER BY created_at, id"
@@ -4857,7 +4973,7 @@ def prepare_coordination_final_return_deliveries(
         request = get_coordination_request(conn, row["id"])
         if request is None:
             continue
-        if profiles is not None and request.responsible_agent not in profiles:
+        if agents is not None and request.responsible_agent not in agents:
             continue
         try:
             route = _coordination_final_route(conn, request.root_task_id)
@@ -4891,7 +5007,7 @@ def prepare_coordination_final_return_deliveries(
         request = get_coordination_request(conn, row["id"])
         if request is None:
             continue
-        if profiles is not None and request.responsible_agent not in profiles:
+        if agents is not None and request.responsible_agent not in agents:
             continue
         try:
             route = _coordination_final_route(conn, request.root_task_id)
@@ -5037,6 +5153,16 @@ def reserve_coordination_launch(
     task = get_task(conn, task_id)
     if task is None:
         raise ValueError(f"unknown task: {task_id}")
+    admission_refusal = _workforce_handoff_launch_refusal(
+        conn,
+        task_id=task.id,
+        body=task.body,
+        request_root_id=task.request_root_id,
+        assignee=task.assignee,
+        launch_phase="review" if task.status == "review" else "work",
+    )
+    if admission_refusal:
+        raise CoordinationLaunchRefused(task.id, admission_refusal)
     if not task.request_root_id:
         return None
     if task.status not in {"ready", "review"}:
@@ -5047,10 +5173,33 @@ def reserve_coordination_launch(
         from hermes_cli.workforce_org import load_organization
 
         organization = load_organization()
-    role = coordination_execution_role(task.assignee, organization=organization)
     timestamp = int(time.time() if now is None else now)
 
     with write_txn(conn, allow_nested=True):
+        task = get_task(conn, task_id)
+        if task is None:
+            raise ValueError(f"unknown task: {task_id}")
+        if task.status not in {"ready", "review"}:
+            raise ValueError("coordination launch must be reserved before task claim")
+        admission_refusal = _workforce_handoff_launch_refusal(
+            conn,
+            task_id=task.id,
+            body=task.body,
+            request_root_id=task.request_root_id,
+            assignee=task.assignee,
+            launch_phase="review" if task.status == "review" else "work",
+        )
+        if admission_refusal:
+            raise CoordinationLaunchRefused(task.id, admission_refusal)
+        if not task.assignee:
+            raise CoordinationBudgetExceeded(
+                task.request_root_id,
+                "task has no assignee",
+            )
+        role = coordination_execution_role(
+            task.assignee,
+            organization=organization,
+        )
         request = get_coordination_request(conn, task.request_root_id)
         if request is None:
             raise CoordinationBudgetExceeded(task.request_root_id, "request root is missing")
@@ -5136,8 +5285,15 @@ def claim_task_for_dispatch(
     organization=None,
     now: Optional[int] = None,
     board: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
 ) -> tuple[Optional[Task], Optional[CoordinationLaunchReservation]]:
-    """Atomically reserve request capacity and claim one dispatchable task."""
+    """Atomically reserve request capacity and claim one dispatchable task.
+
+    When a concrete-profile cap is supplied, its final check shares this
+    transaction with the fresh status/assignee read and precedes every launch
+    reservation or claim write. This closes the reassignment window between a
+    dispatch loop's optimistic capacity check and the durable claim.
+    """
     claimed: Optional[Task] = None
     reservation: Optional[CoordinationLaunchReservation] = None
     with write_txn(conn):
@@ -5145,6 +5301,17 @@ def claim_task_for_dispatch(
         expected_status = "review" if review else "ready"
         if task is None or task.status != expected_status:
             return None, None
+
+        admission_refusal = _workforce_handoff_launch_refusal(
+            conn,
+            task_id=task.id,
+            body=task.body,
+            request_root_id=task.request_root_id,
+            assignee=task.assignee,
+            launch_phase="review" if review else "work",
+        )
+        if admission_refusal:
+            raise CoordinationLaunchRefused(task.id, admission_refusal)
 
         # Let the canonical claim functions persist their structural rejection
         # without consuming a request launch. Under BEGIN IMMEDIATE no writer
@@ -5169,6 +5336,25 @@ def claim_task_for_dispatch(
                 _fire_lifecycle=False,
             )
             return None, None
+
+        profile_cap = max_in_progress_per_profile if (
+            isinstance(max_in_progress_per_profile, int)
+            and max_in_progress_per_profile > 0
+        ) else None
+        if profile_cap is not None:
+            profile = _resolve_dispatch_profile(task.assignee)
+            if profile is None:
+                raise CoordinationLaunchRefused(
+                    task.id, "assignee has no launchable Hermes profile"
+                )
+            current = _dispatch_profile_running_counts(conn).get(profile, 0)
+            if current >= profile_cap:
+                raise _DispatchProfileCapacityDeferred(
+                    task.id,
+                    task.assignee or "",
+                    profile,
+                    current,
+                )
 
         reservation = reserve_coordination_launch(
             conn,
@@ -6507,12 +6693,23 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, body, consecutive_failures, max_retries "
+            "SELECT id, status, body, assignee, request_root_id, "
+            "consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            resume_status = _resume_status_from_events(conn, task_id)
+            if _workforce_handoff_launch_refusal(
+                conn,
+                task_id=task_id,
+                body=row["body"],
+                request_root_id=row["request_root_id"],
+                assignee=row["assignee"],
+                launch_phase="review" if resume_status == "review" else "work",
+            ):
+                continue
             if _task_body_forbids_launch(row["body"]):
                 if cur_status != "blocked":
                     conn.execute(
@@ -6539,7 +6736,6 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
-                resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -6609,8 +6805,22 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn, allow_nested=_allow_nested):
         guarded = conn.execute(
-            "SELECT status, body FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, body, assignee, request_root_id FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
+        if (
+            guarded is not None
+            and guarded["status"] == "ready"
+            and _workforce_handoff_launch_refusal(
+                conn,
+                task_id=task_id,
+                body=guarded["body"],
+                request_root_id=guarded["request_root_id"],
+                assignee=guarded["assignee"],
+                launch_phase="work",
+            )
+        ):
+            return None
         if (
             guarded is not None
             and guarded["status"] == "ready"
@@ -6763,6 +6973,23 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn, allow_nested=_allow_nested):
+        guarded = conn.execute(
+            "SELECT status, body, assignee, request_root_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            guarded is not None
+            and guarded["status"] == "review"
+            and _workforce_handoff_launch_refusal(
+                conn,
+                task_id=task_id,
+                body=guarded["body"],
+                request_root_id=guarded["request_root_id"],
+                assignee=guarded["assignee"],
+                launch_phase="review",
+            )
+        ):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -7231,6 +7458,10 @@ def _verify_created_cards(
     * ``created_by`` matches the completing task's ``assignee`` profile
       (the common case: worker A spawns a card via ``kanban_create``,
       which stamps ``created_by=A``).
+    * In a valid workforce organization, mismatched labels resolve
+      canonical-first to the same agent. This accepts a legacy runtime alias
+      such as ``main`` completing a card stamped by canonical ``root``, while
+      a colliding canonical ``main`` that owns another profile stays distinct.
     * ``created_by`` matches the completing task's id (edge case where
       a worker passed its own task id as the ``created_by`` value).
     * The card is linked as a ``task_links.child`` of the completing
@@ -7240,7 +7471,7 @@ def _verify_created_cards(
       the completing task by the worker.
 
     ``phantom`` returns ids that either don't exist at all, or exist
-    but don't satisfy any of the three trust conditions. The caller
+    but don't satisfy any trust condition. The caller
     decides what to do with each bucket; this helper never mutates.
     """
     claimed = [str(x).strip() for x in (claimed_ids or []) if str(x).strip()]
@@ -7262,6 +7493,26 @@ def _verify_created_cards(
         return [], ordered
     completing_assignee = row["assignee"]
 
+    organization = None
+    completing_agent = None
+    if completing_assignee:
+        from hermes_cli.workforce_org import (
+            WorkforceOrganizationError,
+            load_organization,
+        )
+
+        try:
+            organization = load_organization()
+            completing_agent = organization.resolve_profile(
+                completing_assignee
+            ).agent
+        except (WorkforceOrganizationError, UnicodeError):
+            # Organization identity is an additional trust proof only. An
+            # absent, invalid, ambiguous, or partial installation must not
+            # widen the existing exact/task-id/link acceptance boundary.
+            organization = None
+            completing_agent = None
+
     # Batch-fetch existence + created_by in one query.
     placeholders = ",".join(["?"] * len(ordered))
     rows = conn.execute(
@@ -7281,13 +7532,26 @@ def _verify_created_cards(
         if created_by is None:
             phantom.append(cid)
             continue
-        # Accept if any of the three trust conditions holds.
+        # Preserve the historical exact/task-id/link proofs before consulting
+        # canonical workforce identity as a best-effort additional proof.
         if completing_assignee and created_by == completing_assignee:
             verified.append(cid)
         elif created_by == completing_task_id:
             verified.append(cid)
         elif cid in linked_children:
             verified.append(cid)
+        elif organization is not None and completing_agent is not None:
+            try:
+                same_agent = (
+                    organization.resolve_profile(created_by).agent
+                    == completing_agent
+                )
+            except WorkforceOrganizationError:
+                same_agent = False
+            if same_agent:
+                verified.append(cid)
+            else:
+                phantom.append(cid)
         else:
             phantom.append(cid)
     return verified, phantom
@@ -9246,7 +9510,8 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, body, assignee, request_root_id FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -9257,6 +9522,17 @@ def promote_task(
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
         )
+
+    admission_refusal = _workforce_handoff_launch_refusal(
+        conn,
+        task_id=task_id,
+        body=row["body"],
+        request_root_id=row["request_root_id"],
+        assignee=row["assignee"],
+        launch_phase="work",
+    )
+    if admission_refusal:
+        return False, admission_refusal
 
     if not force:
         parents = conn.execute(
@@ -9279,6 +9555,22 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        fresh = conn.execute(
+            "SELECT status, body, assignee, request_root_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if fresh is None or fresh["status"] not in ("todo", "blocked"):
+            return False, f"task {task_id} status changed during promotion"
+        admission_refusal = _workforce_handoff_launch_refusal(
+            conn,
+            task_id=task_id,
+            body=fresh["body"],
+            request_root_id=fresh["request_root_id"],
+            assignee=fresh["assignee"],
+            launch_phase="work",
+        )
+        if admission_refusal:
+            return False, admission_refusal
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
@@ -9358,7 +9650,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, body, assignee, request_root_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         resume_status = (
@@ -9366,6 +9658,15 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if current and current["status"] == "blocked"
             else "ready"
         )
+        if current is not None and _workforce_handoff_launch_refusal(
+            conn,
+            task_id=task_id,
+            body=current["body"],
+            request_root_id=current["request_root_id"],
+            assignee=current["assignee"],
+            launch_phase="review" if resume_status == "review" else "work",
+        ):
+            return False
         _reclaim_dangling_run(
             conn, task_id, statuses=("blocked", "scheduled"), now=now,
             note="invariant recovery on unblock",
@@ -10590,9 +10891,9 @@ class DispatchResult:
     Unlike ``skipped_nonspawnable``, these assignments violate durable
     workforce policy and are surfaced as operator-actionable errors."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
-    """Tasks deferred this tick because their assignee is already at
+    """Tasks deferred because their resolved execution profile is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
-    ``(task_id, assignee, current_running_count)``. NOT an
+    ``(task_id, canonical_assignee, current_running_count)``. NOT an
     operator-actionable failure — the task will be picked up on a
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
@@ -10631,7 +10932,7 @@ class DispatchResult:
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
     coordination_deferred: list[tuple[str, str]] = field(default_factory=list)
-    """Tasks left queued by a healthy request-local concurrency/recovery gate."""
+    """Tasks left queued by request-local or typed admission gates."""
     coordination_guardrails: list[tuple[str, str, str]] = field(
         default_factory=list
     )
@@ -12166,20 +12467,30 @@ def check_respawn_guard(
     return None
 
 
-def _resolve_dispatch_profile(assignee: Optional[str]) -> Optional[str]:
+def _resolve_dispatch_profile(
+    assignee: Optional[str],
+    *,
+    allow_missing_legacy_profile: bool = False,
+) -> Optional[str]:
     """Return the real Hermes profile used to launch an assignee's worker.
 
     Kanban keeps the task's canonical workforce assignee intact for ownership,
     events, and historical reporting.  At the dispatch boundary, though, an
     agent id may map to a differently named profile directory (for example,
-    canonical ``root`` runs from the ``main`` profile).  Direct profile names
-    remain supported unchanged; names that resolve neither way are control
-    plane lanes and must not be auto-spawned.
+    canonical ``root`` runs from the ``main`` profile). Exact canonical
+    identities take precedence over same-named profile directories. Direct
+    profile names remain supported when no canonical identity owns that name;
+    names that resolve neither way are control-plane lanes and must not be
+    auto-spawned.
 
     A known workforce identity must satisfy the canonical execution policy
     before its local profile is considered. If profile discovery is unavailable
     in a partial installation, preserve the legacy fail-open dispatch behavior
     by returning the supplied assignee.
+
+    ``allow_missing_legacy_profile`` preserves the low-level spawn helper's
+    historical normalize-and-try behavior only when the organization file is
+    genuinely absent. A loaded or broken organization remains authoritative.
     """
     if not isinstance(assignee, str) or not assignee.strip():
         return None
@@ -12194,19 +12505,71 @@ def _resolve_dispatch_profile(assignee: Optional[str]) -> Optional[str]:
         profile = normalize_profile_name(assignee)
     except (TypeError, ValueError):
         return None
-    if profile_exists(profile):
-        return profile
-
     try:
-        from hermes_cli.workforce_org import load_organization
-
-        agent = load_organization().resolve_profile(assignee)
-        if not agent.profile_path:
-            return None
-        profile = normalize_profile_name(Path(agent.profile_path).name)
+        from hermes_cli.workforce_org import (
+            WorkforceOrganizationAbsentError,
+            load_organization,
+        )
     except Exception:
         return None
-    return profile if profile_exists(profile) else None
+
+    try:
+        organization = load_organization()
+    except WorkforceOrganizationAbsentError:
+        if allow_missing_legacy_profile or profile_exists(profile):
+            return profile
+        return None
+    except Exception:
+        return None
+
+    canonical = organization.agents.get(profile)
+    if canonical is not None:
+        try:
+            agent = organization.validate_execution_profile(canonical.agent)
+            if not agent.profile_path:
+                return None
+            declared_profile = normalize_profile_name(Path(agent.profile_path).name)
+            declared = organization.from_profile_path(declared_profile)
+        except Exception:
+            return None
+        if declared.agent != agent.agent:
+            return None
+        return declared_profile if profile_exists(declared_profile) else None
+
+    declared_aliases = [
+        agent
+        for agent in organization.agents.values()
+        if agent.profile_path
+        and Path(agent.profile_path).name.casefold() == profile
+    ]
+    if declared_aliases:
+        try:
+            declared = organization.from_profile_path(profile)
+            organization.validate_execution_profile(declared.agent)
+        except Exception:
+            return None
+        return profile if profile_exists(profile) else None
+
+    if not profile_exists(profile):
+        return None
+    return profile
+
+
+def _dispatch_profile_running_counts(
+    conn: sqlite3.Connection,
+) -> dict[str, int]:
+    """Aggregate running work by the concrete profile that executes it."""
+    counts: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks "
+        "WHERE status = 'running' AND assignee IS NOT NULL "
+        "GROUP BY assignee"
+    ):
+        profile = _resolve_dispatch_profile(row["assignee"])
+        if profile is None:
+            continue
+        counts[profile] = counts.get(profile, 0) + int(row["n"])
+    return counts
 
 
 def _record_non_operational_dispatch_rejection(
@@ -12252,13 +12615,22 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee, body, request_root_id FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
     if not rows:
         return False
     for row in rows:
+        if _workforce_handoff_launch_refusal(
+            conn,
+            task_id=row["id"],
+            body=row["body"],
+            request_root_id=row["request_root_id"],
+            assignee=row["assignee"],
+            launch_phase="work",
+        ):
+            continue
         if _resolve_dispatch_profile(row["assignee"]) is not None:
             return True
     return False
@@ -12273,13 +12645,22 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     should have spawned a review agent.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee, body, request_root_id FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
     if not rows:
         return False
     for row in rows:
+        if _workforce_handoff_launch_refusal(
+            conn,
+            task_id=row["id"],
+            body=row["body"],
+            request_root_id=row["request_root_id"],
+            assignee=row["assignee"],
+            launch_phase="review",
+        ):
+            continue
         if _resolve_dispatch_profile(row["assignee"]) is not None:
             return True
     return False
@@ -12733,7 +13114,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, body, request_root_id FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -12745,20 +13126,17 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
-    _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
+    _per_profile_running = (
+        _dispatch_profile_running_counts(conn)
+        if _per_profile_cap is not None
+        else {}
+    )
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, body, request_root_id FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -12779,11 +13157,21 @@ def _dispatch_once_locked(
             return False
         if not review_rows:
             return False
-        if _resolve_dispatch_profile(assignee) is None:
+        if _workforce_handoff_launch_refusal(
+            conn,
+            task_id=row["id"],
+            body=row["body"],
+            request_root_id=row["request_root_id"],
+            assignee=assignee,
+            launch_phase="review",
+        ):
+            return False
+        profile = _resolve_dispatch_profile(assignee)
+        if profile is None:
             return False
         if (
             _per_profile_cap is not None
-            and _per_profile_running.get(assignee, 0) >= _per_profile_cap
+            and _per_profile_running.get(profile, 0) >= _per_profile_cap
         ):
             return False
         if coordination_launch_deferral_reason(conn, row["id"]):
@@ -12792,6 +13180,11 @@ def _dispatch_once_locked(
 
     reserved_review = next(
         (row for row in review_rows if _spawnable_review(row)), None,
+    )
+    reserved_review_profile = (
+        _resolve_dispatch_profile(reserved_review["assignee"])
+        if reserved_review is not None
+        else None
     )
 
     ready_budget = spawn_budget
@@ -12824,9 +13217,18 @@ def _dispatch_once_locked(
                 review=review,
                 ttl_seconds=ttl_seconds,
                 board=board,
+                max_in_progress_per_profile=_per_profile_cap,
             )
             return claimed_task
+        except _DispatchProfileCapacityDeferred as exc:
+            result.skipped_per_profile_capped.append(
+                (exc.task_id, exc.assignee, exc.current)
+            )
+            return None
         except CoordinationLaunchDeferred as exc:
+            result.coordination_deferred.append((task_id, exc.reason))
+            return None
+        except CoordinationLaunchRefused as exc:
             result.coordination_deferred.append((task_id, exc.reason))
             return None
         except CoordinationBudgetExceeded as exc:
@@ -12849,6 +13251,17 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        admission_refusal = _workforce_handoff_launch_refusal(
+            conn,
+            task_id=row["id"],
+            body=row["body"],
+            request_root_id=row["request_root_id"],
+            assignee=row["assignee"],
+            launch_phase="work",
+        )
+        if admission_refusal:
+            result.coordination_deferred.append((row["id"], admission_refusal))
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -12916,7 +13329,8 @@ def _dispatch_once_locked(
                     conn, row["id"], row_assignee, policy_reason,
                 )
             continue
-        if _resolve_dispatch_profile(row_assignee) is None:
+        row_profile = _resolve_dispatch_profile(row_assignee)
+        if row_profile is None:
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -12932,10 +13346,10 @@ def _dispatch_once_locked(
         # while the global max_in_progress / max_spawn caps still allow
         # work on OTHER profiles.
         if _per_profile_cap is not None:
-            current = _per_profile_running.get(row_assignee, 0)
+            current = _per_profile_running.get(row_profile, 0)
             if (
-                reserved_review is not None
-                and row_assignee == reserved_review["assignee"]
+                reserved_review_profile is not None
+                and row_profile == reserved_review_profile
                 and current >= _per_profile_cap - 1
             ):
                 # Keep the final profile-local slot available for the review
@@ -12974,9 +13388,9 @@ def _dispatch_once_locked(
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
             # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
-                _per_profile_running[row_assignee] = (
-                    _per_profile_running.get(row_assignee, 0) + 1
+            if _per_profile_cap is not None:
+                _per_profile_running[row_profile] = (
+                    _per_profile_running.get(row_profile, 0) + 1
                 )
             continue
         claimed = _claim_with_coordination(row["id"], review=False)
@@ -13038,9 +13452,11 @@ def _dispatch_once_locked(
             # iterations in this same tick respect the per-profile cap
             # (#21582). Subsequent ticks re-query from the DB.
             if _per_profile_cap is not None and claimed.assignee:
-                _per_profile_running[claimed.assignee] = (
-                    _per_profile_running.get(claimed.assignee, 0) + 1
-                )
+                claimed_profile = _resolve_dispatch_profile(claimed.assignee)
+                if claimed_profile is not None:
+                    _per_profile_running[claimed_profile] = (
+                        _per_profile_running.get(claimed_profile, 0) + 1
+                    )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -13072,6 +13488,17 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        admission_refusal = _workforce_handoff_launch_refusal(
+            conn,
+            task_id=row["id"],
+            body=row["body"],
+            request_root_id=row["request_root_id"],
+            assignee=row["assignee"],
+            launch_phase="review",
+        )
+        if admission_refusal:
+            result.coordination_deferred.append((row["id"], admission_refusal))
+            continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -13085,11 +13512,12 @@ def _dispatch_once_locked(
                     conn, row["id"], row["assignee"], policy_reason,
                 )
             continue
-        if _resolve_dispatch_profile(row["assignee"]) is None:
+        row_profile = _resolve_dispatch_profile(row["assignee"])
+        if row_profile is None:
             result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:
-            current = _per_profile_running.get(row["assignee"], 0)
+            current = _per_profile_running.get(row_profile, 0)
             if current >= _per_profile_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row["assignee"], current)
@@ -13109,8 +13537,8 @@ def _dispatch_once_locked(
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
             if _per_profile_cap is not None:
-                _per_profile_running[row["assignee"]] = (
-                    _per_profile_running.get(row["assignee"], 0) + 1
+                _per_profile_running[row_profile] = (
+                    _per_profile_running.get(row_profile, 0) + 1
                 )
             continue
         claimed = _claim_with_coordination(row["id"], review=True)
@@ -13173,9 +13601,11 @@ def _dispatch_once_locked(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
-                _per_profile_running[claimed.assignee] = (
-                    _per_profile_running.get(claimed.assignee, 0) + 1
-                )
+                claimed_profile = _resolve_dispatch_profile(claimed.assignee)
+                if claimed_profile is not None:
+                    _per_profile_running[claimed_profile] = (
+                        _per_profile_running.get(claimed_profile, 0) + 1
+                    )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -13647,13 +14077,15 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
-    profile_arg = _resolve_dispatch_profile(task.assignee)
+    profile_arg = _resolve_dispatch_profile(
+        task.assignee,
+        allow_missing_legacy_profile=True,
+    )
     if profile_arg is None:
-        # Dispatch eligibility already rejects unknown lanes.  Preserve the
-        # direct-call contract of this low-level helper for test harnesses and
-        # integrations that supply a profile created immediately afterward.
-        from hermes_cli.profiles import normalize_profile_name
-        profile_arg = normalize_profile_name(task.assignee)
+        raise ValueError(
+            f"task {task.id} assignee {task.assignee!r} has no launchable "
+            "Hermes profile"
+        )
 
     prompt = f"work kanban task {task.id}"
     if task.coordination_purpose == "terminal_review":

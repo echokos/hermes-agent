@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from hermes_cli.workforce_org import (
+    WorkforceOrganizationAbsentError,
     WorkforceOrganizationError,
     load_organization,
     validate_workflow_profiles,
@@ -36,6 +37,17 @@ def test_unknown_workflow_owner_fails_closed():
     org = load_organization(SOURCE)
     with pytest.raises(WorkforceOrganizationError):
         validate_workflow_profiles(org, "stranger", [])
+
+
+def test_organization_load_distinguishes_absent_from_present_invalid(tmp_path):
+    path = tmp_path / "organization.yaml"
+    with pytest.raises(WorkforceOrganizationAbsentError):
+        load_organization(path)
+
+    path.write_text("not: [valid", encoding="utf-8")
+    with pytest.raises(WorkforceOrganizationError) as invalid:
+        load_organization(path)
+    assert not isinstance(invalid.value, WorkforceOrganizationAbsentError)
 
 
 def test_manager_cycle_is_rejected(tmp_path):

@@ -1,15 +1,20 @@
 """Canonical coordination polling and receipt-backed final-return ownership."""
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import yaml
 
 from gateway.config import Platform
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_watchers import (
+    GatewayKanbanWatchersMixin,
+    _execution_profile_agents,
+)
 from hermes_cli import kanban_db as kb
 from tests.hermes_cli.test_coordination_requests import ORGANIZATION
 
@@ -36,7 +41,13 @@ class Runner(GatewayKanbanWatchersMixin):
 def board(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     (home / "organization").mkdir(parents=True)
-    (home / "organization" / "organization.yaml").write_text(ORGANIZATION)
+    organization = yaml.safe_load(ORGANIZATION)
+    for agent in organization["agents"]:
+        if agent["operational"]:
+            agent["profile_path"] = f"/profiles/{agent['agent']}"
+    (home / "organization" / "organization.yaml").write_text(
+        yaml.safe_dump(organization, sort_keys=False)
+    )
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
@@ -203,6 +214,307 @@ def test_pickup_without_adapter_or_sub_does_not_block_next_tick(board, monkeypat
         await asyncio.gather(*runner._kanban_coordination_jobs.values())
 
     asyncio.run(scenario())
+
+
+def test_execution_profile_projection_distinguishes_absent_and_invalid_org(
+    tmp_path, monkeypatch,
+):
+    organization = tmp_path / "organization.yaml"
+    monkeypatch.setenv("HERMES_WORKFORCE_ORG", str(organization))
+    assert _execution_profile_agents({"legacy"}) == {"legacy": "legacy"}
+
+    organization.write_text("not: [valid", encoding="utf-8")
+    assert _execution_profile_agents({"legacy"}) == {}
+
+    read_error = tmp_path / "organization-directory"
+    read_error.mkdir()
+    monkeypatch.setenv("HERMES_WORKFORCE_ORG", str(read_error))
+    assert _execution_profile_agents({"legacy"}) == {}
+
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    assert _execution_profile_agents({"root", "main", "amy", "missing-profile"}) == {
+        "main": "root"
+    }
+
+
+def test_canonical_root_name_cannot_claim_through_undeclared_runtime_profile(
+    board,
+    monkeypatch,
+):
+    from hermes_cli.workforce_handoffs import create_handoff
+    from hermes_cli.workforce_org import load_organization
+
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    now = datetime.now(timezone.utc)
+    with kb.connect_closing(board) as conn:
+        created = create_handoff(
+            conn,
+            source_agent="aurora",
+            target_agent="root",
+            expected_outcome="Reject the undeclared Root runtime profile",
+            acceptance_test="No pickup is durably claimed",
+            evidence_references=["execution:root-profile-mismatch"],
+            acknowledgment_deadline=(now + timedelta(minutes=2)).isoformat(),
+            checkpoint_at=(now + timedelta(minutes=20)).isoformat(),
+            organization=load_organization(),
+            requires_source_acceptance=True,
+            context={
+                "kind": "owned_operational_failure",
+                "technical_owner": "root",
+                "director": "aurora",
+                "workflow_id": "root-profile-mismatch",
+                "event_id": "root-profile-mismatch",
+            },
+        )
+        events_before = [event.kind for event in kb.list_events(conn, created["task_id"])]
+
+    runner = Runner()
+    runner._active_profile_name = lambda: "root"
+    runner._kanban_pickup_owned_failure = AsyncMock()
+    asyncio.run(finish_tick(runner))
+
+    runner._kanban_pickup_owned_failure.assert_not_awaited()
+    assert runner._kanban_coordination_jobs == {}
+    with kb.connect_closing(board) as conn:
+        task = kb.get_task(conn, created["task_id"])
+        assert task is not None
+        assert task.request_root_id is None
+        assert [event.kind for event in kb.list_events(conn, task.id)] == events_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM coordination_requests"
+        ).fetchone()[0] == 0
+
+
+def test_root_alias_pickup_uses_main_profile_and_stays_single_flight(board, monkeypatch):
+    import hermes_cli.workforce_handoff_pickup as pickup_module
+    import hermes_cli.workforce_handoffs as workforce_handoffs
+    import hermes_cli.workforce_org as workforce_org
+    from hermes_cli.workforce_handoffs import create_handoff
+    from hermes_cli.workforce_org import load_organization
+
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    organization = load_organization()
+    canonical_main = replace(
+        organization.agents["alina"],
+        agent="main",
+        display_name="Canonical Main",
+        profile_path="/profiles/foo",
+    )
+    organization = replace(
+        organization,
+        agents={**organization.agents, "main": canonical_main},
+    )
+    monkeypatch.setattr(
+        workforce_org,
+        "load_organization",
+        lambda *args, **kwargs: organization,
+    )
+    monkeypatch.setattr(
+        workforce_handoffs,
+        "load_organization",
+        lambda: organization,
+    )
+    monkeypatch.setattr(pickup_module, "load_organization", lambda: organization)
+    now = datetime.now(timezone.utc)
+    with kb.connect_closing(board) as conn:
+        created = create_handoff(
+            conn,
+            source_agent="aurora",
+            target_agent="root",
+            expected_outcome="Repair the owned failure",
+            acceptance_test="Later probes succeed",
+            evidence_references=["execution:root-failure"],
+            acknowledgment_deadline=(now + timedelta(minutes=2)).isoformat(),
+            checkpoint_at=(now + timedelta(minutes=20)).isoformat(),
+            organization=organization,
+            requires_source_acceptance=True,
+            context={
+                "kind": "owned_operational_failure",
+                "technical_owner": "root",
+                "director": "aurora",
+                "workflow_id": "root-owned-failure",
+                "event_id": "root-failure",
+            },
+        )
+        second = create_handoff(
+            conn,
+            source_agent="aurora",
+            target_agent="root",
+            expected_outcome="Repair the second owned failure",
+            acceptance_test="Later probes succeed",
+            evidence_references=["execution:root-failure-2"],
+            acknowledgment_deadline=(now + timedelta(minutes=2)).isoformat(),
+            checkpoint_at=(now + timedelta(minutes=20)).isoformat(),
+            organization=organization,
+            requires_source_acceptance=True,
+            context={
+                "kind": "owned_operational_failure",
+                "technical_owner": "root",
+                "director": "aurora",
+                "workflow_id": "root-owned-failure-2",
+                "event_id": "root-failure-2",
+            },
+        )
+
+    runner = Runner()
+    runner._active_profile_name = lambda: "main"
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        pickups = []
+
+        async def pickup(data):
+            assert pickup_module._canonical_execution_profile(
+                data["execution_profile"],
+                target_agent=data["target_agent"],
+            ) == "main"
+            pickups.append(data)
+            started.set()
+            await release.wait()
+
+        runner._kanban_pickup_owned_failure = pickup
+        await runner._kanban_coordination_tick()
+        await started.wait()
+        assert set(runner._kanban_coordination_jobs) == {"main"}
+        await runner._kanban_coordination_tick()
+        assert len(pickups) == 1
+        release.set()
+        await asyncio.gather(*runner._kanban_coordination_jobs.values())
+        return pickups[0]
+
+    pickup = asyncio.run(scenario())
+    task_ids = {created["task_id"], second["task_id"]}
+    assert pickup["task_id"] in task_ids
+    assert pickup["target_agent"] == "root"
+    assert pickup["execution_profile"] == "main"
+    with kb.connect_closing(board) as conn:
+        request = kb.get_coordination_request(conn, pickup["request_root_id"])
+        assert request is not None
+        assert request.responsible_agent == "root"
+        events = kb.list_events(conn, pickup["task_id"])
+        assert [event.kind for event in events].count(
+            "workforce_handoff_pickup_claimed"
+        ) == 1
+        unclaimed_id = (task_ids - {pickup["task_id"]}).pop()
+        unclaimed_task = kb.get_task(conn, unclaimed_id)
+        assert unclaimed_task is not None
+        assert unclaimed_task.request_root_id is None
+        assert all(
+            event.kind != "workforce_handoff_pickup_claimed"
+            for event in kb.list_events(conn, unclaimed_id)
+        )
+
+
+def test_root_alias_final_return_uses_main_route_and_canonical_receipt(board, monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    with kb.connect_closing(board) as conn:
+        root = kb.create_task(
+            conn, title="Root final result", assignee="root", session_id="origin-root",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="origin-chat",
+            notifier_profile="main",
+            delivery_mode="notify+wake",
+            chat_type="dm",
+        )
+        request = kb.create_coordination_request(
+            conn,
+            root_task_id=root,
+            origin_session_id="origin-root",
+            origin_message_id="origin-message",
+        )
+        child = kb.create_task(
+            conn,
+            title="Verified repair",
+            assignee="alina",
+            coordination_source_task_id=root,
+        )
+        assert kb.complete_task(conn, child, summary="verified")
+
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner = Runner(adapter)
+    runner._active_profile_name = lambda: "main"
+    routed_profiles = []
+
+    def authorization_adapter(_platform, profile):
+        routed_profiles.append(profile)
+        return adapter if profile == "main" else None
+
+    runner._authorization_adapter = authorization_adapter
+
+    async def wake(_adapter, **kwargs):
+        assert _adapter is adapter
+        assert kwargs["source"].profile == "main"
+        assert kwargs["coordination_context"]["responsible_agent"] == "root"
+        with kb.connect_closing(board) as conn:
+            assert kb.complete_task(conn, root, summary="root verified final")
+        return SimpleNamespace(
+            state="acknowledged", returned_message_id="platform:root:1",
+        )
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", AsyncMock(side_effect=wake))
+    asyncio.run(finish_tick(runner))
+
+    assert routed_profiles == ["main"]
+    with kb.connect_closing(board) as conn:
+        assert kb.get_coordination_request(conn, request.id).status == "completed"
+
+
+@pytest.mark.parametrize(
+    ("notifier_profile", "adapter_profiles"),
+    [("aurora", ()), ("missing-profile", ("missing-profile",))],
+)
+def test_root_alias_final_return_rejects_unowned_notifier_route(
+    board, monkeypatch, notifier_profile, adapter_profiles,
+):
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    with kb.connect_closing(board) as conn:
+        root = kb.create_task(
+            conn, title="Wrong route", assignee="root", session_id="origin-root",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="origin-chat",
+            notifier_profile=notifier_profile,
+            delivery_mode="notify+wake",
+        )
+        request = kb.create_coordination_request(
+            conn,
+            root_task_id=root,
+            origin_session_id="origin-root",
+            origin_message_id="origin-message",
+        )
+
+    runner = Runner()
+    runner._active_profile_name = lambda: "main"
+    runner._profile_adapters = {profile: object() for profile in adapter_profiles}
+    runner._kanban_deliver_coordination_return = AsyncMock()
+    asyncio.run(finish_tick(runner))
+
+    runner._kanban_deliver_coordination_return.assert_not_awaited()
+    with kb.connect_closing(board) as conn:
+        assert kb.get_coordination_request(conn, request.id).status == "active"
 
 
 def test_watcher_shutdown_cancels_and_reaps_background_jobs(monkeypatch):

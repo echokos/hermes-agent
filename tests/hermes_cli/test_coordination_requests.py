@@ -37,6 +37,7 @@ agents:
     authority: []
     prohibited_actions: []
     buzz_rooms: []
+    profile_path: /profiles/aurora
   - agent: director
     display_name: Director
     status: active
@@ -49,6 +50,7 @@ agents:
     authority: []
     prohibited_actions: []
     buzz_rooms: []
+    profile_path: /profiles/director
   - agent: builder
     display_name: Builder
     status: active
@@ -61,6 +63,7 @@ agents:
     authority: []
     prohibited_actions: []
     buzz_rooms: []
+    profile_path: /profiles/builder
   - agent: qa
     display_name: QA
     status: active
@@ -73,6 +76,7 @@ agents:
     authority: []
     prohibited_actions: []
     buzz_rooms: []
+    profile_path: /profiles/qa
 """
 
 
@@ -80,6 +84,8 @@ agents:
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    for profile in ("aurora", "director", "builder", "qa"):
+        (home / "profiles" / profile).mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     organization_dir = home / "organization"
@@ -1188,6 +1194,26 @@ def _owned_failure_task(conn):
     )
 
 
+def _acknowledge_owned_failure_task(conn, task_id, organization, *, now: int):
+    from hermes_cli.workforce_handoffs import acknowledge_handoff
+
+    payload = json.loads(kb.get_task(conn, task_id).body)
+    payload["acknowledgment_deadline"] = now + 10
+    payload["checkpoint_at"] = now + 20
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET body = ? WHERE id = ?",
+            (json.dumps(payload), task_id),
+        )
+    return acknowledge_handoff(
+        conn,
+        task_id,
+        actor="builder",
+        organization=organization,
+        now=now,
+    )
+
+
 def _verified_terminal_review(conn, organization, *, work_calls: int = 17):
     from datetime import datetime, timezone
 
@@ -1302,6 +1328,12 @@ def test_owned_failure_factory_has_fixed_internal_caps_and_no_user_route(
             "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?",
             (task_id,),
         ).fetchone()[0] == 0
+        _acknowledge_owned_failure_task(
+            conn,
+            task_id,
+            organization,
+            now=101,
+        )
 
         for ordinal in range(1, 18):
             assert kb.charge_coordination_model_call(
@@ -1313,8 +1345,7 @@ def test_owned_failure_factory_has_fixed_internal_caps_and_no_user_route(
             )
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET status = 'review', assignee = 'director' "
-                "WHERE id = ?",
+                "UPDATE tasks SET status = 'review', assignee = 'director' WHERE id = ?",
                 (task_id,),
             )
             kb._append_event(
@@ -1838,10 +1869,15 @@ def test_owned_failure_review_waits_for_recovery_then_launches_after_checkpoint(
         request = kb.create_owned_failure_coordination_request(
             conn, root_task_id=task_id, organization=organization, now=100,
         )
+        _acknowledge_owned_failure_task(
+            conn,
+            task_id,
+            organization,
+            now=101,
+        )
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET status = 'review', assignee = 'director' "
-                "WHERE id = ?",
+                "UPDATE tasks SET status = 'review', assignee = 'director' WHERE id = ?",
                 (task_id,),
             )
             kb._append_event(

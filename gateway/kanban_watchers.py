@@ -73,6 +73,37 @@ def _kanban_dispatch_allowed() -> bool:
     return not check_paused("kanban", logger)
 
 
+def _execution_profile_agents(profiles: set[str]) -> dict[str, str]:
+    """Project runtime profile names to canonical workforce agent ids."""
+    try:
+        from hermes_cli.workforce_org import (
+            WorkforceOrganizationAbsentError,
+            load_organization,
+        )
+    except Exception:
+        return {}
+    try:
+        organization = load_organization()
+    except WorkforceOrganizationAbsentError:
+        # A genuinely absent organization preserves legacy direct profiles.
+        return {profile: profile for profile in profiles}
+    except Exception:
+        return {}
+
+    projected: dict[str, str] = {}
+    for profile in profiles:
+        try:
+            declared = organization.from_profile_path(profile)
+            projected[profile] = organization.validate_execution_profile(
+                declared.agent
+            ).agent
+        except Exception:
+            # A loaded organization is authoritative: ambiguous, unknown, and
+            # non-operational profiles cannot execute coordination turns.
+            continue
+    return projected
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -199,6 +230,9 @@ class GatewayKanbanWatchersMixin:
             for profile in getattr(self, "_profile_adapters", {})
             if str(profile).strip()
         )
+        profile_agents = _execution_profile_agents(profiles)
+        agents = set(profile_agents.values())
+        routable_profiles = set(profile_agents)
         jobs = self._kanban_coordination_jobs
         for profile, job in list(jobs.items()):
             if job.done():
@@ -214,37 +248,63 @@ class GatewayKanbanWatchersMixin:
             # of the currently selected dashboard board or chat adapters.
             path = kb.kanban_db_path(kb.DEFAULT_BOARD).resolve()
             if not kb.has_coordination_tick_work(
-                path, notifier_profiles=profiles, include_unowned=include_unowned,
+                path,
+                notifier_profiles=routable_profiles,
+                notifier_agents=agents,
+                include_unowned=include_unowned,
             ):
                 return [], []
             conn = kb.connect(path)
             try:
-                deliveries = kb.prepare_coordination_final_return_deliveries(
-                    conn, notifier_profiles=profiles, include_unowned=include_unowned,
+                available_deliveries = kb.prepare_coordination_final_return_deliveries(
+                    conn,
+                    notifier_profiles=routable_profiles,
+                    notifier_agents=agents,
+                    include_unowned=include_unowned,
                 )
-                final_profiles = {d["responsible_agent"] for d in deliveries}
+                deliveries = []
+                final_profiles: set[str] = set()
+                for delivery in available_deliveries:
+                    execution_profile = next((
+                        profile for profile in sorted(idle_profiles)
+                        if profile_agents.get(profile) == delivery["responsible_agent"]
+                    ), None)
+                    if execution_profile is None:
+                        continue
+                    deliveries.append({
+                        **delivery,
+                        "execution_profile": execution_profile,
+                    })
+                    final_profiles.add(execution_profile)
                 pickups = []
                 if pickup_allowed:
-                    for profile in sorted(idle_profiles.difference(final_profiles)):
+                    pickup_profiles = (
+                        (idle_profiles - final_profiles) & profile_agents.keys()
+                    )
+                    for profile in sorted(pickup_profiles):
                         claim = claim_owned_failure_handoff_pickup(
-                            conn, target_agent=profile,
+                            conn, target_agent=profile_agents[profile],
                         )
                         if claim is not None:
-                            pickups.append({**claim, "database_path": path})
+                            pickups.append({
+                                **claim,
+                                "execution_profile": profile,
+                                "database_path": path,
+                            })
                 return deliveries, pickups
             finally:
                 conn.close()
 
         deliveries, pickups = await asyncio.to_thread(collect)
         for delivery in deliveries:
-            profile = delivery["responsible_agent"]
+            profile = delivery["execution_profile"]
             if profile in idle_profiles and profile not in jobs:
                 jobs[profile] = asyncio.create_task(
                     self._kanban_deliver_coordination_return(delivery),
                     name=f"kanban-final-return:{profile}",
                 )
         for pickup in pickups:
-            profile = pickup["target_agent"]
+            profile = pickup["execution_profile"]
             jobs[profile] = asyncio.create_task(
                 self._kanban_pickup_owned_failure(pickup),
                 name=f"kanban-handoff-pickup:{profile}",
@@ -257,6 +317,7 @@ class GatewayKanbanWatchersMixin:
             task_id=pickup["task_id"],
             request_root_id=pickup["request_root_id"],
             target_agent=pickup["target_agent"],
+            execution_profile=pickup["execution_profile"],
             source_agent=pickup["source_agent"],
             database_path=pickup["database_path"],
         )
@@ -277,7 +338,8 @@ class GatewayKanbanWatchersMixin:
             platform = Platform(str(sub["platform"]).lower())
         except ValueError:
             return
-        profile = delivery["responsible_agent"]
+        responsible_agent = delivery["responsible_agent"]
+        profile = delivery["execution_profile"]
         adapter = self._authorization_adapter(platform, profile)
         if adapter is None:
             return
@@ -321,7 +383,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 kb.acknowledge_coordination_return(
                     conn, delivery["request_root_id"], event_id=delivery["event_id"],
-                    responsible_agent=profile,
+                    responsible_agent=responsible_agent,
                     returned_message_id=outcome.returned_message_id,
                 )
             finally:

@@ -178,7 +178,29 @@ def final_return_context_matches_profile(
         actual = normalize_profile_name(str(actual_profile or ""))
     except Exception:
         return False
-    return bool(expected and actual and expected == actual)
+    if not expected or not actual:
+        return False
+    try:
+        from hermes_cli.workforce_org import (
+            WorkforceOrganizationAbsentError,
+            load_organization,
+        )
+    except Exception:
+        return False
+
+    try:
+        organization = load_organization()
+    except WorkforceOrganizationAbsentError:
+        return expected == actual
+    except Exception:
+        return False
+    try:
+        expected_agent = organization.validate_execution_profile(expected).agent
+        declared = organization.from_profile_path(actual)
+        actual_agent = organization.validate_execution_profile(declared.agent).agent
+    except Exception:
+        return False
+    return expected_agent == actual_agent
 
 
 def complete_final_return_delivery(
