@@ -178,6 +178,29 @@ def test_final_return_profile_match_uses_canonical_workforce_identity(
     assert final_return_context_matches_profile(context, "aurora") is False
     assert final_return_context_matches_profile(context, "missing-profile") is False
 
+    context["responsible_agent"] = "amy"
+    assert final_return_context_matches_profile(context, "amy") is False
+
+
+def test_final_return_profile_match_preserves_legacy_only_when_org_absent(
+    tmp_path, monkeypatch,
+):
+    context = _final_return_context(tmp_path)
+    context["responsible_agent"] = "legacy"
+    organization = tmp_path / "missing-organization.yaml"
+    monkeypatch.setenv("HERMES_WORKFORCE_ORG", str(organization))
+
+    assert final_return_context_matches_profile(context, "legacy") is True
+    assert final_return_context_matches_profile(context, "other") is False
+
+    organization.write_text("not: [valid", encoding="utf-8")
+    assert final_return_context_matches_profile(context, "legacy") is False
+
+    read_error = tmp_path / "organization-directory"
+    read_error.mkdir()
+    monkeypatch.setenv("HERMES_WORKFORCE_ORG", str(read_error))
+    assert final_return_context_matches_profile(context, "legacy") is False
+
 
 def test_repeated_final_return_after_ambiguous_turn_never_enqueues_second_model(tmp_path, monkeypatch):
     """A timed-out worker keeps its ticket; a watcher replay is inert."""

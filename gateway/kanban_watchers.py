@@ -76,11 +76,19 @@ def _kanban_dispatch_allowed() -> bool:
 def _execution_profile_agents(profiles: set[str]) -> dict[str, str]:
     """Project runtime profile names to canonical workforce agent ids."""
     try:
-        from hermes_cli.workforce_org import load_organization
-
-        organization = load_organization()
+        from hermes_cli.workforce_org import (
+            WorkforceOrganizationAbsentError,
+            load_organization,
+        )
     except Exception:
+        return {}
+    try:
+        organization = load_organization()
+    except WorkforceOrganizationAbsentError:
+        # A genuinely absent organization preserves legacy direct profiles.
         return {profile: profile for profile in profiles}
+    except Exception:
+        return {}
 
     projected: dict[str, str] = {}
     for profile in profiles:
@@ -221,6 +229,7 @@ class GatewayKanbanWatchersMixin:
         )
         profile_agents = _execution_profile_agents(profiles)
         agents = set(profile_agents.values())
+        routable_profiles = set(profile_agents)
         jobs = self._kanban_coordination_jobs
         for profile, job in list(jobs.items()):
             if job.done():
@@ -237,7 +246,7 @@ class GatewayKanbanWatchersMixin:
             path = kb.kanban_db_path(kb.DEFAULT_BOARD).resolve()
             if not kb.has_coordination_tick_work(
                 path,
-                notifier_profiles=profiles,
+                notifier_profiles=routable_profiles,
                 notifier_agents=agents,
                 include_unowned=include_unowned,
             ):
@@ -246,7 +255,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 available_deliveries = kb.prepare_coordination_final_return_deliveries(
                     conn,
-                    notifier_profiles=profiles,
+                    notifier_profiles=routable_profiles,
                     notifier_agents=agents,
                     include_unowned=include_unowned,
                 )

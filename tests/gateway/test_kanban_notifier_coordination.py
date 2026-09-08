@@ -9,7 +9,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_watchers import (
+    GatewayKanbanWatchersMixin,
+    _execution_profile_agents,
+)
 from hermes_cli import kanban_db as kb
 from tests.hermes_cli.test_coordination_requests import ORGANIZATION
 
@@ -205,6 +208,30 @@ def test_pickup_without_adapter_or_sub_does_not_block_next_tick(board, monkeypat
     asyncio.run(scenario())
 
 
+def test_execution_profile_projection_distinguishes_absent_and_invalid_org(
+    tmp_path, monkeypatch,
+):
+    organization = tmp_path / "organization.yaml"
+    monkeypatch.setenv("HERMES_WORKFORCE_ORG", str(organization))
+    assert _execution_profile_agents({"legacy"}) == {"legacy": "legacy"}
+
+    organization.write_text("not: [valid", encoding="utf-8")
+    assert _execution_profile_agents({"legacy"}) == {}
+
+    read_error = tmp_path / "organization-directory"
+    read_error.mkdir()
+    monkeypatch.setenv("HERMES_WORKFORCE_ORG", str(read_error))
+    assert _execution_profile_agents({"legacy"}) == {}
+
+    monkeypatch.setenv(
+        "HERMES_WORKFORCE_ORG",
+        str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
+    )
+    assert _execution_profile_agents({"main", "amy", "missing-profile"}) == {
+        "main": "root"
+    }
+
+
 def test_root_alias_pickup_uses_main_profile_and_stays_single_flight(board, monkeypatch):
     from hermes_cli.workforce_handoffs import create_handoff
     from hermes_cli.workforce_org import load_organization
@@ -362,7 +389,13 @@ def test_root_alias_final_return_uses_main_route_and_canonical_receipt(board, mo
         assert kb.get_coordination_request(conn, request.id).status == "completed"
 
 
-def test_root_alias_final_return_rejects_unowned_notifier_route(board, monkeypatch):
+@pytest.mark.parametrize(
+    ("notifier_profile", "adapter_profiles"),
+    [("aurora", ()), ("missing-profile", ("missing-profile",))],
+)
+def test_root_alias_final_return_rejects_unowned_notifier_route(
+    board, monkeypatch, notifier_profile, adapter_profiles,
+):
     monkeypatch.setenv(
         "HERMES_WORKFORCE_ORG",
         str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
@@ -376,7 +409,7 @@ def test_root_alias_final_return_rejects_unowned_notifier_route(board, monkeypat
             task_id=root,
             platform="telegram",
             chat_id="origin-chat",
-            notifier_profile="aurora",
+            notifier_profile=notifier_profile,
             delivery_mode="notify+wake",
         )
         request = kb.create_coordination_request(
@@ -388,6 +421,7 @@ def test_root_alias_final_return_rejects_unowned_notifier_route(board, monkeypat
 
     runner = Runner()
     runner._active_profile_name = lambda: "main"
+    runner._profile_adapters = {profile: object() for profile in adapter_profiles}
     runner._kanban_deliver_coordination_return = AsyncMock()
     asyncio.run(finish_tick(runner))
 

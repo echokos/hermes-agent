@@ -26,6 +26,10 @@ class WorkforceOrganizationError(ValueError):
     """Raised when canonical workforce metadata is invalid."""
 
 
+class WorkforceOrganizationAbsentError(WorkforceOrganizationError):
+    """Raised when no workforce organization file exists."""
+
+
 @dataclass(frozen=True)
 class WorkforceAgent:
     agent: str
@@ -188,6 +192,10 @@ def load_organization(
         raw = yaml.safe_load(
             source.read_text(encoding="utf-8-sig") if source_text is None else source_text
         ) or {}
+    except FileNotFoundError as exc:
+        raise WorkforceOrganizationAbsentError(
+            f"organization file does not exist: {source}"
+        ) from exc
     except OSError as exc:
         raise WorkforceOrganizationError(f"cannot read organization file {source}: {exc}") from exc
     except yaml.YAMLError as exc:

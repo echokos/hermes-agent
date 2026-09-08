@@ -180,12 +180,21 @@ def final_return_context_matches_profile(
         return False
     if not expected or not actual:
         return False
-    if expected == actual:
-        return True
     try:
-        from hermes_cli.workforce_org import load_organization
+        from hermes_cli.workforce_org import (
+            WorkforceOrganizationAbsentError,
+            load_organization,
+        )
+    except Exception:
+        return False
 
+    try:
         organization = load_organization()
+    except WorkforceOrganizationAbsentError:
+        return expected == actual
+    except Exception:
+        return False
+    try:
         expected_agent = organization.validate_execution_profile(expected).agent
         actual_agent = organization.validate_execution_profile(actual).agent
     except Exception:
