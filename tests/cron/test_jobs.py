@@ -881,6 +881,30 @@ class TestGetDueJobs:
 
 
 class TestEnabledToolsets:
+    @pytest.mark.parametrize("mode", ["always", "when_invoked"])
+    def test_dependency_mode_operator_create_update_and_preservation(self, tmp_cron_dir, mode):
+        job = create_job(
+            prompt="conditional", schedule="every 1h",
+            required_tool_dependencies=["mcp__nirvana__get_tasks"],
+            required_tool_dependency_mode=mode,
+        )
+        assert job["required_tool_dependency_mode"] == mode
+        assert update_job(job["id"], {"name": "renamed"})["required_tool_dependency_mode"] == mode
+        other = "when_invoked" if mode == "always" else "always"
+        assert update_job(job["id"], {"required_tool_dependency_mode": other})[
+            "required_tool_dependency_mode"
+        ] == other
+
+    @pytest.mark.parametrize("mode", ["", "sometimes", "WHEN_INVOKED", True, [], {}])
+    def test_dependency_mode_rejects_invalid_values_without_mutation(self, tmp_cron_dir, mode):
+        job = create_job(prompt="existing", schedule="every 1h")
+        assert "required_tool_dependency_mode" not in job
+        with pytest.raises(ValueError, match="required_tool_dependency_mode"):
+            create_job(prompt="bad", schedule="every 1h", required_tool_dependency_mode=mode)
+        with pytest.raises(ValueError, match="required_tool_dependency_mode"):
+            update_job(job["id"], {"required_tool_dependency_mode": mode})
+        assert get_job(job["id"]) == job
+
     def test_enabled_toolsets_stored(self, tmp_cron_dir):
         job = create_job(prompt="monitor", schedule="every 1h", enabled_toolsets=["web", "terminal"])
         assert job["enabled_toolsets"] == ["web", "terminal"]

@@ -37,12 +37,12 @@ def _result(text: str, *, error: bool = False):
 def mcp_runtime(monkeypatch):
     servers = {}
 
-    def install(server_name: str, *responses):
+    def install(server_name: str, *responses, tool_name="get_tasks"):
         session = SimpleNamespace(call_tool=AsyncMock(side_effect=responses))
         server = SimpleNamespace(session=session, _rpc_lock=None)
         servers[server_name] = server
         mcp_tool._servers[server_name] = server
-        return mcp_tool._make_tool_handler(server_name, "get_tasks", 10.0)
+        return mcp_tool._make_tool_handler(server_name, tool_name, 10.0)
 
     def run(coro_or_factory, timeout=30):
         coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
@@ -109,8 +109,9 @@ def _run_cron(monkeypatch, tmp_path, run_job, job=None):
     return delivered, marked, events
 
 
+@pytest.mark.parametrize("mode", [None, "always", "when_invoked"])
 def test_caught_mcp_401_keeps_partial_artifact_and_records_dependency_failure(
-    monkeypatch, tmp_path, mcp_runtime,
+    monkeypatch, tmp_path, mcp_runtime, mode,
 ):
     handler = mcp_runtime("nirvana", _result("Unauthorized 401 raw-provider", error=True))
 
@@ -118,7 +119,10 @@ def test_caught_mcp_401_keeps_partial_artifact_and_records_dependency_failure(
         assert "error" in json.loads(handler({}))
         return True, "saved partial", "Useful partial daily note", None
 
-    delivered, marked, events = _run_cron(monkeypatch, tmp_path, run_job)
+    delivered, marked, events = _run_cron(
+        monkeypatch, tmp_path, run_job,
+        _job(required_tool_dependency_mode=mode),
+    )
 
     assert marked[0][1] is True
     assert delivered and delivered[0].startswith("Useful partial daily note")
@@ -144,6 +148,71 @@ def test_missing_required_call_cannot_emit_false_recovery(
     assert events[0]["status"] == "failure"
     assert events[0]["dependency_outcome"]["missing"] == [REQUIRED]
     assert "degraded" in delivered[0]
+
+
+@pytest.mark.parametrize("branch", ["preserve_nonempty_next_things", "same_day_noop"])
+def test_conditional_no_call_preserves_result_without_false_recovery(
+    monkeypatch, tmp_path, mcp_runtime, branch,
+):
+    required = mcp_runtime("nirvana", _result("Unauthorized", error=True))
+    note = mcp_runtime("evernote", _result("Existing Next Things"), tool_name="get_note")
+    job = _job(required_tool_dependency_mode="when_invoked")
+
+    def failing_run(_job, **_kwargs):
+        required({})
+        return True, "partial", "Partial note", None
+
+    _run_cron(monkeypatch, tmp_path, failing_run, job)
+    intake = tmp_path / "cron" / "operational-failures.jsonl"
+    previous_intake = intake.read_bytes()
+
+    def preserving_run(_job, **_kwargs):
+        note({"guid": "existing-note"})
+        return True, "Existing Next Things", branch, None
+
+    delivered, marked, events = _run_cron(
+        monkeypatch, tmp_path, preserving_run, job,
+    )
+
+    assert marked[0][1] is True
+    assert marked[0][3]["dependency_status"] == "not_observed"
+    assert marked[0][3]["dependency_outcome"]["missing"] == [REQUIRED]
+    assert delivered == [branch]
+    assert intake.read_bytes() == previous_intake
+    assert [event["status"] for event in events] == ["failure"]
+
+
+def test_conditional_silent_no_call_is_not_a_failure(monkeypatch, tmp_path):
+    delivered, marked, events = _run_cron(
+        monkeypatch, tmp_path,
+        lambda _job, **_kwargs: (True, "out", "[SILENT]", None),
+        _job(required_tool_dependency_mode="when_invoked"),
+    )
+    assert delivered == []
+    assert events == []
+    assert marked[0][3]["dependency_status"] == "not_observed"
+
+
+def test_conditional_partial_observation_cannot_emit_recovery(
+    monkeypatch, tmp_path, mcp_runtime,
+):
+    handler = mcp_runtime("nirvana", _result("tasks"))
+
+    def run_job(_job, **_kwargs):
+        handler({})
+        return True, "out", "Preserved note", None
+
+    delivered, marked, events = _run_cron(
+        monkeypatch, tmp_path, run_job,
+        _job(
+            required_tool_dependency_mode="when_invoked",
+            required_tool_dependencies=[REQUIRED, "mcp__evernote__get_note"],
+        ),
+    )
+    assert delivered == ["Preserved note"]
+    assert events == []
+    assert marked[0][3]["dependency_status"] == "not_observed"
+    assert marked[0][3]["dependency_outcome"]["successful"] == [REQUIRED]
 
 
 def test_silent_model_response_cannot_hide_missing_dependency(
@@ -224,8 +293,9 @@ def test_success_for_distinct_arguments_does_not_clear_failed_invocation(
     assert "starred" not in json.dumps(events[0])
 
 
+@pytest.mark.parametrize("mode", ["always", "when_invoked"])
 def test_detached_pending_distinct_call_keeps_completed_artifact_degraded(
-    monkeypatch, tmp_path, mcp_runtime,
+    monkeypatch, tmp_path, mcp_runtime, mode,
 ):
     from tools.thread_context import propagate_context_to_thread
 
@@ -263,7 +333,9 @@ def test_detached_pending_distinct_call_keeps_completed_artifact_degraded(
         assert pending_started.wait(5)
         return True, "out", "Partial result from A", None
 
-    delivered, marked, events = _run_cron(monkeypatch, tmp_path, run_job)
+    delivered, marked, events = _run_cron(
+        monkeypatch, tmp_path, run_job, _job(required_tool_dependency_mode=mode),
+    )
     try:
         assert marked[0][1] is True
         assert "degraded" in delivered[0]
@@ -395,13 +467,15 @@ def test_transport_and_circuit_failures_are_authoritative_dependency_failures(
         mcp_tool._server_breaker_opened_at.pop("nirvana", None)
 
 
+@pytest.mark.parametrize("mode", [None, "when_invoked"])
 def test_whole_run_failure_remains_suppressed_with_dependency_observation(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, mode,
 ):
     delivered, marked, events = _run_cron(
         monkeypatch,
         tmp_path,
         lambda _job, **_kwargs: (False, "partial", "", "whole run failed"),
+        _job(required_tool_dependency_mode=mode),
     )
 
     assert delivered == []
@@ -409,8 +483,10 @@ def test_whole_run_failure_remains_suppressed_with_dependency_observation(
     assert events[0]["failure_type"] == "execution"
 
 
+@pytest.mark.parametrize("mode", [None, "always", "when_invoked"])
+@pytest.mark.parametrize("invoked", [True, False])
 def test_dependency_health_is_persisted_with_native_job_run_lock(
-    monkeypatch, tmp_path, mcp_runtime,
+    monkeypatch, tmp_path, mcp_runtime, mode, invoked,
 ):
     from cron import jobs as jobs_mod
 
@@ -419,7 +495,8 @@ def test_dependency_health_is_persisted_with_native_job_run_lock(
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
 
     def run_job(_job, **_kwargs):
-        handler({"filter": "all"})
+        if invoked:
+            handler({"filter": "all"})
         return True, "out", "Complete result", None
 
     monkeypatch.setattr(
@@ -438,16 +515,25 @@ def test_dependency_health_is_persisted_with_native_job_run_lock(
             deliver="local",
             workflow_slug="daily-note-workflow",
             required_tool_dependencies=[REQUIRED],
+            required_tool_dependency_mode=mode,
             failure_ownership={"technical_owner": "root", "director": "aurora"},
         )
         assert scheduler.run_one_job(job) is True
         stored = jobs_mod.get_job(job["id"])
 
     assert stored["last_status"] == "ok"
-    assert stored["last_dependency_status"] == "healthy"
+    expected_status = (
+        "healthy" if invoked else "not_observed" if mode == "when_invoked" else "degraded"
+    )
+    assert stored["last_dependency_status"] == expected_status
     assert stored["last_dependency_outcome"] == {
         "required": [REQUIRED],
-        "successful": [REQUIRED],
+        "successful": [REQUIRED] if invoked else [],
         "failed": [],
-        "missing": [],
+        "missing": [] if invoked else [REQUIRED],
     }
+    intake = tmp_path / "cron" / "operational-failures.jsonl"
+    events = [json.loads(line) for line in intake.read_text().splitlines()] if intake.exists() else []
+    assert [event["status"] for event in events] == (
+        ["recovered"] if invoked else [] if mode == "when_invoked" else ["failure"]
+    )

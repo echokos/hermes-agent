@@ -6951,15 +6951,24 @@ def _run_one_job_body(
             dependency_outcome is not None
             and (
                 dependency_outcome["failed"]
-                or dependency_outcome["missing"]
+                or (
+                    dependency_outcome["missing"]
+                    and job.get("required_tool_dependency_mode") != "when_invoked"
+                )
             )
+        )
+        # Conditional no-call branches are not failures, but they cannot prove
+        # that a previously unhealthy dependency has recovered.
+        dependency_recovery_observed = (
+            dependency_outcome is None
+            or not (dependency_outcome["failed"] or dependency_outcome["missing"])
         )
         dependency_error = None
         if dependency_degraded and dependency_outcome is not None:
             missing = dependency_outcome["missing"]
             failed = dependency_outcome["failed"]
             parts = []
-            if missing:
+            if missing and job.get("required_tool_dependency_mode") != "when_invoked":
                 parts.append("not called: " + ", ".join(missing))
             if failed:
                 parts.append(
@@ -7122,7 +7131,7 @@ def _run_one_job_body(
                             )
                             # Never bypass owned intake with a direct chat alert.
                             operational_failure_event = {"intake_unavailable": True}
-                    else:
+                    elif dependency_recovery_observed:
                         from cron.operational_failures import append_profile_recovery
 
                         try:
@@ -7365,7 +7374,9 @@ def _run_one_job_body(
             mark_kwargs["workflow_status"] = workflow_status
         if dependency_outcome is not None:
             mark_kwargs["dependency_status"] = (
-                "degraded" if dependency_degraded else "healthy"
+                "degraded" if dependency_degraded
+                else "healthy" if dependency_recovery_observed
+                else "not_observed"
             )
             mark_kwargs["dependency_outcome"] = dependency_outcome
         marked = mark_job_run(job["id"], success, error, **mark_kwargs)
