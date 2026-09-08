@@ -46,6 +46,27 @@ def _flatten_ids(segments):
     return [tc.id for _, calls in segments for tc in calls]
 
 
+@pytest.fixture(params=["inline", "persisted"])
+def budget_replacement(request):
+    environment = None
+    if request.param == "persisted":
+        environment = MagicMock()
+        environment.get_temp_dir.return_value = "/sandbox/tmp"
+        environment.execute.return_value = {"returncode": 0}
+    with (
+        patch("tools.terminal_tool.get_active_env", return_value=None),
+        patch("tools.terminal_tool.ensure_task_env", return_value=environment) as ensure,
+    ):
+        yield "Truncated:" if environment is None else "<persisted-output>"
+    ensure.assert_called_with("task-1", include_local=True)
+    if environment is not None:
+        assert environment.execute.called
+        assert all(
+            STEER_MARKER_OPEN not in call.kwargs["stdin_data"]
+            for call in environment.execute.call_args_list
+        )
+
+
 # ---------------------------------------------------------------------------
 # Planner unit tests
 # ---------------------------------------------------------------------------
@@ -562,7 +583,7 @@ class TestSegmentedDispatchIntegration:
         ids=["parallel", "sequential", "mixed-parallel-large", "mixed-sequential-large"],
     )
     def test_steer_survives_turn_budget_in_every_dispatch_path(
-        self, agent, calls, expected_segment_kinds
+        self, agent, calls, expected_segment_kinds, budget_replacement
     ):
         """A steer must be appended after aggregate budgeting in direct
         concurrent, direct sequential, and segmented mixed batches.
@@ -594,12 +615,12 @@ class TestSegmentedDispatchIntegration:
             agent._execute_tool_calls(msg, messages, "task-1")
 
         large_result_index = next(i for i, call in enumerate(calls) if call.id.endswith("large"))
-        assert "Truncated:" in messages[large_result_index]["content"]
+        assert budget_replacement in messages[large_result_index]["content"]
         steer_messages = [m for m in messages if STEER_MARKER_OPEN in m["content"]]
         assert steer_messages == [messages[-1]]
         assert "preserve this steer after budget enforcement" in steer_messages[0]["content"]
 
-    def test_steer_survives_turn_budget_after_malformed_arguments(self, agent):
+    def test_steer_survives_turn_budget_after_malformed_arguments(self, agent, budget_replacement):
         """Malformed arguments still reach the shared post-budget finalizer.
 
         The parser error itself can exceed a constrained turn budget.  A steer
@@ -622,7 +643,7 @@ class TestSegmentedDispatchIntegration:
             agent._execute_tool_calls(msg, messages, "task-1")
 
         assert len(messages) == 1
-        assert "Truncated:" in messages[0]["content"]
+        assert budget_replacement in messages[0]["content"]
         assert messages[0]["content"].count(STEER_MARKER_OPEN) == 1
         assert "preserve malformed-call steer after budget enforcement" in messages[0]["content"]
 
