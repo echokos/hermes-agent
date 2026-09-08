@@ -1,0 +1,22 @@
+name: Diagnostic plan review-labels
+on:
+  pull_request:
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+  security-events: write
+jobs:
+  witness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo 'Planning-only diagnostic, not a release check.'
+  leaf:
+    if: false
+    uses: ./.github/workflows/review-labels.yml
+    with:
+      ci_review: false
+      ci_review_files: ''
+      mcp_catalog: false
+      supply_chain: false
