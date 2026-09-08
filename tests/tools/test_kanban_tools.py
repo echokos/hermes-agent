@@ -89,6 +89,7 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
     assert "runs" in d
+    assert "coordination_budget" not in d
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):

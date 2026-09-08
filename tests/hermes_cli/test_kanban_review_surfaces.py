@@ -236,6 +236,8 @@ def test_worker_guidance_distinguishes_same_card_and_downstream_review() -> None
     assert "Never sticky-block that parent for `review-required`" in KANBAN_GUIDANCE
     assert "`kanban_request_changes`" in KANBAN_GUIDANCE
     assert "metadata=..." in KANBAN_GUIDANCE
+    assert "[HERMES_HOST_TERMINAL_REVIEW_V1]" in KANBAN_GUIDANCE
+    assert "Ordinary workers never skip the opening call" in KANBAN_GUIDANCE
     kanban_defaults = DEFAULT_CONFIG["kanban"]
     assert isinstance(kanban_defaults, dict)
     assert kanban_defaults["review_dispatch"] is True

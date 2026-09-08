@@ -93,3 +93,13 @@ def test_review_lenses_vary_per_round(skill_text: str) -> None:
     assert "`terminal`" in lenses
     # Fan-out note: parallel reviewers get different briefs.
     assert "`delegate_task`" in lenses
+
+
+def test_host_preface_narrowly_replaces_only_opening_discovery(skill_text: str) -> None:
+    assert "[HERMES_HOST_TERMINAL_REVIEW_V1]" in skill_text
+    assert "replaces only the redundant opening discovery call" in skill_text
+    assert "balance as an observation, not a promise" in skill_text
+    assert "reserve the final available response" in skill_text
+    assert "Never invent a path" in skill_text
+    assert "approve failed verification" in skill_text
+    assert '"cold" means' in skill_text

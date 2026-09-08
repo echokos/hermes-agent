@@ -62,6 +62,24 @@ def current_coordination_origin() -> tuple[str, str]:
     return scope.origin_session_id, scope.origin_message_id
 
 
+def current_coordination_execution() -> tuple[str, str, str] | None:
+    """Return the active bound request, task, and purpose without resolving it.
+
+    Unlike :func:`current_coordination_request_id`, this read-only view never
+    falls back to process environment, queries SQLite, settles provisional
+    calls, or otherwise mutates coordination accounting. It is suitable for
+    post-tool guards that must prove they are still inside the validated turn
+    scope rather than merely trusting inherited environment variables.
+    """
+    scope = _scope.get()
+    if scope is None:
+        return None
+    with scope.lock:
+        if scope.closed.is_set() or not scope.request_root_id or not scope.task_id:
+            return None
+        return scope.request_root_id, scope.task_id, scope.purpose
+
+
 @dataclass
 class CoordinationAcceptanceBinding:
     model_calls: int

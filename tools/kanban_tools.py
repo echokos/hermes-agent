@@ -535,6 +535,20 @@ def _handle_show(args: dict, **kw) -> str:
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
+            terminal_review_snapshot = None
+            if (
+                tid == (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+                and os.environ.get("HERMES_COORDINATION_PURPOSE")
+                == "terminal_review"
+            ):
+                terminal_review_snapshot = kb.terminal_review_context_snapshot(
+                    conn,
+                    tid,
+                    request_root_id=(
+                        os.environ.get("HERMES_COORDINATION_REQUEST_ROOT") or ""
+                    ),
+                    run_id=(os.environ.get("HERMES_KANBAN_RUN_ID") or ""),
+                )
 
             def _task_dict(t):
                 return {
@@ -561,7 +575,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
-            return json.dumps({
+            response = {
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
@@ -581,7 +595,19 @@ def _handle_show(args: dict, **kw) -> str:
                 # the same string build_worker_context returns to the
                 # dispatcher at spawn time.
                 "worker_context": kb.build_worker_context(conn, tid),
-            })
+            }
+            if terminal_review_snapshot is not None:
+                response["coordination_budget"] = {
+                    "observed_at": terminal_review_snapshot["observed_at"],
+                    "purpose": terminal_review_snapshot["purpose"],
+                    "request_root_id": terminal_review_snapshot[
+                        "request_root_id"
+                    ],
+                    "task_id": terminal_review_snapshot["task_id"],
+                    "review_run_id": terminal_review_snapshot["review_run_id"],
+                    **terminal_review_snapshot["budget"],
+                }
+            return json.dumps(response)
         finally:
             conn.close()
     except ValueError as e:
