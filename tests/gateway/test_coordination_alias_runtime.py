@@ -26,6 +26,7 @@ class _PassedFinalReturnGuard(Exception):
 
 @pytest.fixture
 def workforce_alias_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     home = tmp_path / ".hermes"
     main_profile = home / "profiles" / "main"
     aurora_profile = home / "profiles" / "aurora"
