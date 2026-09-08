@@ -655,10 +655,166 @@ def _require_fresh_evidence(evidence: list[str], evidence_at: str | int | None) 
     return timestamp
 
 
+def _validated_materialization_coordination(
+    conn: sqlite3.Connection,
+    *,
+    actor: str,
+    context: tuple[str, str, str] | None,
+    organization: WorkforceOrganization,
+) -> dict[str, Any] | None:
+    if context is None:
+        return None
+    try:
+        request_root_id, source_task_id, purpose = context
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid current coordination execution context") from exc
+    request_root_id = str(request_root_id or "").strip()
+    source_task_id = str(source_task_id or "").strip()
+    if not request_root_id or not source_task_id or purpose != "work":
+        raise ValueError("materialization requires a current coordination work context")
+    request = kanban_db.get_coordination_request(conn, request_root_id)
+    source = kanban_db.get_task(conn, source_task_id)
+    actor_id = organization.resolve_profile(actor).agent
+    if request is None or request.status != "active":
+        raise ValueError("materialization requires an active accepted coordination request")
+    if request.responsible_agent != actor_id:
+        raise PermissionError("current coordination request is owned by another manager")
+    if source is None or source.request_root_id != request.id:
+        raise ValueError("current coordination task is not bound to the accepted request")
+    return {
+        "request_root_id": request.id,
+        "source_task_id": source.id,
+        "origin_session_id": request.origin_session_id,
+        "origin_message_id": request.origin_message_id,
+    }
+
+
+def _resolved_materialization_context(
+    conn: sqlite3.Connection,
+    *,
+    context: tuple[str, str, str] | None,
+    origin: tuple[str, str] | None,
+) -> tuple[tuple[str, str, str] | None, tuple[str, str] | None]:
+    normalized_origin = None
+    if origin is not None:
+        try:
+            origin_session_id, origin_message_id = origin
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid current coordination origin") from exc
+        origin_session_id = str(origin_session_id or "").strip()
+        origin_message_id = str(origin_message_id or "").strip()
+        if origin_message_id and not origin_session_id:
+            raise ValueError("current coordination origin is incomplete")
+        if origin_session_id:
+            normalized_origin = (origin_session_id, origin_message_id)
+    if context is None and normalized_origin is not None and normalized_origin[1]:
+        request = kanban_db.get_coordination_request(
+            conn,
+            kanban_db.coordination_request_id(*normalized_origin),
+        )
+        if request is not None:
+            context = (request.id, request.root_task_id, "work")
+    return context, normalized_origin
+
+
+def _materialized_plan_result(
+    conn: sqlite3.Connection,
+    *,
+    actor: str,
+    plan: sqlite3.Row,
+    coordination_context: tuple[str, str, str] | None,
+    coordination_origin: tuple[str, str] | None,
+    organization: WorkforceOrganization,
+) -> dict[str, Any]:
+    coordination_context, coordination_origin = _resolved_materialization_context(
+        conn,
+        context=coordination_context,
+        origin=coordination_origin,
+    )
+    coordination = _validated_materialization_coordination(
+        conn,
+        actor=actor,
+        context=coordination_context,
+        organization=organization,
+    )
+    root_task_id = str(plan["materialized_root_task_id"] or "")
+    root = kanban_db.get_task(conn, root_task_id)
+    if coordination is not None:
+        if root is None or root.request_root_id != coordination["request_root_id"]:
+            raise ValueError(
+                "materialized plan is not bound to the current coordination request"
+            )
+    result = {
+        "plan_id": str(plan["plan_id"]),
+        "root_task_id": root_task_id,
+        "created": False,
+    }
+    if coordination is not None:
+        result["request_root_id"] = coordination["request_root_id"]
+    return result
+
+
+def _reject_materialization_task_key_collisions(
+    conn: sqlite3.Connection, idempotency_keys: Iterable[str],
+) -> None:
+    """Reserve a draft plan's predictable task keys inside its write lock."""
+    for idempotency_key in idempotency_keys:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key=? "
+            "AND status!='archived' ORDER BY created_at DESC LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        if row is not None:
+            raise ValueError(
+                "workforce materialization idempotency key already belongs to "
+                f"task {row['id']}: {idempotency_key}"
+            )
+
+
+def _require_materialized_task_identity(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    title: str,
+    body: str,
+    assignee: str,
+    created_by: str,
+    tenant: str,
+    idempotency_key: str,
+    goal_mode: bool,
+    session_id: str | None,
+    request_root_id: str | None,
+    parents: Iterable[str],
+) -> None:
+    """Prove create_task returned this plan's task before metadata is attached."""
+    task = kanban_db.get_task(conn, task_id)
+    expected = {
+        "title": title.strip(),
+        "body": body,
+        "assignee": assignee.strip().lower(),
+        "created_by": created_by,
+        "tenant": tenant,
+        "idempotency_key": idempotency_key,
+        "goal_mode": goal_mode,
+        "session_id": session_id,
+        "request_root_id": request_root_id,
+    }
+    if task is None or any(
+        getattr(task, field_name) != value
+        for field_name, value in expected.items()
+    ):
+        raise RuntimeError("workforce materialization returned an unexpected task identity")
+    expected_parents = sorted(set(parents))
+    if kanban_db.parent_ids(conn, task_id) != expected_parents:
+        raise RuntimeError("workforce materialization returned unexpected task parents")
+
+
 def materialize_plan(
     conn: sqlite3.Connection, *, actor: str, plan_id: str,
     current_state_evidence: list[str], current_state_evidence_at: str | int,
     confirmed_execution_ready: bool, organization: WorkforceOrganization | None = None,
+    coordination_context: tuple[str, str, str] | None = None,
+    coordination_origin: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     org = organization or load_organization()
     if org.resolve_profile(actor).agent != "aurora":
@@ -673,46 +829,134 @@ def materialize_plan(
     if plan is None:
         raise ValueError("unknown workforce plan")
     if plan["state"] == "materialized":
-        return {"plan_id": plan_id, "root_task_id": plan["materialized_root_task_id"], "created": False}
+        return _materialized_plan_result(
+            conn,
+            actor=actor,
+            plan=plan,
+            coordination_context=coordination_context,
+            coordination_origin=coordination_origin,
+            organization=org,
+        )
     if plan["state"] != "draft":
         raise ValueError(f"plan cannot be materialized from {plan['state']}")
-    if plan["goal_ref"].strip().casefold() == "unknown":
-        raise ValueError("plans with an unknown goal remain in discovery")
-    unresolved = list(_loads(plan["unresolved_decisions_json"], []))
-    if unresolved:
-        raise ValueError("unresolved decisions must be resolved before materialization")
-    nodes = list(_loads(plan["graph_json"], []))
-    _validate_graph(nodes, org)
-    if any(str(node.get("authority_class") or "routine") == "reserved" for node in nodes):
-        raise PermissionError("reserved-authority nodes require Elliott and cannot be materialized by Aurora")
-    max_nodes = min(MAX_PLAN_NODES, int(state["max_materialized_nodes"]))
-    if len(nodes) > max_nodes:
-        raise ValueError("plan exceeds the configured materialization limit")
 
     now = _now()
-    by_key: dict[str, str] = {}
-    remaining = {str(node["key"]): node for node in nodes}
     with write_txn(conn):
+        # Another connection may have materialized this draft while this call
+        # waited for the write lock. Re-read before any idempotent task create
+        # can return rows owned by that other request.
+        plan = conn.execute(
+            "SELECT * FROM wc_plans WHERE plan_id=?", (plan_id,)
+        ).fetchone()
+        if plan is None:
+            raise ValueError("unknown workforce plan")
+        if plan["state"] == "materialized":
+            return _materialized_plan_result(
+                conn,
+                actor=actor,
+                plan=plan,
+                coordination_context=coordination_context,
+                coordination_origin=coordination_origin,
+                organization=org,
+            )
+        if plan["state"] != "draft":
+            raise ValueError(f"plan cannot be materialized from {plan['state']}")
+        if plan["goal_ref"].strip().casefold() == "unknown":
+            raise ValueError("plans with an unknown goal remain in discovery")
+        unresolved = list(_loads(plan["unresolved_decisions_json"], []))
+        if unresolved:
+            raise ValueError("unresolved decisions must be resolved before materialization")
+        nodes = list(_loads(plan["graph_json"], []))
+        _validate_graph(nodes, org)
+        if any(
+            str(node.get("authority_class") or "routine") == "reserved"
+            for node in nodes
+        ):
+            raise PermissionError(
+                "reserved-authority nodes require Elliott and cannot be materialized by Aurora"
+            )
+        max_nodes = min(MAX_PLAN_NODES, int(state["max_materialized_nodes"]))
+        if len(nodes) > max_nodes:
+            raise ValueError("plan exceeds the configured materialization limit")
+        coordination_context, coordination_origin = _resolved_materialization_context(
+            conn,
+            context=coordination_context,
+            origin=coordination_origin,
+        )
+        coordination = _validated_materialization_coordination(
+            conn, actor=actor, context=coordination_context, organization=org,
+        )
+        origin_session_id, origin_message_id = coordination_origin or ("", "")
+        if coordination is not None:
+            if (
+                origin_session_id
+                and origin_session_id != coordination["origin_session_id"]
+            ) or (
+                origin_message_id
+                and origin_message_id != coordination["origin_message_id"]
+            ):
+                raise ValueError("current coordination origin does not match the accepted request")
+            origin_session_id = coordination["origin_session_id"]
+            origin_message_id = coordination["origin_message_id"]
+        task_context = {
+            "session_id": origin_session_id or None,
+            "coordination_source_task_id": coordination["source_task_id"] if coordination else None,
+            "coordination_origin_message_id": origin_message_id or None,
+        }
+        expected_request_root_id = (
+            coordination["request_root_id"] if coordination else None
+        )
+        execution_idempotency_keys = {
+            str(node["key"]): f"workforce-plan:{plan_id}:{node['key']}"
+            for node in nodes
+        }
+        outcome_idempotency_key = f"workforce-outcome:{plan['stable_key']}"
+        _reject_materialization_task_key_collisions(
+            conn,
+            [*execution_idempotency_keys.values(), outcome_idempotency_key],
+        )
+        by_key: dict[str, str] = {}
+        remaining = {str(node["key"]): node for node in nodes}
         while remaining:
             progressed = False
             for key, node in list(remaining.items()):
                 parents = [str(value) for value in node.get("parents") or []]
                 if any(parent not in by_key for parent in parents):
                     continue
+                task_title = str(node["title"])
+                task_body = json.dumps({
+                    "kind": "workforce_execution", "plan_id": plan_id,
+                    "desired_outcome": plan["desired_outcome"],
+                    "acceptance_test": node["acceptance_test"],
+                    "current_state_evidence": current_state_evidence,
+                    "current_state_evidence_at": evidence_at,
+                }, indent=2, sort_keys=True)
+                task_assignee = str(node["assignee"])
+                task_tenant = str(node.get("tenant") or "company")
+                task_parents = [by_key[parent] for parent in parents]
+                task_idempotency_key = execution_idempotency_keys[key]
                 task_id = kanban_db.create_task(
-                    conn, title=str(node["title"]),
-                    body=json.dumps({
-                        "kind": "workforce_execution", "plan_id": plan_id,
-                        "desired_outcome": plan["desired_outcome"],
-                        "acceptance_test": node["acceptance_test"],
-                        "current_state_evidence": current_state_evidence,
-                        "current_state_evidence_at": evidence_at,
-                    }, indent=2, sort_keys=True),
-                    assignee=str(node["assignee"]), created_by="aurora",
-                    tenant=str(node.get("tenant") or "company"),
+                    conn, title=task_title, body=task_body,
+                    assignee=task_assignee, created_by="aurora",
+                    tenant=task_tenant,
                     project_id=node.get("project_id"), workspace_kind=str(node.get("workspace_kind") or "scratch"),
-                    parents=[by_key[parent] for parent in parents],
-                    idempotency_key=f"workforce-plan:{plan_id}:{key}", goal_mode=bool(node.get("goal_mode", True)),
+                    parents=task_parents,
+                    idempotency_key=task_idempotency_key, goal_mode=bool(node.get("goal_mode", True)),
+                    **task_context,
+                )
+                _require_materialized_task_identity(
+                    conn,
+                    task_id=task_id,
+                    title=task_title,
+                    body=task_body,
+                    assignee=task_assignee,
+                    created_by="aurora",
+                    tenant=task_tenant,
+                    idempotency_key=task_idempotency_key,
+                    goal_mode=bool(node.get("goal_mode", True)),
+                    session_id=task_context["session_id"],
+                    request_root_id=expected_request_root_id,
+                    parents=task_parents,
                 )
                 stable_key = stable_identity(
                     item_kind="execution", desired_outcome=str(node["title"]),
@@ -730,11 +974,34 @@ def materialize_plan(
                 progressed = True
             if not progressed:
                 raise RuntimeError("plan graph could not be topologically materialized")
+        outcome_title = f"Outcome: {plan['title']}"
+        outcome_body = json.dumps({
+            "kind": "workforce_outcome", "plan_id": plan_id,
+            "desired_outcome": plan["desired_outcome"],
+            "acceptance_test": plan["acceptance_test"],
+        }, indent=2, sort_keys=True)
+        outcome_parents = list(by_key.values())
         root_id = kanban_db.create_task(
-            conn, title=f"Outcome: {plan['title']}",
-            body=json.dumps({"kind": "workforce_outcome", "plan_id": plan_id, "desired_outcome": plan["desired_outcome"], "acceptance_test": plan["acceptance_test"]}, indent=2, sort_keys=True),
-            assignee="aurora", created_by="aurora", tenant="company", parents=list(by_key.values()),
-            idempotency_key=f"workforce-outcome:{plan['stable_key']}", workspace_kind="scratch", goal_mode=False,
+            conn, title=outcome_title, body=outcome_body,
+            assignee="aurora", created_by="aurora", tenant="company",
+            parents=outcome_parents,
+            idempotency_key=outcome_idempotency_key,
+            workspace_kind="scratch", goal_mode=False,
+            **task_context,
+        )
+        _require_materialized_task_identity(
+            conn,
+            task_id=root_id,
+            title=outcome_title,
+            body=outcome_body,
+            assignee="aurora",
+            created_by="aurora",
+            tenant="company",
+            idempotency_key=outcome_idempotency_key,
+            goal_mode=False,
+            session_id=task_context["session_id"],
+            request_root_id=expected_request_root_id,
+            parents=outcome_parents,
         )
         outcome_key = stable_identity(item_kind="outcome", desired_outcome=plan["desired_outcome"], action_class="outcome", target_ref=plan["goal_ref"])
         conn.execute(
@@ -748,7 +1015,15 @@ def materialize_plan(
                 (child_id, root_id, _json(current_state_evidence), now),
             )
         conn.execute("UPDATE wc_plans SET state='materialized',materialized_root_task_id=?,updated_at=? WHERE plan_id=?", (root_id, now, plan_id))
-    return {"plan_id": plan_id, "root_task_id": root_id, "execution_tasks": by_key, "created": True}
+    result = {
+        "plan_id": plan_id,
+        "root_task_id": root_id,
+        "execution_tasks": by_key,
+        "created": True,
+    }
+    if coordination is not None:
+        result["request_root_id"] = coordination["request_root_id"]
+    return result
 
 
 def propose_reconciliation(

@@ -22,7 +22,9 @@ class CoordinationScope:
     provisional_model_calls: int = 0
     settled_provisional_model_calls: int = 0
     acceptance_scope_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    coordination_acceptance_required: bool = False
     unbudgeted_delegation_started: bool = False
+    uncoordinated_materialization_committed: bool = False
     closed: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -80,6 +82,76 @@ def current_coordination_execution() -> tuple[str, str, str] | None:
         return scope.request_root_id, scope.task_id, scope.purpose
 
 
+def declares_coordination_acceptance(function_name: str, arguments: object) -> bool:
+    """Return whether one parsed native tool call declares root acceptance."""
+    if function_name != "kanban_create" or not isinstance(arguments, dict):
+        return False
+    if not isinstance(arguments.get("coordination"), dict):
+        return False
+    report = arguments.get("report_to_origin")
+    return report is True or str(report).strip().lower() in {"true", "1", "yes"}
+
+
+def register_declared_coordination_acceptance(*, declared: bool) -> None:
+    """Make a parsed acceptance declaration mandatory for this user turn."""
+    if not declared:
+        return
+    scope = _scope.get()
+    if scope is None:
+        return
+    with scope.lock:
+        if scope.closed.is_set():
+            raise ValueError("coordination turn already ended")
+        scope.coordination_acceptance_required = True
+
+
+def register_uncoordinated_materialization(
+    *, created: bool, request_root_id: str | None,
+) -> None:
+    """Fence later same-turn acceptance after newly committed unbound work."""
+    if not created or str(request_root_id or "").strip():
+        return
+    scope = _scope.get()
+    if scope is None:
+        return
+    with scope.lock:
+        if scope.closed.is_set():
+            raise ValueError("coordination turn already ended")
+        scope.uncoordinated_materialization_committed = True
+
+
+@contextmanager
+def coordination_materialization_binding():
+    """Fence task materialization against same-turn request acceptance.
+
+    A parsed coordination declaration makes acceptance mandatory for the rest
+    of the turn. Materialization may proceed only after the request commits;
+    otherwise it fails before opening the materialization transaction and the
+    draft remains recoverable on a later tool round or user turn.
+    """
+    scope = _current_scope()
+    if scope is None:
+        yield None, ("", "")
+        return
+    with scope.lock:
+        if scope.closed.is_set():
+            raise ValueError("coordination turn already ended")
+        _resolve_request_root(scope)
+        execution = None
+        if scope.request_root_id and scope.task_id:
+            execution = (
+                scope.request_root_id,
+                scope.task_id,
+                scope.purpose,
+            )
+        if execution is None and scope.coordination_acceptance_required:
+            raise ValueError(
+                "workforce materialization requires successful coordination "
+                "acceptance; retry after kanban_create succeeds"
+            )
+        yield execution, (scope.origin_session_id, scope.origin_message_id)
+
+
 @dataclass
 class CoordinationAcceptanceBinding:
     model_calls: int
@@ -113,6 +185,11 @@ def coordination_acceptance_binding():
             raise ValueError("coordination turn already ended")
         if scope.unbudgeted_delegation_started:
             raise ValueError("cannot accept a request after unbudgeted delegation started")
+        if scope.uncoordinated_materialization_committed:
+            raise ValueError(
+                "cannot accept a request after uncoordinated workforce "
+                "materialization committed"
+            )
         binding = CoordinationAcceptanceBinding(
             model_calls=scope.provisional_model_calls,
             scope_id=scope.acceptance_scope_id,

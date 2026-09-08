@@ -8207,6 +8207,26 @@ class AIAgent:
         handoff; concurrent dispatch retains its historical ``None`` result.
         """
         tool_calls = assistant_message.tool_calls
+        from agent.coordination_budget import (
+            declares_coordination_acceptance,
+            register_declared_coordination_acceptance,
+        )
+
+        declared_acceptance = False
+        for tool_call in tool_calls:
+            try:
+                arguments = json.loads(tool_call.function.arguments)
+            except (TypeError, ValueError):
+                continue
+            if declares_coordination_acceptance(
+                tool_call.function.name,
+                arguments,
+            ):
+                declared_acceptance = True
+                break
+        register_declared_coordination_acceptance(
+            declared=declared_acceptance
+        )
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
