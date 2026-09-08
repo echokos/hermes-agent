@@ -22,6 +22,25 @@ def test_local_backend_is_noop(monkeypatch):
     create.assert_not_called()
 
 
+def test_local_backend_explicit_opt_in_reuses_configured_task(monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_LOCAL_PERSISTENT", "true")
+    task_id = "t-local-persist"
+    eff = tt._resolve_container_task_id(task_id)
+    _clear(eff, task_id)
+    fake = SimpleNamespace()
+    monkeypatch.setattr(tt, "resolve_task_overrides", lambda task: {"cwd": "/task-workspace"})
+    try:
+        with patch.object(tt, "_create_environment", return_value=fake) as create:
+            assert tt.ensure_task_env(task_id, include_local=True) is fake
+            assert tt.ensure_task_env(task_id, include_local=True) is fake
+            create.assert_called_once()
+            assert create.call_args.kwargs["cwd"] == "/task-workspace"
+            assert create.call_args.kwargs["local_config"] == {"persistent": True}
+    finally:
+        _clear(eff, task_id)
+
+
 def test_non_local_creates_and_reuses(monkeypatch):
     """A non-local backend with no active env creates one, caches it, and a
     second call reuses the cache instead of spawning a duplicate."""

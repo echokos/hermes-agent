@@ -2051,7 +2051,7 @@ def get_active_env(task_id: str):
         return _active_environments.get(lookup) or _active_environments.get(task_id)
 
 
-def ensure_task_env(task_id: Optional[str] = None):
+def ensure_task_env(task_id: Optional[str] = None, *, include_local: bool = False):
     """Lazily create and cache the sandbox env for *task_id* if none is active.
 
     :func:`terminal_tool` creates the environment on the first terminal command,
@@ -2062,13 +2062,14 @@ def ensure_task_env(task_id: Optional[str] = None):
     ``tools.image_source``), so it calls this to bring the env up on demand,
     reusing the same creation machinery as the terminal tool.
 
-    No-op on the local backend (images are read host-side). Returns the env
-    instance, or ``None`` when local or when creation fails (best-effort: a
-    failure leaves the caller's fail-closed error path intact).
+    No-op on the local backend by default (images are read host-side).
+    Persistence callers opt in with ``include_local=True`` because they need
+    an environment even before the first terminal command. Returns ``None``
+    when creation fails; never falls back from a remote backend to the host.
     """
     config = _get_env_config()
     env_type = config["env_type"]
-    if env_type == "local":
+    if env_type == "local" and not include_local:
         return None
 
     effective_task_id = _resolve_container_task_id(task_id)
@@ -2081,6 +2082,7 @@ def ensure_task_env(task_id: Optional[str] = None):
         return existing
 
     overrides = resolve_task_overrides(task_id)
+    cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
     if env_type == "docker":
         image = overrides.get("docker_image") or config["docker_image"]
     elif env_type == "singularity":
@@ -2107,14 +2109,14 @@ def ensure_task_env(task_id: Optional[str] = None):
             new_env = _create_environment(
                 env_type=env_type,
                 image=image,
-                cwd=config["cwd"],
+                cwd=cwd,
                 timeout=config["timeout"],
                 ssh_config=_ssh_config_from_config(config) if env_type == "ssh" else None,
                 container_config=(
                     _container_config_from_config(config)
                     if env_type in _CONTAINER_BACKENDS else None
                 ),
-                local_config=None,
+                local_config={"persistent": config.get("local_persistent", False)} if env_type == "local" else None,
                 task_id=effective_task_id,
                 host_cwd=_resolve_task_host_cwd(config, task_id),
             )
