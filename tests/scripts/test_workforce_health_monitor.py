@@ -3,6 +3,7 @@ from pathlib import Path
 import sqlite3
 import time
 
+import pytest
 import yaml
 
 from hermes_cli import kanban_db
@@ -131,6 +132,28 @@ def test_recurring_failure_creates_once_and_closes_after_two_successes(tmp_path:
     assert recovery["recovered"] == 1
     with kanban_db.connect_closing(database) as conn:
         assert kanban_db.get_task(conn, task_id).status == "done"
+
+
+def test_legacy_scan_cannot_auto_close_a_dependency_failure(tmp_path):
+    organization, database, state, profile = _fixture(tmp_path)
+    jobs_file = profile / "cron" / "jobs.json"
+    _write_failure(profile)
+    jobs = json.loads(jobs_file.read_text())
+    jobs["jobs"][0]["required_tool_dependencies"] = ["mcp__nirvana__get_tasks"]
+    jobs_file.write_text(json.dumps(jobs))
+    assert run(organization=organization, database=database, state_path=state)["created"] == 1
+    finding = next(iter(json.loads(state.read_text())["findings"].values()))
+    with kanban_db.connect_closing(database) as conn:
+        original_status = kanban_db.get_task(conn, finding["task_id"]).status
+
+    _write_successes(profile)
+    jobs = json.loads(jobs_file.read_text())
+    jobs["jobs"][0]["required_tool_dependencies"] = ["mcp__nirvana__get_tasks"]
+    jobs_file.write_text(json.dumps(jobs))
+    assert run(organization=organization, database=database, state_path=state)["recovered"] == 0
+    assert next(iter(json.loads(state.read_text())["findings"].values()))["status"] == "active"
+    with kanban_db.connect_closing(database) as conn:
+        assert kanban_db.get_task(conn, finding["task_id"]).status == original_status
 
 
 def test_failure_attaches_to_existing_active_repair_instead_of_fanout(tmp_path: Path):
@@ -485,6 +508,124 @@ def test_execution_ledger_recovers_a_lost_append_and_requires_two_successes(
     run(organization=organization, database=database, state_path=state)
     after_newer = json.loads(state.read_text())
     assert next(iter(after_newer["ledger_cursors"].values()))["execution_id"] == "success-3"
+
+
+@pytest.mark.parametrize("observation", ["failed", "pending", "missing", "successful"])
+def test_dependency_job_requires_producer_recovery_not_completed_ledger(
+    tmp_path, monkeypatch, observation,
+):
+    organization, database, state, profile = _fixture(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("scripts.workforce_health_monitor.time.time", lambda: 1788782760)
+    dependency = "mcp__nirvana__get_tasks"
+    job = {
+        "id": "job-1", "name": "Daily note", "workflow_id": "daily-note",
+        "required_tool_dependencies": [dependency],
+        "required_tool_dependency_mode": "when_invoked",
+        "last_status": "ok",
+        "last_dependency_status": (
+            "not_observed" if observation == "missing"
+            else "healthy" if observation == "successful" else "degraded"
+        ),
+        "last_dependency_outcome": {
+            "required": [dependency],
+            "successful": [dependency] if observation == "successful" else [],
+            "missing": [dependency] if observation == "missing" else [],
+            "failed": (
+                [{"tool": dependency, "reasons": [observation]}]
+                if observation in {"failed", "pending"} else []
+            ),
+        },
+        "failure_ownership": {
+            "technical_owner": "worker", "director": "aurora",
+            "enabled_at": "2026-09-07T11:59:00+00:00",
+        },
+    }
+    (profile / "cron" / "jobs.json").write_text(json.dumps({"jobs": [job]}))
+    append_profile_failure(
+        profile, job, "required tool failed", execution_id="failure-1",
+        occurred_at="2026-09-07T12:01:00+00:00",
+        failure_type="required_tool_dependency",
+        dependency_outcome={
+            "required": [dependency], "successful": [], "missing": [],
+            "failed": [{"tool": dependency, "reasons": ["tool_error"]}],
+        },
+    )
+    assert run(organization=organization, database=database, state_path=state)["created"] == 1
+    with sqlite3.connect(profile / "cron" / "executions.db") as conn:
+        conn.execute(
+            "CREATE TABLE executions (id TEXT PRIMARY KEY, job_id TEXT, status TEXT, "
+            "finished_at TEXT, error TEXT)"
+        )
+        conn.executemany("INSERT INTO executions VALUES (?,?,?,?,?)", [
+            ("completed-1", "job-1", "completed", "2026-09-07T12:03:00+00:00", None),
+            ("completed-2", "job-1", "completed", "2026-09-07T12:05:00+00:00", None),
+        ])
+
+    assert run(organization=organization, database=database, state_path=state)["recovered"] == 0
+    state_value = json.loads(state.read_text())
+    finding = next(iter(state_value["findings"].values()))
+    assert finding["status"] == "active"
+    assert finding["recovery_verified"] is False
+    assert finding["recovery_success_event_ids"] == []
+    cursor = next(iter(state_value["ledger_cursors"].values()))
+    assert cursor["execution_id"] == "completed-2"
+    with kanban_db.connect_closing(database) as conn:
+        assert kanban_db.get_task(conn, finding["task_id"]).status == "triage"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE kind = ?",
+            ("workforce_handoff_recovery_verified",),
+        ).fetchone()[0] == 0
+
+    # A delayed producer append for an already-scanned execution remains valid.
+    first = append_profile_recovery(
+        profile, job, execution_id="completed-1",
+        occurred_at="2026-09-07T12:03:00+00:00",
+    )
+    assert run(organization=organization, database=database, state_path=state)["recovered"] == 0
+    second = append_profile_recovery(
+        profile, job, execution_id="completed-2",
+        occurred_at="2026-09-07T12:05:00+00:00",
+    )
+    assert run(organization=organization, database=database, state_path=state)["recovered"] == 1
+    finding = next(iter(json.loads(state.read_text())["findings"].values()))
+    assert finding["recovery_success_event_ids"] == [first["event_id"], second["event_id"]]
+    assert finding["recovery_verified"] is True
+    assert run(organization=organization, database=database, state_path=state)["recovered"] == 0
+
+
+def test_dependency_ledger_skips_completed_pages_but_retains_failure_fallback(tmp_path):
+    from scripts.workforce_health_monitor import _ledger_intake_events
+
+    _, _, _, profile = _fixture(tmp_path)
+    job = {
+        "id": "job-1", "required_tool_dependencies": ["mcp__nirvana__get_tasks"],
+        "workflow_id": "daily-note",
+        "failure_ownership": {
+            "technical_owner": "worker", "director": "aurora",
+            "enabled_at": "2026-09-07T11:59:00+00:00",
+        },
+    }
+    with sqlite3.connect(profile / "cron" / "executions.db") as conn:
+        conn.execute(
+            "CREATE TABLE executions (id TEXT, job_id TEXT, status TEXT, finished_at TEXT, error TEXT)"
+        )
+        conn.executemany("INSERT INTO executions VALUES (?,?,?,?,?)", [
+            (f"completed-{index:03}", "job-1", "completed", "2026-09-07T12:00:00+00:00", None)
+            for index in range(256)
+        ])
+        conn.executemany("INSERT INTO executions VALUES (?,?,?,?,?)", [
+            ("failed", "job-1", "failed", "2026-09-07T12:01:00+00:00", "timeout"),
+            ("unknown", "job-1", "unknown", "2026-09-07T12:02:00+00:00", "interrupted"),
+        ])
+    cursor = {}
+    assert _ledger_intake_events(profile, job, cursor) == []
+    assert cursor["execution_id"] == "completed-255"
+    events = _ledger_intake_events(profile, job, cursor)
+    assert [event["execution_id"] for event in events] == ["failed", "unknown"]
+    assert all(event["status"] == "failure" for event in events)
+    assert cursor["execution_id"] == "unknown"
+    assert _ledger_intake_events(profile, job, cursor) == []
 
 
 def test_scheduler_append_and_terminal_ledger_are_one_incident_event(tmp_path, monkeypatch):
