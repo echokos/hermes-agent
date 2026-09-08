@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -120,6 +121,51 @@ def test_root_execution_profile_validation_rejects_wrong_or_nonoperational_profi
         _canonical_execution_profile("aurora", target_agent="root")
     with pytest.raises(ValueError):
         _canonical_execution_profile("amy", target_agent="root")
+
+
+def test_pickup_runtime_validation_uses_declared_path_under_agent_name_collision(
+    monkeypatch,
+):
+    import hermes_cli.workforce_handoff_pickup as pickup_module
+    import hermes_cli.workforce_org as workforce_org
+    from tools.workforce_handoff_pickup_scope import _active_profile_matches
+
+    organization = workforce_org.load_organization(
+        Path(__file__).parents[2] / "workforce" / "organization.yaml"
+    )
+    canonical_main = replace(
+        organization.agents["alina"],
+        agent="main",
+        display_name="Canonical Main",
+        profile_path="/profiles/foo",
+    )
+    organization = replace(
+        organization,
+        agents={**organization.agents, "main": canonical_main},
+    )
+    monkeypatch.setattr(pickup_module, "load_organization", lambda: organization)
+    monkeypatch.setattr(
+        workforce_org,
+        "load_organization",
+        lambda *args, **kwargs: organization,
+    )
+
+    assert pickup_module._canonical_execution_profile(
+        "main",
+        target_agent="root",
+    ) == "main"
+    with pytest.raises(ValueError, match="does not match"):
+        pickup_module._canonical_execution_profile("foo", target_agent="root")
+
+    monkeypatch.setenv("HERMES_PROFILE", "main")
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "main")
+    assert _active_profile_matches("root") is True
+    assert _active_profile_matches("main") is False
+
+    monkeypatch.setenv("HERMES_PROFILE", "foo")
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "foo")
+    assert _active_profile_matches("main") is True
+    assert _active_profile_matches("root") is False
 
 
 @pytest.mark.skipif(IS_WINDOWS, reason="pickup log descriptor hardening is POSIX-only")

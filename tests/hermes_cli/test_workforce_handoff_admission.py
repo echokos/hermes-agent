@@ -39,6 +39,7 @@ def _create_handoff(
     label: str,
     owned: bool,
     checkpoint_seconds: int = 120,
+    requires_source_acceptance: bool | None = None,
 ) -> str:
     context = None
     if owned:
@@ -60,7 +61,11 @@ def _create_handoff(
         checkpoint_at=_iso(now + checkpoint_seconds),
         organization=ORG,
         context=context,
-        requires_source_acceptance=owned,
+        requires_source_acceptance=(
+            owned
+            if requires_source_acceptance is None
+            else requires_source_acceptance
+        ),
     )["task_id"]
 
 
@@ -294,6 +299,49 @@ def test_invalid_owned_request_link_refuses_without_touching_ledger(
     assert _ledger(conn) == baseline
 
 
+@pytest.mark.parametrize("assignment_api", ["assign_task", "reassign_task"])
+def test_reassigned_handoff_cannot_launch_under_non_target_without_writes(
+    conn,
+    monkeypatch,
+    assignment_api,
+):
+    now = int(time.time())
+    task_id, _ = _accept_owned(conn, now=now, label=assignment_api)
+    assert getattr(kanban_db, assignment_api)(conn, task_id, "aurora") is True
+    baseline = _ledger(conn)
+
+    assert kanban_db.claim_task(conn, task_id) is None
+    with pytest.raises(
+        kanban_db.CoordinationLaunchRefused,
+        match="workforce handoff work is not assigned to its target",
+    ):
+        kanban_db.reserve_coordination_launch(conn, task_id, organization=ORG)
+    with pytest.raises(
+        kanban_db.CoordinationLaunchRefused,
+        match="workforce handoff work is not assigned to its target",
+    ):
+        kanban_db.claim_task_for_dispatch(conn, task_id, organization=ORG)
+
+    _prepare_dispatch(monkeypatch)
+    result = kanban_db.dispatch_once(
+        conn,
+        spawn_fn=lambda task, workspace: pytest.fail("wrong target spawned"),
+        reconcile_orphans=False,
+    )
+
+    task = kanban_db.get_task(conn, task_id)
+    assert task.status == "ready"
+    assert task.assignee == "aurora"
+    assert task.current_run_id is None
+    assert result.spawned == []
+    assert result.coordination_guardrails == []
+    assert result.coordination_deferred == [
+        (task_id, "workforce handoff work is not assigned to its target")
+    ]
+    assert kanban_db.has_spawnable_ready(conn) is False
+    assert _ledger(conn) == baseline
+
+
 def test_valid_owned_and_public_handoffs_keep_launch_paths(conn):
     now = int(time.time())
     owned_id, request_id = _accept_owned(conn, now=now, label="valid-owned")
@@ -358,6 +406,7 @@ def test_valid_owned_and_public_handoffs_keep_launch_paths(conn):
         now=now + 86_400,
     )
     assert reviewer is not None
+    assert reviewer.assignee == "aurora"
     assert terminal_reservation is not None
 
     public_id = _create_handoff(conn, now=now, label="valid-public", owned=False)
@@ -407,6 +456,165 @@ def test_valid_owned_and_public_handoffs_keep_launch_paths(conn):
     assert public_active is not None
     assert public_active.request_root_id is None
     assert active_reservation is None
+
+
+def test_public_review_keeps_explicit_reviewer_contract(conn):
+    now = int(time.time())
+    task_id = _create_handoff(
+        conn,
+        now=now,
+        label="public-review",
+        owned=False,
+    )
+    acknowledge_handoff(
+        conn,
+        task_id,
+        actor="alina",
+        organization=ORG,
+        now=now + 1,
+    )
+    owner = kanban_db.claim_task(conn, task_id, claimer="alina:test")
+    assert owner is not None
+    assert kanban_db.request_review(
+        conn,
+        task_id,
+        reviewer="xenia",
+        summary="Verify the public handoff",
+        expected_run_id=owner.current_run_id,
+    )
+
+    reviewer = kanban_db.claim_review_task(conn, task_id, claimer="xenia:test")
+    assert reviewer is not None
+    assert reviewer.assignee == "xenia"
+
+
+def test_source_review_routes_changes_back_to_target_work(conn):
+    now = int(time.time())
+    task_id = _create_handoff(
+        conn,
+        now=now,
+        label="source-rework",
+        owned=False,
+        requires_source_acceptance=True,
+    )
+    acknowledge_handoff(
+        conn,
+        task_id,
+        actor="alina",
+        organization=ORG,
+        now=now + 1,
+    )
+    owner = kanban_db.claim_task(conn, task_id, claimer="alina:test")
+    assert owner is not None
+    assert kanban_db.request_review(
+        conn,
+        task_id,
+        summary="Return the implementation to its source",
+        expected_run_id=owner.current_run_id,
+    )
+    reviewer = kanban_db.claim_review_task(conn, task_id, claimer="aurora:test")
+    assert reviewer is not None
+    assert reviewer.assignee == "aurora"
+    assert kanban_db.request_changes(
+        conn,
+        task_id,
+        reason="Apply the source review correction",
+        expected_run_id=reviewer.current_run_id,
+    ) == (True, "alina")
+
+    rework = kanban_db.claim_task(conn, task_id, claimer="alina:rework")
+    assert rework is not None
+    assert rework.assignee == "alina"
+
+
+def test_source_review_resume_preserves_review_actor_and_manual_ready_refuses(
+    conn,
+):
+    now = int(time.time())
+    task_id = _create_handoff(
+        conn,
+        now=now,
+        label="source-review-resume",
+        owned=False,
+        requires_source_acceptance=True,
+    )
+    acknowledge_handoff(
+        conn,
+        task_id,
+        actor="alina",
+        organization=ORG,
+        now=now + 1,
+    )
+    owner = kanban_db.claim_task(conn, task_id, claimer="alina:test")
+    assert owner is not None
+    assert kanban_db.request_review(
+        conn,
+        task_id,
+        summary="Source review is required",
+        expected_run_id=owner.current_run_id,
+    )
+    reviewer = kanban_db.claim_review_task(conn, task_id, claimer="aurora:first")
+    assert reviewer is not None
+    assert kanban_db.block_task(
+        conn,
+        task_id,
+        reason="needs_input: source decision",
+        kind="needs_input",
+        expected_run_id=reviewer.current_run_id,
+    )
+    blocked_ledger = _ledger(conn)
+
+    assert kanban_db.promote_task(
+        conn,
+        task_id,
+        actor="operator",
+        force=True,
+        dry_run=True,
+    ) == (False, "workforce handoff work is not assigned to its target")
+    assert kanban_db.promote_task(
+        conn,
+        task_id,
+        actor="operator",
+        force=True,
+    ) == (False, "workforce handoff work is not assigned to its target")
+    assert _ledger(conn) == blocked_ledger
+
+    assert kanban_db.unblock_task(conn, task_id) is True
+    resumed = kanban_db.get_task(conn, task_id)
+    assert resumed.status == "review"
+    assert resumed.assignee == "aurora"
+
+    parent_id = kanban_db.create_task(
+        conn,
+        title="Review dependency",
+        assignee="alina",
+    )
+    assert kanban_db.complete_task(conn, parent_id)
+    kanban_db.link_tasks(conn, parent_id, task_id)
+    review_again = kanban_db.claim_review_task(
+        conn,
+        task_id,
+        claimer="aurora:dependency",
+    )
+    assert review_again is not None
+    with kanban_db.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent_id,))
+    assert kanban_db.block_task(
+        conn,
+        task_id,
+        reason="dependency: upstream review evidence changed",
+        kind="dependency",
+        expected_run_id=review_again.current_run_id,
+    )
+    waiting = kanban_db.get_task(conn, task_id)
+    assert waiting.status == "todo"
+    assert waiting.assignee == "aurora"
+
+    assert kanban_db.complete_task(conn, parent_id)
+    resumed_after_parent = kanban_db.get_task(conn, task_id)
+    assert resumed_after_parent.status == "review"
+    assert resumed_after_parent.assignee == "aurora"
+    assert kanban_db.claim_review_task(conn, task_id) is not None
 
 
 def test_public_pending_overdue_and_stalled_handoffs_are_not_launchable(conn):
@@ -523,6 +731,70 @@ def test_malformed_handoff_state_does_not_starve_valid_task(
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "bad_value", "reason"),
+    [
+        ("target_agent", "", "workforce handoff target agent is invalid"),
+        ("target_agent", [], "workforce handoff target agent is invalid"),
+        ("target_agent", {}, "workforce handoff target agent is invalid"),
+        ("source_agent", "", "workforce handoff source agent is invalid"),
+        ("source_agent", [], "workforce handoff source agent is invalid"),
+        ("source_agent", {}, "workforce handoff source agent is invalid"),
+    ],
+)
+def test_malformed_handoff_route_does_not_starve_valid_task(
+    conn,
+    monkeypatch,
+    field,
+    bad_value,
+    reason,
+):
+    body = {
+        "kind": "workforce_handoff",
+        "state": "accepted",
+        "target_agent": "alina",
+        "source_agent": "aurora",
+    }
+    body[field] = bad_value
+    malformed_id = kanban_db.create_task(
+        conn,
+        title="Malformed workforce handoff route",
+        body=json.dumps(body),
+        assignee="alina",
+    )
+    valid_id = kanban_db.create_task(
+        conn,
+        title="Independent valid task after malformed route",
+        assignee="alina",
+    )
+    malformed_ledger = _ledger(conn)
+    _prepare_dispatch(monkeypatch)
+    spawned: list[str] = []
+
+    result = kanban_db.dispatch_once(
+        conn,
+        spawn_fn=lambda task, workspace: spawned.append(task.id),
+        reconcile_orphans=False,
+    )
+
+    assert spawned == [valid_id]
+    assert result.coordination_deferred == [(malformed_id, reason)]
+    assert kanban_db.get_task(conn, malformed_id).status == "ready"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+        (malformed_id,),
+    ).fetchone()[0] == 0
+    assert tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+            (malformed_id,),
+        )
+    ) == tuple(
+        row for row in malformed_ledger["events"] if row[1] == malformed_id
+    )
+
+
 def test_promote_rechecks_handoff_state_inside_write_transaction(
     conn,
     monkeypatch,
@@ -598,3 +870,104 @@ def test_reservation_rechecks_handoff_link_inside_write_transaction(
         )
     assert injected is True
     assert _ledger(conn) == baseline
+
+
+def test_reservation_uses_fresh_review_actor_role_inside_write_transaction(
+    conn,
+    monkeypatch,
+):
+    now = int(time.time())
+    task_id, request_id = _accept_owned(conn, now=now, label="reservation-role-race")
+    with kanban_db.write_txn(conn):
+        kanban_db._append_event(
+            conn,
+            task_id,
+            "workforce_handoff_recovery_required",
+            {
+                "failure_event_id": "reservation-role-race",
+                "failure_order": 10,
+                "required_successes": 2,
+            },
+        )
+        kanban_db._append_event(
+            conn,
+            task_id,
+            "workforce_handoff_recovery_verified",
+            {
+                "failure_event_id": "reservation-role-race",
+                "failure_order": 10,
+                "success_event_ids": ["success-1", "success-2"],
+                "success_orders": [11, 12],
+                "required_successes": 2,
+            },
+        )
+    original_write_txn = kanban_db.write_txn
+    injected = False
+
+    @contextmanager
+    def inject_review(connection, *args, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            assert kanban_db.request_review(
+                connection,
+                task_id,
+                summary="Supported source-owned review transition",
+            )
+        with original_write_txn(connection, *args, **kwargs):
+            yield
+
+    monkeypatch.setattr(kanban_db, "write_txn", inject_review)
+    reservation = kanban_db.reserve_coordination_launch(
+        conn,
+        task_id,
+        organization=ORG,
+        now=now + 3,
+    )
+
+    assert injected is True
+    assert reservation is not None
+    assert reservation.role == "manager"
+    assert reservation.leaf_launch_ordinal is None
+    task = kanban_db.get_task(conn, task_id)
+    assert task.status == "review"
+    assert task.assignee == "aurora"
+    request = kanban_db.get_coordination_request(conn, request_id)
+    assert request.leaf_launches_used == 0
+
+
+def test_reservation_rechecks_work_actor_inside_write_transaction(
+    conn,
+    monkeypatch,
+):
+    now = int(time.time())
+    task_id, _ = _accept_owned(conn, now=now, label="reservation-actor-race")
+    original_write_txn = kanban_db.write_txn
+    injected = False
+    post_assignment_ledger = None
+
+    @contextmanager
+    def inject_assignment(connection, *args, **kwargs):
+        nonlocal injected, post_assignment_ledger
+        if not injected:
+            injected = True
+            assert kanban_db.assign_task(connection, task_id, "aurora") is True
+            post_assignment_ledger = _ledger(connection)
+        with original_write_txn(connection, *args, **kwargs):
+            yield
+
+    monkeypatch.setattr(kanban_db, "write_txn", inject_assignment)
+    with pytest.raises(
+        kanban_db.CoordinationLaunchRefused,
+        match="workforce handoff work is not assigned to its target",
+    ):
+        kanban_db.reserve_coordination_launch(
+            conn,
+            task_id,
+            organization=ORG,
+            now=now + 3,
+        )
+
+    assert injected is True
+    assert kanban_db.get_task(conn, task_id).assignee == "aurora"
+    assert _ledger(conn) == post_assignment_ledger

@@ -29,8 +29,10 @@ def workforce_alias_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pat
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     home = tmp_path / ".hermes"
     main_profile = home / "profiles" / "main"
+    foo_profile = home / "profiles" / "foo"
     aurora_profile = home / "profiles" / "aurora"
     main_profile.mkdir(parents=True)
+    foo_profile.mkdir(parents=True)
     aurora_profile.mkdir(parents=True)
 
     organization = tmp_path / "organization.yaml"
@@ -45,7 +47,7 @@ agents:
     department: null
     function: Owner
     manager: null
-    direct_reports: [root, aurora]
+    direct_reports: [root, main, aurora]
     mission: Retain final authority
     owned_outcomes: []
     authority: []
@@ -70,6 +72,22 @@ agents:
     cross_team_request_path: null
     buzz_rooms: []
     profile_path: {main_profile}
+  - agent: main
+    display_name: Canonical Main
+    status: active
+    operational: true
+    department: Operations
+    function: Separate canonical agent
+    manager: elliott
+    direct_reports: []
+    mission: Exercise runtime-name collisions
+    owned_outcomes: []
+    authority: []
+    prohibited_actions: []
+    escalation_target: elliott
+    cross_team_request_path: null
+    buzz_rooms: []
+    profile_path: {foo_profile}
   - agent: aurora
     display_name: Aurora
     status: active

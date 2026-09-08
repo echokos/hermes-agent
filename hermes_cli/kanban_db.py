@@ -135,11 +135,14 @@ def _workforce_handoff_launch_refusal(
     task_id: str,
     body: Optional[str],
     request_root_id: Optional[str],
+    assignee: Optional[str],
+    launch_phase: str,
 ) -> Optional[str]:
     """Return why a structured workforce handoff is not launchable.
 
-    Every handoff must be accepted and current. An owned operational failure
-    additionally must be linked to its own bounded coordination request.
+    Every handoff must be accepted, current, and routed to the actor authorized
+    for the phase that will actually launch. An owned operational failure also
+    must be linked to its own bounded coordination request.
     """
     if not isinstance(body, str) or not body.strip():
         return None
@@ -152,6 +155,37 @@ def _workforce_handoff_launch_refusal(
     state = payload.get("state")
     if not isinstance(state, str) or state not in {"accepted", "active"}:
         return "workforce handoff state is not launchable"
+
+    def route_actor(field: str) -> Optional[str]:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            return _canonical_assignee(value)
+        except (TypeError, ValueError):
+            return None
+
+    target = route_actor("target_agent")
+    if target is None:
+        return "workforce handoff target agent is invalid"
+    source = route_actor("source_agent")
+    if source is None:
+        return "workforce handoff source agent is invalid"
+    try:
+        current_actor = _canonical_assignee(assignee)
+    except (TypeError, ValueError):
+        current_actor = None
+    if launch_phase == "work":
+        if current_actor != target:
+            return "workforce handoff work is not assigned to its target"
+    elif launch_phase == "review":
+        if (
+            payload.get("requires_source_acceptance") is True
+            and current_actor != source
+        ):
+            return "workforce handoff review is not assigned to its source"
+    else:
+        return "workforce handoff launch phase is invalid"
 
     context = payload.get("context")
     if not isinstance(context, dict) or context.get("kind") != "owned_operational_failure":
@@ -5110,6 +5144,8 @@ def reserve_coordination_launch(
         task_id=task.id,
         body=task.body,
         request_root_id=task.request_root_id,
+        assignee=task.assignee,
+        launch_phase="review" if task.status == "review" else "work",
     )
     if admission_refusal:
         raise CoordinationLaunchRefused(task.id, admission_refusal)
@@ -5123,21 +5159,33 @@ def reserve_coordination_launch(
         from hermes_cli.workforce_org import load_organization
 
         organization = load_organization()
-    role = coordination_execution_role(task.assignee, organization=organization)
     timestamp = int(time.time() if now is None else now)
 
     with write_txn(conn, allow_nested=True):
         task = get_task(conn, task_id)
         if task is None:
             raise ValueError(f"unknown task: {task_id}")
+        if task.status not in {"ready", "review"}:
+            raise ValueError("coordination launch must be reserved before task claim")
         admission_refusal = _workforce_handoff_launch_refusal(
             conn,
             task_id=task.id,
             body=task.body,
             request_root_id=task.request_root_id,
+            assignee=task.assignee,
+            launch_phase="review" if task.status == "review" else "work",
         )
         if admission_refusal:
             raise CoordinationLaunchRefused(task.id, admission_refusal)
+        if not task.assignee:
+            raise CoordinationBudgetExceeded(
+                task.request_root_id,
+                "task has no assignee",
+            )
+        role = coordination_execution_role(
+            task.assignee,
+            organization=organization,
+        )
         request = get_coordination_request(conn, task.request_root_id)
         if request is None:
             raise CoordinationBudgetExceeded(task.request_root_id, "request root is missing")
@@ -5238,6 +5286,8 @@ def claim_task_for_dispatch(
             task_id=task.id,
             body=task.body,
             request_root_id=task.request_root_id,
+            assignee=task.assignee,
+            launch_phase="review" if review else "work",
         )
         if admission_refusal:
             raise CoordinationLaunchRefused(task.id, admission_refusal)
@@ -6603,17 +6653,21 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, body, request_root_id, consecutive_failures, max_retries "
+            "SELECT id, status, body, assignee, request_root_id, "
+            "consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            resume_status = _resume_status_from_events(conn, task_id)
             if _workforce_handoff_launch_refusal(
                 conn,
                 task_id=task_id,
                 body=row["body"],
                 request_root_id=row["request_root_id"],
+                assignee=row["assignee"],
+                launch_phase="review" if resume_status == "review" else "work",
             ):
                 continue
             if _task_body_forbids_launch(row["body"]):
@@ -6642,7 +6696,6 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
-                resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -6712,7 +6765,8 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn, allow_nested=_allow_nested):
         guarded = conn.execute(
-            "SELECT status, body, request_root_id FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, body, assignee, request_root_id FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if (
             guarded is not None
@@ -6722,6 +6776,8 @@ def claim_task(
                 task_id=task_id,
                 body=guarded["body"],
                 request_root_id=guarded["request_root_id"],
+                assignee=guarded["assignee"],
+                launch_phase="work",
             )
         ):
             return None
@@ -6878,7 +6934,7 @@ def claim_review_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn, allow_nested=_allow_nested):
         guarded = conn.execute(
-            "SELECT status, body, request_root_id FROM tasks WHERE id = ?",
+            "SELECT status, body, assignee, request_root_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if (
@@ -6889,6 +6945,8 @@ def claim_review_task(
                 task_id=task_id,
                 body=guarded["body"],
                 request_root_id=guarded["request_root_id"],
+                assignee=guarded["assignee"],
+                launch_phase="review",
             )
         ):
             return None
@@ -9375,7 +9433,8 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status, body, request_root_id FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, body, assignee, request_root_id FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -9392,6 +9451,8 @@ def promote_task(
         task_id=task_id,
         body=row["body"],
         request_root_id=row["request_root_id"],
+        assignee=row["assignee"],
+        launch_phase="work",
     )
     if admission_refusal:
         return False, admission_refusal
@@ -9418,7 +9479,7 @@ def promote_task(
 
     with write_txn(conn):
         fresh = conn.execute(
-            "SELECT status, body, request_root_id FROM tasks WHERE id = ?",
+            "SELECT status, body, assignee, request_root_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if fresh is None or fresh["status"] not in ("todo", "blocked"):
@@ -9428,6 +9489,8 @@ def promote_task(
             task_id=task_id,
             body=fresh["body"],
             request_root_id=fresh["request_root_id"],
+            assignee=fresh["assignee"],
+            launch_phase="work",
         )
         if admission_refusal:
             return False, admission_refusal
@@ -9510,21 +9573,23 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status, body, request_root_id FROM tasks WHERE id = ?",
+            "SELECT status, body, assignee, request_root_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        if current is not None and _workforce_handoff_launch_refusal(
-            conn,
-            task_id=task_id,
-            body=current["body"],
-            request_root_id=current["request_root_id"],
-        ):
-            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current and current["status"] == "blocked"
             else "ready"
         )
+        if current is not None and _workforce_handoff_launch_refusal(
+            conn,
+            task_id=task_id,
+            body=current["body"],
+            request_root_id=current["request_root_id"],
+            assignee=current["assignee"],
+            launch_phase="review" if resume_status == "review" else "work",
+        ):
+            return False
         _reclaim_dangling_run(
             conn, task_id, statuses=("blocked", "scheduled"), now=now,
             note="invariant recovery on unblock",
@@ -12423,6 +12488,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
             task_id=row["id"],
             body=row["body"],
             request_root_id=row["request_root_id"],
+            assignee=row["assignee"],
+            launch_phase="work",
         ):
             continue
         if _resolve_dispatch_profile(row["assignee"]) is not None:
@@ -12451,6 +12518,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
             task_id=row["id"],
             body=row["body"],
             request_root_id=row["request_root_id"],
+            assignee=row["assignee"],
+            launch_phase="review",
         ):
             continue
         if _resolve_dispatch_profile(row["assignee"]) is not None:
@@ -12957,6 +13026,8 @@ def _dispatch_once_locked(
             task_id=row["id"],
             body=row["body"],
             request_root_id=row["request_root_id"],
+            assignee=assignee,
+            launch_phase="review",
         ):
             return False
         if _resolve_dispatch_profile(assignee) is None:
@@ -13037,6 +13108,8 @@ def _dispatch_once_locked(
             task_id=row["id"],
             body=row["body"],
             request_root_id=row["request_root_id"],
+            assignee=row["assignee"],
+            launch_phase="work",
         )
         if admission_refusal:
             result.coordination_deferred.append((row["id"], admission_refusal))
@@ -13269,6 +13342,8 @@ def _dispatch_once_locked(
             task_id=row["id"],
             body=row["body"],
             request_root_id=row["request_root_id"],
+            assignee=row["assignee"],
+            launch_phase="review",
         )
         if admission_refusal:
             result.coordination_deferred.append((row["id"], admission_refusal))

@@ -1,6 +1,7 @@
 """Canonical coordination polling and receipt-backed final-return ownership."""
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -291,6 +292,9 @@ def test_canonical_root_name_cannot_claim_through_undeclared_runtime_profile(
 
 
 def test_root_alias_pickup_uses_main_profile_and_stays_single_flight(board, monkeypatch):
+    import hermes_cli.workforce_handoff_pickup as pickup_module
+    import hermes_cli.workforce_handoffs as workforce_handoffs
+    import hermes_cli.workforce_org as workforce_org
     from hermes_cli.workforce_handoffs import create_handoff
     from hermes_cli.workforce_org import load_organization
 
@@ -299,6 +303,27 @@ def test_root_alias_pickup_uses_main_profile_and_stays_single_flight(board, monk
         str(Path(__file__).parents[2] / "workforce" / "organization.yaml"),
     )
     organization = load_organization()
+    canonical_main = replace(
+        organization.agents["alina"],
+        agent="main",
+        display_name="Canonical Main",
+        profile_path="/profiles/foo",
+    )
+    organization = replace(
+        organization,
+        agents={**organization.agents, "main": canonical_main},
+    )
+    monkeypatch.setattr(
+        workforce_org,
+        "load_organization",
+        lambda *args, **kwargs: organization,
+    )
+    monkeypatch.setattr(
+        workforce_handoffs,
+        "load_organization",
+        lambda: organization,
+    )
+    monkeypatch.setattr(pickup_module, "load_organization", lambda: organization)
     now = datetime.now(timezone.utc)
     with kb.connect_closing(board) as conn:
         created = create_handoff(
@@ -349,6 +374,10 @@ def test_root_alias_pickup_uses_main_profile_and_stays_single_flight(board, monk
         pickups = []
 
         async def pickup(data):
+            assert pickup_module._canonical_execution_profile(
+                data["execution_profile"],
+                target_agent=data["target_agent"],
+            ) == "main"
             pickups.append(data)
             started.set()
             await release.wait()

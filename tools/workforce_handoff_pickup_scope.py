@@ -46,14 +46,32 @@ def _canonical_agent(value: str) -> str:
     return load_organization().validate_execution_profile(candidate).agent
 
 
+def _runtime_profile_agent(value: str) -> str:
+    """Resolve one actual runtime name only through a declared profile path."""
+    from hermes_cli.workforce_org import load_organization
+
+    candidate = str(value or "").strip().casefold()
+    if not candidate or candidate != str(value or "").strip():
+        raise ValueError("pickup runtime profile is not canonical")
+    organization = load_organization()
+    declared = organization.from_profile_path(candidate)
+    resolved = organization.validate_execution_profile(declared.agent)
+    declared_profile = (
+        Path(resolved.profile_path).name.casefold() if resolved.profile_path else ""
+    )
+    if declared_profile != candidate:
+        raise ValueError("pickup runtime profile is not declared")
+    return resolved.agent
+
+
 def _active_profile_matches(target: str) -> bool:
     """Require the running profile, not only child-controlled scope fields."""
     from hermes_cli.profiles import get_active_profile_name
 
     try:
         return (
-            _canonical_agent(os.environ.get("HERMES_PROFILE", "")) == target
-            and _canonical_agent(get_active_profile_name()) == target
+            _runtime_profile_agent(os.environ.get("HERMES_PROFILE", "")) == target
+            and _runtime_profile_agent(get_active_profile_name()) == target
         )
     except Exception:
         return False

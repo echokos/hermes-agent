@@ -51,7 +51,8 @@ def _canonical_execution_profile(
         candidate = normalize_profile_name(Path(target.profile_path).name)
     else:
         candidate = normalize_profile_name(value)
-    resolved = organization.validate_execution_profile(candidate)
+    declared = organization.from_profile_path(candidate)
+    resolved = organization.validate_execution_profile(declared.agent)
     declared_profile = (
         Path(resolved.profile_path).name.casefold() if resolved.profile_path else ""
     )
