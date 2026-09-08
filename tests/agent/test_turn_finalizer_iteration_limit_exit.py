@@ -341,6 +341,39 @@ def test_terminal_review_marker_does_not_mask_failed_exit(monkeypatch):
     record.assert_called_once()
 
 
+def test_work_review_handoff_at_limit_skips_timeout_and_explainer(monkeypatch):
+    """A host-confirmed implementation handoff is a successful local-cap exit."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-work-review")
+    record = MagicMock(name="record_task_failure")
+    conn = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    agent = _LimitAgent(completion_explainer=True)
+
+    result = finalize_turn(
+        agent,
+        final_response="",
+        api_call_count=60,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "task"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="task",
+        original_user_message="task",
+        _should_review_memory=False,
+        _turn_exit_reason="work_review_handoff",
+    )
+
+    assert result["completed"] is True
+    assert result["final_response"] == ""
+    assert result["turn_exit_reason"] == "work_review_handoff"
+    assert agent._handle_max_iterations_called is False
+    record.assert_not_called()
+
+
 def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
     """When budget is exhausted and interrupted but no kanban task is
     active, the bounded fallback must NOT fire (#87096).
@@ -401,4 +434,3 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
     )
 
     record.assert_not_called()
-
