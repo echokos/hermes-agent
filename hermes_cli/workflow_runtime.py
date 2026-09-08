@@ -254,6 +254,8 @@ def _sync_one_schedule(
         "runtime_tool_budget": schedule.get(
             "runtime_tool_budget", runtime.get("tool_budget")
         ),
+        "required_tool_dependencies": schedule.get("required_tool_dependencies"),
+        "failure_ownership": schedule.get("failure_ownership"),
         "workdir": schedule.get("workdir"),
         "provider": schedule.get("provider"),
         "model": schedule.get("model"),

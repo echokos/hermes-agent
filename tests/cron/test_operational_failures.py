@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from cron.operational_failures import (
     append_host_failure,
@@ -33,6 +34,46 @@ def test_profile_intake_is_sanitized_and_host_adapter_is_durable(tmp_path):
     assert host["source_kind"] == "host_job"
     persisted = (tmp_path / "state" / "operational-failures.jsonl").read_text().splitlines()
     assert json.loads(persisted[0])["event_id"] == host["event_id"]
+
+
+def test_profile_intake_uses_default_for_root_and_name_for_named_profile(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / ".hermes"
+    named = root / "profiles" / "aurora"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    job = {
+        "id": "daily-note",
+        "workflow_id": "daily-note",
+        "deliver": "telegram:12345",
+        "failure_ownership": {
+            "technical_owner": "builder", "director": "aurora",
+            "return_outcome_to_origin": True,
+        },
+    }
+
+    default_event = append_profile_failure(
+        root, job, "timeout", execution_id="default-run",
+    )
+    named_event = append_profile_failure(
+        named, job, "timeout", execution_id="named-run",
+    )
+
+    assert default_event["source_scope"] == "default"
+    assert default_event["outcome_notice"]["status"] == "bound"
+    assert default_event["outcome_notice"]["source_profile"] == "default"
+    assert named_event["source_scope"] == "aurora"
+    assert named_event["outcome_notice"]["source_profile"] == "aurora"
+    default_persisted = json.loads(
+        (root / "cron" / "operational-failures.jsonl").read_text()
+    )
+    named_persisted = json.loads(
+        (named / "cron" / "operational-failures.jsonl").read_text()
+    )
+    assert default_persisted["source_scope"] == "default"
+    assert default_persisted["outcome_notice"]["source_profile"] == "default"
+    assert named_persisted["source_scope"] == "aurora"
 
 
 def test_host_intake_identity_is_stable_per_execution_and_unique_across_runs(tmp_path):

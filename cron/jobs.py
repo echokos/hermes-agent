@@ -118,6 +118,10 @@ OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
 
+class CrossProcessJobsLockUnavailable(RuntimeError):
+    """Raised when a strict jobs mutation cannot acquire its process fence."""
+
+
 @dataclass(frozen=True)
 class _CronStorePaths:
     cron_dir: Path
@@ -270,7 +274,7 @@ def _jobs_lock_file() -> Path:
 
 
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, require_cross_process: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section.
 
     Combines the in-process threading lock (cheap mutual exclusion between
@@ -287,10 +291,20 @@ def _jobs_lock():
 
     Nested calls in the same thread reuse the held lock so legacy callers that
     invoke save_jobs() inside a broader mutation section don't deadlock or try
-    to reacquire the advisory file lock.
+    to reacquire the advisory file lock. Callers that cannot safely proceed in
+    the historical in-process-only degraded mode can set
+    ``require_cross_process=True`` to fail before entering their critical
+    section unless the outermost call acquired the advisory lock.
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if require_cross_process and not getattr(
+            _jobs_lock_state, "cross_process_acquired", False
+        ):
+            raise CrossProcessJobsLockUnavailable(
+                "required cross-process jobs lock unavailable: "
+                "outer _jobs_lock is running in degraded mode"
+            )
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -300,6 +314,7 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.cross_process_acquired = False
         # Stamp of jobs.json as of this section's load_jobs() (#80703's
         # fast-path, credit @JoaoMarcos44): lets _save_jobs_unlocked skip the
         # shrink-merge parse when the file provably hasn't changed since this
@@ -339,31 +354,61 @@ def _jobs_lock():
                     while True:
                         try:
                             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            _jobs_lock_state.cross_process_acquired = True
                             break
                         except (OSError, IOError):
                             if time.monotonic() >= _deadline:
+                                lock_path = _jobs_lock_file()
+                                try:
+                                    lock_fd.close()
+                                except OSError:
+                                    pass
+                                lock_fd = None
+                                if require_cross_process:
+                                    raise CrossProcessJobsLockUnavailable(
+                                        "timed out after "
+                                        f"{_JOBS_LOCK_TIMEOUT_SECONDS:.0f}s waiting "
+                                        "for required cron jobs cross-process lock "
+                                        f"({lock_path})"
+                                    )
                                 logger.error(
                                     "Timed out after %.0fs waiting for the cron "
                                     "jobs lock (%s) — another process is holding "
                                     "it. Proceeding with in-process locking only "
                                     "so the scheduler stays alive (#60703).",
                                     _JOBS_LOCK_TIMEOUT_SECONDS,
-                                    _jobs_lock_file(),
+                                    lock_path,
                                 )
-                                try:
-                                    lock_fd.close()
-                                except OSError:
-                                    pass
-                                lock_fd = None
                                 break
                             time.sleep(0.1)
                 elif msvcrt is not None:
                     getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    _jobs_lock_state.cross_process_acquired = True
+                elif require_cross_process:
+                    try:
+                        lock_fd.close()
+                    except OSError:
+                        pass
+                    lock_fd = None
+                    raise CrossProcessJobsLockUnavailable(
+                        "required cron jobs cross-process lock unavailable: "
+                        "no supported advisory lock backend"
+                    )
             except _PrivateStatePermissionError:
                 raise
             except (OSError, IOError) as e:
                 # Ordinary lock failures retain the historical in-process
                 # fallback. Unsafe private-state paths fail closed above.
+                if require_cross_process:
+                    if lock_fd is not None:
+                        try:
+                            lock_fd.close()
+                        except OSError:
+                            pass
+                        lock_fd = None
+                    raise CrossProcessJobsLockUnavailable(
+                        f"required cron jobs cross-process lock unavailable ({e})"
+                    ) from e
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
             try:
@@ -382,6 +427,7 @@ def _jobs_lock():
         finally:
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.cross_process_acquired = False
 
 
 @contextlib.contextmanager
@@ -1952,6 +1998,80 @@ def _normalize_runtime_tool_budget(value: Any) -> Optional[Dict[str, Any]]:
     return normalized
 
 
+def _normalize_required_tool_dependencies(value: Any) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise ValueError("required_tool_dependencies must be a non-empty list")
+    normalized = [str(item).strip() for item in value]
+    if any(not item for item in normalized) or len(set(normalized)) != len(normalized):
+        raise ValueError(
+            "required_tool_dependencies must contain unique non-empty names"
+        )
+    if len(normalized) > 32:
+        raise ValueError("required_tool_dependencies must contain at most 32 names")
+    if any(
+        len(item) > 256
+        or re.fullmatch(r"mcp__[A-Za-z0-9_]+__[A-Za-z0-9_]+", item) is None
+        for item in normalized
+    ):
+        raise ValueError(
+            "required_tool_dependencies entries must be exact mcp__server__tool names"
+        )
+    return normalized
+
+
+def _normalize_failure_ownership(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("failure_ownership must be a mapping")
+    expected = {
+        "technical_owner",
+        "director",
+        "severity",
+        "enabled_at",
+        "ack_timeout_seconds",
+        "repair_timeout_seconds",
+        "recovery_successes_required",
+        "return_outcome_to_origin",
+    }
+    unexpected = set(value) - expected
+    if unexpected:
+        raise ValueError(
+            "failure_ownership has unsupported field(s): "
+            + ", ".join(sorted(unexpected))
+        )
+    normalized = dict(value)
+    for key in ("technical_owner", "director"):
+        text = str(normalized.get(key) or "").strip()
+        if not text:
+            raise ValueError(f"failure_ownership.{key} is required")
+        normalized[key] = text
+    for key in ("severity", "enabled_at"):
+        if key in normalized:
+            text = str(normalized.get(key) or "").strip()
+            if not text:
+                raise ValueError(f"failure_ownership.{key} must be non-empty")
+            normalized[key] = text
+    for key in (
+        "ack_timeout_seconds",
+        "repair_timeout_seconds",
+        "recovery_successes_required",
+    ):
+        if key in normalized:
+            normalized[key] = _normalize_job_positive_int(
+                normalized[key], f"failure_ownership.{key}"
+            )
+    if "return_outcome_to_origin" in normalized and not isinstance(
+        normalized["return_outcome_to_origin"], bool
+    ):
+        raise ValueError(
+            "failure_ownership.return_outcome_to_origin must be a boolean"
+        )
+    return normalized
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1969,6 +2089,8 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     max_iterations: Optional[int] = None,
     runtime_tool_budget: Optional[Dict[str, Any]] = None,
+    required_tool_dependencies: Optional[List[str]] = None,
+    failure_ownership: Optional[Dict[str, Any]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
@@ -2073,6 +2195,10 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_max_iterations = _normalize_job_positive_int(max_iterations, "max_iterations")
     normalized_runtime_tool_budget = _normalize_runtime_tool_budget(runtime_tool_budget)
+    normalized_required_tool_dependencies = _normalize_required_tool_dependencies(
+        required_tool_dependencies
+    )
+    normalized_failure_ownership = _normalize_failure_ownership(failure_ownership)
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
@@ -2183,6 +2309,10 @@ def create_job(
         "runtime_tool_budget": normalized_runtime_tool_budget,
         "workdir": normalized_workdir,
     }
+    if normalized_required_tool_dependencies is not None:
+        job["required_tool_dependencies"] = normalized_required_tool_dependencies
+    if normalized_failure_ownership is not None:
+        job["failure_ownership"] = normalized_failure_ownership
     if normalized_workflow_id:
         job["workflow_id"] = normalized_workflow_id
     if normalized_workflow_slug:
@@ -2293,6 +2423,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     if "runtime_tool_budget" in updates:
         updates["runtime_tool_budget"] = _normalize_runtime_tool_budget(
             updates["runtime_tool_budget"]
+        )
+    if "required_tool_dependencies" in updates:
+        updates["required_tool_dependencies"] = _normalize_required_tool_dependencies(
+            updates["required_tool_dependencies"]
+        )
+    if "failure_ownership" in updates:
+        updates["failure_ownership"] = _normalize_failure_ownership(
+            updates["failure_ownership"]
         )
     if "service_tier" in updates:
         if "speed" not in updates:
@@ -2600,6 +2738,8 @@ def mark_job_run(
     delivery_error: Optional[str] = None,
     status: Optional[str] = None,
     workflow_status: Optional[str] = None,
+    dependency_status: Optional[str] = None,
+    dependency_outcome: Optional[Dict[str, Any]] = None,
     *,
     expected_fire_owner: Optional[str] = None,
 ) -> bool:
@@ -2613,6 +2753,8 @@ def mark_job_run(
             delivery_error,
             status=status,
             workflow_status=workflow_status,
+            dependency_status=dependency_status,
+            dependency_outcome=dependency_outcome,
             expected_fire_owner=expected_fire_owner,
         )
 
@@ -2625,6 +2767,8 @@ def _mark_job_run_locked(
     *,
     status: Optional[str] = None,
     workflow_status: Optional[str] = None,
+    dependency_status: Optional[str] = None,
+    dependency_outcome: Optional[Dict[str, Any]] = None,
     expected_fire_owner: Optional[str] = None,
 ) -> bool:
     """
@@ -2692,6 +2836,17 @@ def _mark_job_run_locked(
                             f"Invalid workflow status: {workflow_status!r}"
                         )
                     job["last_workflow_status"] = workflow_status
+                if dependency_status is not None:
+                    if dependency_status not in {"healthy", "degraded"}:
+                        raise ValueError(
+                            f"Invalid dependency status: {dependency_status!r}"
+                        )
+                    if not isinstance(dependency_outcome, dict):
+                        raise ValueError(
+                            "dependency_outcome is required with dependency_status"
+                        )
+                    job["last_dependency_status"] = dependency_status
+                    job["last_dependency_outcome"] = dependency_outcome
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None

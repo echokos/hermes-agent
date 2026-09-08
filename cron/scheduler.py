@@ -6913,9 +6913,14 @@ def _run_one_job_body(
         _deferred_agents: list = []
         from tools.workforce_signal_runtime import activate as activate_required_signal
         from tools.workforce_signal_runtime import reset as reset_required_signal
+        from tools.required_dependency_runtime import activate as activate_dependencies
+        from tools.required_dependency_runtime import reset as reset_dependencies
         _required_signal_token, _required_signal_state = activate_required_signal(
             bool(job.get("required_workforce_signal")),
             observe_attempts=bool(job.get("observe_workforce_signal_attempts")),
+        )
+        _dependency_token, _dependency_state = activate_dependencies(
+            job.get("required_tool_dependencies")
         )
         try:
             _run_kwargs = {"defer_agent_teardown": _deferred_agents}
@@ -6935,8 +6940,36 @@ def _run_one_job_body(
                 _teardown_cron_agent(_deferred_agent, job["id"])
             raise
         finally:
+            reset_dependencies(_dependency_token)
             reset_required_signal(_required_signal_token)
             reset_secret_scope(_scope_token)
+
+        dependency_outcome = (
+            _dependency_state.finalize() if _dependency_state is not None else None
+        )
+        dependency_degraded = bool(
+            dependency_outcome is not None
+            and (
+                dependency_outcome["failed"]
+                or dependency_outcome["missing"]
+            )
+        )
+        dependency_error = None
+        if dependency_degraded and dependency_outcome is not None:
+            missing = dependency_outcome["missing"]
+            failed = dependency_outcome["failed"]
+            parts = []
+            if missing:
+                parts.append("not called: " + ", ".join(missing))
+            if failed:
+                parts.append(
+                    "unsuccessful: "
+                    + ", ".join(
+                        f"{item['tool']} ({'/'.join(item['reasons'])})"
+                        for item in failed
+                    )
+                )
+            dependency_error = "Required tool dependency degraded: " + "; ".join(parts)
 
         workforce_signal_failure = None
         if _required_signal_state is not None and (
@@ -7065,13 +7098,22 @@ def _run_one_job_body(
                 with _side_effect_fence() as owns_intake:
                     if not owns_intake:
                         raise _FireClaimLostDuringSideEffect
-                    if not success:
+                    if not success or dependency_degraded:
                         from cron.operational_failures import append_profile_failure
 
                         try:
                             operational_failure_event = append_profile_failure(
-                                _get_hermes_home(), job, error,
+                                _get_hermes_home(), job,
+                                error if not success else dependency_error,
                                 execution_id=execution_id,
+                                failure_type=(
+                                    "execution"
+                                    if not success
+                                    else "required_tool_dependency"
+                                ),
+                                dependency_outcome=(
+                                    dependency_outcome if success else None
+                                ),
                             )
                         except Exception:
                             logger.error(
@@ -7146,6 +7188,45 @@ def _run_one_job_body(
                     _summarize_cron_failure_for_delivery(job, error)
                     + _failure_streak_nudge(job)
                 )
+                if (
+                    success
+                    and dependency_degraded
+                    and final_response.strip()
+                    and not _is_cron_silence_response(final_response)
+                ):
+                    dependency_notice = (
+                        "Required dependency health degraded; this result may be "
+                        "incomplete."
+                    )
+                    if (
+                        operational_failure_event
+                        and operational_failure_event.get("status") == "failure"
+                        and operational_failure_event.get("technical_owner")
+                        and operational_failure_event.get("director")
+                    ):
+                        dependency_notice += (
+                            " An owned repair intake was recorded; owner acceptance "
+                            "is not yet verified here."
+                        )
+                    elif (
+                        operational_failure_event
+                        and operational_failure_event.get("status")
+                        == "invalid_ownership"
+                    ):
+                        dependency_notice += (
+                            " Failure intake was recorded with invalid ownership; "
+                            "it is not an accepted repair."
+                        )
+                    else:
+                        dependency_notice += (
+                            " Owned repair intake was not recorded; owner acceptance "
+                            "is not verified."
+                        )
+                    deliver_content = (
+                        f"{deliver_content.rstrip()}\n\n{dependency_notice}"
+                        if deliver_content.strip()
+                        else dependency_notice
+                    )
                 if drift_skip and not success:
                     # Drift-skip alert: bypass the generic summarizer's
                     # 180-char truncation (it would eat the remediation
@@ -7162,7 +7243,9 @@ def _run_one_job_body(
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
-            if empty_response_failure or operational_failure_event is not None:
+            if empty_response_failure or (
+                operational_failure_event is not None and not success
+            ):
                 should_deliver = False
             if blocked_config_silent or drift_skip_silent:
                 should_deliver = False
@@ -7280,6 +7363,11 @@ def _run_one_job_body(
             mark_kwargs["status"] = "blocked_config"
         if workflow_status is not None:
             mark_kwargs["workflow_status"] = workflow_status
+        if dependency_outcome is not None:
+            mark_kwargs["dependency_status"] = (
+                "degraded" if dependency_degraded else "healthy"
+            )
+            mark_kwargs["dependency_outcome"] = dependency_outcome
         marked = mark_job_run(job["id"], success, error, **mark_kwargs)
         if fire_owner is not None and not marked:
             finish_execution(

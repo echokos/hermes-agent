@@ -677,12 +677,14 @@ def _handle_list(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Match CLI list: dependencies that cleared since the last
-            # dispatcher tick should be visible to orchestrators immediately.
-            promoted = kb.recompute_ready(conn)
+            # Ordinary listing matches the CLI's dependency promotion. Bounded
+            # workforce discovery remains read-only, including signal intake.
+            promoted = kb.recompute_ready(conn) if workforce_scope is None else 0
             # Fetch one extra row so model-facing output can report that
             # a bounded listing was truncated without dumping the board.
             scope_profiles = None
+            signal_ids: set[str] = set()
+            signal_owner = None
             if workforce_scope in {"owned_outcomes", "portfolio_outcomes"}:
                 from hermes_cli.workforce_org import (
                     WorkforceOrganizationError,
@@ -724,6 +726,24 @@ def _handle_list(args: dict, **kw) -> str:
                     include_archived=include_archived,
                     limit=limit + 1,
                 )
+                if workforce_scope == "portfolio_outcomes":
+                    signal_owner = actor.agent
+                    signals = kb.list_unresolved_workforce_signal_tasks(
+                        conn, decision_owner=signal_owner, status=status, tenant=tenant,
+                        limit=limit + 1,
+                    )
+                    signal_ids = {task.id for task in signals}
+                    # Alternate intake and outcomes within one candidate budget
+                    # so either backlog cannot hide the other. Signal ordering
+                    # reflects canonical reobservations, not only creation age.
+                    outcomes = rows
+                    rows = []
+                    seen_ids: set[str] = set()
+                    for index in range(max(len(signals), len(outcomes))):
+                        for group in (signals, outcomes):
+                            if index < len(group) and group[index].id not in seen_ids:
+                                rows.append(group[index])
+                                seen_ids.add(group[index].id)
             else:
                 rows = kb.list_tasks(
                     conn,
@@ -735,8 +755,17 @@ def _handle_list(args: dict, **kw) -> str:
                 )
             truncated = len(rows) > limit
             tasks = rows[:limit]
+            summaries = []
+            for task in tasks:
+                summary = _task_summary_dict(kb, conn, task)
+                if task.id in signal_ids:
+                    summary.update({
+                        "workforce_record_kind": "unresolved_signal", "triage_only": True,
+                        "decision_owner": signal_owner, "launch_authorized": False,
+                    })
+                summaries.append(summary)
             result = {
-                "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
+                "tasks": summaries,
                 "count": len(tasks),
                 "limit": limit,
                 "truncated": truncated,
@@ -977,6 +1006,7 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                **({"decision_review": args["decision_review"]} if "decision_review" in args else {}),
             )
             if not ok:
                 return tool_error(
@@ -991,7 +1021,7 @@ def _handle_block(args: dict, **kw) -> str:
                 task_id=tid,
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
-                block_kind=kind,
+                block_kind=landed.block_kind if landed else kind,
             )
         finally:
             conn.close()
@@ -1059,6 +1089,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 reviewer=reviewer,
                 expected_run_id=expected_run_id,
                 with_reason=True,
+                **({"reserved_decision": args["reserved_decision"]} if "reserved_decision" in args else {}),
             )
             if not ok:
                 detail = fail_reason or "unknown id or not in running/ready"
@@ -2215,7 +2246,13 @@ KANBAN_LIST_SCHEMA = {
                     "Canonical decomposed root outcomes explicitly owned by the current "
                     "workforce profile (`owned_outcomes`) or by that profile and every "
                     "direct and indirect report (`portfolio_outcomes`). Ordinary task "
-                    "assignment is not ownership. Mutually exclusive with assignee."
+                    "assignment is not ownership. Portfolio results also include canonical "
+                    "unresolved workforce signals for the current actor's decision, explicitly "
+                    "marked triage_only and launch_authorized=false; visibility does not "
+                    "authorize execution. One shared limit covers both record classes. "
+                    "Portfolio results alternate signals and outcomes; signals use priority "
+                    "then newest canonical observation, and unused slots flow to the other class. "
+                    "Mutually exclusive with assignee."
                 ),
             },
         },
@@ -2357,6 +2394,16 @@ KANBAN_BLOCK_SCHEMA = {
                 ),
             },
             "board": _board_schema_prop(),
+            "decision_review": {
+                "type": "object",
+                "description": "Source reviewer only: accept/reject the exact reserved user-action proposal. Stops blocked without granting the action or claiming repair.",
+                "properties": {
+                    "proposal_event_id": {"type": "integer", "minimum": 1},
+                    "outcome": {"type": "string", "enum": ["accepted", "rejected"]},
+                },
+                "required": ["proposal_event_id", "outcome"],
+                "additionalProperties": False,
+            },
         },
         "required": ["reason"],
     },
@@ -2405,6 +2452,20 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
                 "additionalProperties": True,
             },
             "board": _board_schema_prop(),
+            "reserved_decision": {
+                "type": "object",
+                "description": "Owned failure only: submit an exact current-episode human action for source review, not recovery completion. Do not include credentials or OAuth callback links.",
+                "properties": {
+                    "failure_event_id": {"type": "string", "maxLength": 256},
+                    "action_kind": {"type": "string", "enum": ["user_reauthentication", "authorization_required"]},
+                    "integration": {"type": "string", "maxLength": 100},
+                    "account": {"type": "string", "maxLength": 200},
+                    "action": {"type": "string", "maxLength": 1200},
+                    "evidence_references": {"type": "array", "minItems": 1, "maxItems": 8, "items": {"type": "string", "maxLength": 512}},
+                },
+                "required": ["failure_event_id", "action_kind", "integration", "account", "action", "evidence_references"],
+                "additionalProperties": False,
+            },
         },
         "required": ["summary"],
     },
