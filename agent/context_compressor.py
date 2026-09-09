@@ -1904,9 +1904,11 @@ class ContextCompressor(ContextEngine):
         self._micro_compact_rolling_summary = ""
         self._micro_compact_consecutive_failures = 0
         self._micro_compact_last_failure_cursor = -1
+        self._micro_compact_defrag_blocked_digest = ""
         self._micro_compact_passes = 0
         self._micro_compact_tokens_saved_total = 0
         self._micro_compact_turns_since_pass = 0
+        self._flush_scan_cursor_invalidated = False
 
     def _begin_compression_telemetry(
         self,
@@ -2183,10 +2185,38 @@ class ContextCompressor(ContextEngine):
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
 
+        # A compressor can outlive a cron/gateway session. Micro-compaction's
+        # cursor and retry guards are transcript-relative and must not leak to
+        # whichever session reuses this instance next.
+        self._micro_compact_cursor = 0
+        self._micro_compact_rolling_summary = ""
+        self._micro_compact_consecutive_failures = 0
+        self._micro_compact_last_failure_cursor = -1
+        self._micro_compact_defrag_blocked_digest = ""
+        self._micro_compact_passes = 0
+        self._micro_compact_tokens_saved_total = 0
+        self._micro_compact_turns_since_pass = 0
+        self._flush_scan_cursor_invalidated = False
+
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
+        previous_session_id = getattr(self, "_session_id", "")
+        next_session_id = session_id or ""
+        if previous_session_id and next_session_id != previous_session_id:
+            # Most host transitions call on_session_reset/on_session_end first,
+            # but direct binders must not carry transcript-relative state into
+            # a different session either.
+            self._micro_compact_cursor = 0
+            self._micro_compact_rolling_summary = ""
+            self._micro_compact_consecutive_failures = 0
+            self._micro_compact_last_failure_cursor = -1
+            self._micro_compact_defrag_blocked_digest = ""
+            self._micro_compact_passes = 0
+            self._micro_compact_tokens_saved_total = 0
+            self._micro_compact_turns_since_pass = 0
+            self._flush_scan_cursor_invalidated = False
         self._session_db = session_db
-        self._session_id = session_id or ""
+        self._session_id = next_session_id
         self._summary_failure_cooldown_until = 0.0
         self._cooldown_persist_failed = False
         self._last_summary_error = None
@@ -2919,9 +2949,13 @@ class ContextCompressor(ContextEngine):
         self._micro_compact_consecutive_failures: int = 0
         self._micro_compact_last_failure_cursor: int = -1
         self._micro_compact_defrag_threshold_tokens: int = 2000
-        # Set by _defrag_rolling_summary when it pops _DB_PERSISTED_MARKER
-        # from a live dict in place; consumed by finalize_turn to invalidate
-        # the agent's bounded flush-scan cursor (sibling of the #75170 site).
+        # A rejected/failed defrag is not retried while the exact same rolling
+        # summary remains current. A successful absorption changes the summary
+        # and clears this process-local guard.
+        self._micro_compact_defrag_blocked_digest: str = ""
+        # Set after an accepted defrag replaces the marker with a copy whose
+        # persisted stamp was removed; consumed by finalize_turn to invalidate
+        # the agent's bounded identity-scan cursor.
         self._flush_scan_cursor_invalidated: bool = False
         self._micro_compact_passes: int = 0
         self._micro_compact_tokens_saved_total: int = 0
@@ -6134,12 +6168,22 @@ This compaction should PRIORITISE preserving all information related to the focu
         """Derive the micro-compaction cursor from in-memory state or transcript scan.
 
         Returns the index of the first message that has NOT yet been absorbed
-        into the rolling summary.  If the in-memory cursor ``_micro_compact_cursor``
-        is valid (non-zero and within the compressible window), use it directly.
-        Otherwise scan from *head_end* through *tail_start* for the last context
-        summary marker and set the cursor past it.
+        into the rolling summary. If the in-memory cursor
+        ``_micro_compact_cursor`` remains a valid transcript-relative index,
+        use it directly, including when it is at or beyond the current
+        protected-tail boundary. Otherwise scan from *head_end* through
+        *tail_start* for the last context summary marker and set the cursor
+        past it.
         """
-        if self._micro_compact_cursor > head_end and self._micro_compact_cursor < tail_start:
+        # Preserve an exhausted cursor at (or temporarily beyond) the current
+        # protected-tail boundary. Re-scanning from the last summary marker in
+        # that state would retry already-rejected exchanges. Appended turns
+        # move tail_start forward, making the same transcript-relative cursor
+        # eligible again without special retry state.
+        if (
+            self._micro_compact_cursor > head_end
+            and self._micro_compact_cursor <= len(messages)
+        ):
             return self._micro_compact_cursor
         # Scan transcript for the last summary marker
         last_summary_idx = -1
@@ -6158,13 +6202,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                 if recovered:
                     self._micro_compact_rolling_summary = recovered
                     # Rehydration is containment proof: this marker's text now
-                    # lives inside the rolling summary, so it becomes
-                    # supersede/defrag-eligible. This also covers a BATCH
-                    # marker adopted as the rolling base after a batch
-                    # compaction reset — safe precisely because we just
-                    # absorbed its content. Markers whose content we did NOT
-                    # absorb never get the key and are never dropped.
-                    messages[last_summary_idx][MICRO_COMPACT_MARKER_KEY] = True
+                    # lives inside the rolling summary, so the copy-on-write
+                    # splice may supersede it after a candidate is accepted.
+                    # Do not tag the live input dict here: a later reclaim or
+                    # DB-commit rejection must leave every input byte intact.
                     logger.info(
                         "Micro-compaction: recovered rolling summary from "
                         "transcript (%d chars)", len(recovered),
@@ -6370,19 +6411,48 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     def _needs_defrag(self) -> bool:
         """Return True when the rolling summary is large enough to defrag."""
-        content_tokens = estimate_tokens_rough(self._micro_compact_rolling_summary)
-        return content_tokens >= self._micro_compact_defrag_threshold_tokens
+        summary = self._micro_compact_rolling_summary
+        content_tokens = estimate_tokens_rough(summary)
+        if content_tokens < self._micro_compact_defrag_threshold_tokens:
+            return False
+        digest = hashlib.sha256(summary.encode("utf-8", errors="replace")).hexdigest()
+        return digest != getattr(self, "_micro_compact_defrag_blocked_digest", "")
+
+    @staticmethod
+    def _estimate_micro_compact_tokens(messages: List[Dict[str, Any]]) -> int:
+        """Estimate context size without mutable SessionDB bookkeeping.
+
+        ``archive_and_compact`` replaces every row id and stamps every live
+        dict as persisted. Those private fields are not provider context, and
+        including them makes the pre-commit candidate and post-commit result
+        incomparable at the reclaim boundary. Clone only rows carrying either
+        field so unchanged messages still benefit from the shared estimator's
+        identity cache.
+        """
+        normalized: List[Dict[str, Any]] = []
+        for message in messages:
+            if isinstance(message, dict) and (
+                _DB_PERSISTED_MARKER in message or "_row_id" in message
+            ):
+                message = {
+                    key: value
+                    for key, value in message.items()
+                    if key not in {_DB_PERSISTED_MARKER, "_row_id"}
+                }
+            normalized.append(message)
+        return estimate_messages_tokens_rough(normalized)
 
     def _defrag_rolling_summary(
         self,
         messages: List[Dict[str, Any]],
-    ) -> bool:
-        """Re-summarize the rolling summary TEXT and rewrite the marker in place.
+    ) -> Optional[str]:
+        """Return a re-summarized rolling-summary candidate without publishing it.
 
         Merging exchange after exchange makes the rolling summary baggy —
         repetitive, and larger than the material justifies. Defrag compacts
-        the summary *itself*: one aux call over the accumulated summary text,
-        then the existing marker's content is rewritten in place.
+        the summary *itself*: one aux call over the accumulated summary text.
+        The caller stages the marker rewrite and publishes it only after the
+        reclaim and persistence gates pass.
 
         Deliberately transcript-shape-neutral: no messages are spliced, no
         user turns are touched, and the cursor does not move. The original
@@ -6392,50 +6462,21 @@ This compaction should PRIORITISE preserving all information related to the focu
         compacted" invariant. Un-absorbed exchanges stay where they are and
         get absorbed by later per-exchange passes.
 
-        Returns True when a pass actually rewrote the summary.
+        ``messages`` remains in the signature for compatibility with existing
+        private callers; candidate construction deliberately does not mutate it.
         """
         old_summary = self._micro_compact_rolling_summary
         if not old_summary.strip():
-            return False
+            return None
         # Feed the old summary through the merge prompt with an empty base:
         # "merge these decisions into (no previous summary)" is exactly a
         # rewrite-compactly instruction for the accumulated text.
         self._micro_compact_rolling_summary = ""
-        fresh_summary = self._micro_summarize_one(old_summary)
-        if not fresh_summary:
+        try:
+            fresh_summary = self._micro_summarize_one(old_summary)
+        finally:
             self._micro_compact_rolling_summary = old_summary
-            return False
-        self._micro_compact_rolling_summary = fresh_summary
-        # Rewrite the newest MICRO marker's content in place so the transcript
-        # and the in-memory summary stay in step (resume rehydrates from it).
-        # Scoped to micro-tagged markers: rewriting a batch-compaction marker
-        # would overwrite history the rolling summary does not contain.
-        for idx in range(len(messages) - 1, -1, -1):
-            entry = messages[idx]
-            if (
-                isinstance(entry, dict)
-                and entry.get(COMPRESSED_SUMMARY_METADATA_KEY)
-                and entry.get(MICRO_COMPACT_MARKER_KEY)
-            ):
-                entry["content"] = self._render_micro_marker_content(fresh_summary)
-                # Content changed after a possible flush — clear the persisted
-                # stamp so the DB sync/flush rewrites the row.
-                entry.pop(_DB_PERSISTED_MARKER, None)
-                # Sibling of the finalize_turn pop site (#75170): this pop
-                # also strips the marker from a LIVE dict in place, so the
-                # bounded flush-scan cursor would identity-skip the rewritten
-                # marker and the defragged summary would never reach state.db.
-                # The compressor holds no agent reference, so raise a flag the
-                # finalizer consumes to invalidate agent._db_flush_scan_prefix.
-                # (The pop sites at module scope — fresh copies in
-                # strip-marker helpers — break identity and need no flag.)
-                self._flush_scan_cursor_invalidated = True
-                break
-        logger.info(
-            "Micro-compaction defrag: rolling summary re-summarized "
-            "(%d -> %d chars)", len(old_summary), len(fresh_summary),
-        )
-        return True
+        return fresh_summary or None
 
     def _micro_compact(
         self,
@@ -6496,36 +6537,116 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Baseline for telemetry. Taken only once an exchange is in hand, so
         # turns that no-op early don't pay for the scan.
         _started_at = time.monotonic()
-        _tokens_before = estimate_messages_tokens_rough(messages)
+        _tokens_before = self._estimate_micro_compact_tokens(messages)
         _messages_before = n_messages
 
         def _elapsed_ms() -> int:
             return int((time.monotonic() - _started_at) * 1000)
 
         # Check for defrag trigger: the rolling summary itself has grown
-        # baggy. Defrag rewrites the summary text and the existing marker in
-        # place — no splice, no cursor movement, no user turns touched — so
+        # baggy. Defrag stages rewritten summary text and a replacement marker
+        # — no splice, no cursor movement, no user turns touched — so
         # the transcript shape is unchanged and this pass does not also
         # absorb an exchange (one aux call per turn either way).
         if self._needs_defrag():
-            defragged = self._defrag_rolling_summary(messages)
-            if defragged:
-                self._sync_micro_compact_to_db(messages)
-                self._micro_compact_consecutive_failures = 0
-                self._micro_compact_last_failure_cursor = -1
+            old_summary = self._micro_compact_rolling_summary
+            old_summary_digest = hashlib.sha256(
+                old_summary.encode("utf-8", errors="replace")
+            ).hexdigest()
+            fresh_summary = self._defrag_rolling_summary(messages)
+            if not fresh_summary:
+                self._micro_compact_defrag_blocked_digest = old_summary_digest
+                self._emit_micro_compaction_telemetry(
+                    outcome="defrag_failed",
+                    messages_before=_messages_before,
+                    messages_after=len(messages),
+                    tokens_before=_tokens_before,
+                    tokens_after=_tokens_before,
+                    duration_ms=_elapsed_ms(),
+                )
+                return messages
+
+            candidate = list(messages)
+            marker_rewritten = False
+            for idx in range(len(candidate) - 1, -1, -1):
+                entry = candidate[idx]
+                if (
+                    isinstance(entry, dict)
+                    and self._is_context_summary_message(entry)
+                    and (
+                        entry.get(MICRO_COMPACT_MARKER_KEY)
+                        or self._rolling_summary_from_marker(entry.get("content"))
+                        == old_summary.strip()
+                    )
+                ):
+                    rewritten = dict(entry)
+                    rewritten["content"] = self._render_micro_marker_content(
+                        fresh_summary
+                    )
+                    rewritten[MICRO_COMPACT_MARKER_KEY] = True
+                    candidate[idx] = rewritten
+                    marker_rewritten = True
+                    break
+
+            candidate_tokens = self._estimate_micro_compact_tokens(candidate)
+            if not marker_rewritten or candidate_tokens >= _tokens_before:
+                self._micro_compact_defrag_blocked_digest = old_summary_digest
+                self._emit_micro_compaction_telemetry(
+                    outcome="defrag_no_reclaim",
+                    messages_before=_messages_before,
+                    messages_after=len(messages),
+                    tokens_before=_tokens_before,
+                    tokens_after=_tokens_before,
+                    candidate_tokens_after=candidate_tokens,
+                    duration_ms=_elapsed_ms(),
+                )
+                return messages
+
+            # The staged replacement must be unstamped before publication;
+            # successful DB sync assigns its fresh row id and stamp together.
+            rewritten.pop(_DB_PERSISTED_MARKER, None)
+            sync_status = self._sync_micro_compact_to_db(candidate)
+            if sync_status is False:
+                self._micro_compact_defrag_blocked_digest = old_summary_digest
+                self._emit_micro_compaction_telemetry(
+                    outcome="defrag_db_sync_failed",
+                    messages_before=_messages_before,
+                    messages_after=len(messages),
+                    tokens_before=_tokens_before,
+                    tokens_after=_tokens_before,
+                    candidate_tokens_after=candidate_tokens,
+                    duration_ms=_elapsed_ms(),
+                )
+                return messages
+
+            published_tokens = self._estimate_micro_compact_tokens(candidate)
+            self._micro_compact_rolling_summary = fresh_summary
+            self._micro_compact_defrag_blocked_digest = ""
+            self._micro_compact_consecutive_failures = 0
+            self._micro_compact_last_failure_cursor = -1
+            # Replacing the marker dict invalidates the finalizer's bounded
+            # identity scan when no DB is bound; harmless after a bound commit.
+            self._flush_scan_cursor_invalidated = sync_status is None
+            logger.info(
+                "Micro-compaction defrag: rolling summary re-summarized "
+                "(%d -> %d chars)", len(old_summary), len(fresh_summary),
+            )
             self._emit_micro_compaction_telemetry(
-                outcome="defrag" if defragged else "defrag_failed",
+                outcome="defrag",
                 messages_before=_messages_before,
-                messages_after=len(messages),
+                messages_after=len(candidate),
                 tokens_before=_tokens_before,
-                tokens_after=estimate_messages_tokens_rough(messages),
+                tokens_after=published_tokens,
                 duration_ms=_elapsed_ms(),
             )
-            return messages
+            return candidate
 
         # Whether this pass's summary will be cumulative — i.e. whether it
         # subsumes any earlier marker. Captured before summarizing.
         _cumulative = bool(self._micro_compact_rolling_summary.strip())
+        _has_published_summary = any(
+            self._is_context_summary_message(message) for message in messages
+        )
 
         # Micro-summarize one exchange
         exchange_text = self._serialize_one_exchange(messages, exchange_start, exchange_end)
@@ -6567,22 +6688,69 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
             return messages
 
+        result = self._splice_micro_compact_result(
+            messages,
+            exchange_start,
+            exchange_end,
+            supersede=_cumulative,
+            summary_text=updated_summary,
+            previous_summary=self._micro_compact_rolling_summary,
+        )
+        candidate_tokens = self._estimate_micro_compact_tokens(result)
+        if _cumulative and _has_published_summary and candidate_tokens >= _tokens_before:
+            # Valid but ineffective output should not pay for another attempt
+            # over the same exchange. Keep the exchange verbatim for batch
+            # compression and advance only the process-local cursor.
+            self._micro_compact_cursor = exchange_end
+            self._micro_compact_consecutive_failures = 0
+            self._micro_compact_last_failure_cursor = -1
+            self._emit_micro_compaction_telemetry(
+                outcome="no_reclaim",
+                messages_before=_messages_before,
+                messages_after=len(messages),
+                tokens_before=_tokens_before,
+                tokens_after=_tokens_before,
+                candidate_tokens_after=candidate_tokens,
+                exchange_tokens=_exchange_tokens,
+                duration_ms=_elapsed_ms(),
+            )
+            return messages
+
+        sync_status = self._sync_micro_compact_to_db(result)
+        if sync_status is False:
+            # Persistence is part of publication. Never adopt a candidate the
+            # bound session cannot reload, including the intentional-growth
+            # first pass. Skip this exchange in-process rather than buying the
+            # same provider result again on the next turn.
+            self._micro_compact_cursor = exchange_end
+            self._micro_compact_consecutive_failures = 0
+            self._micro_compact_last_failure_cursor = -1
+            self._emit_micro_compaction_telemetry(
+                outcome="db_sync_failed",
+                messages_before=_messages_before,
+                messages_after=len(messages),
+                tokens_before=_tokens_before,
+                tokens_after=_tokens_before,
+                candidate_tokens_after=candidate_tokens,
+                exchange_tokens=_exchange_tokens,
+                duration_ms=_elapsed_ms(),
+            )
+            return messages
+
+        published_tokens = self._estimate_micro_compact_tokens(result)
         self._micro_compact_rolling_summary = updated_summary
-        self._micro_compact_cursor = exchange_end
+        self._micro_compact_defrag_blocked_digest = ""
+        self._micro_compact_cursor = self._cursor_after_splice(
+            result, exchange_start + 1
+        )
         self._micro_compact_consecutive_failures = 0
         self._micro_compact_last_failure_cursor = -1
-
-        result = self._splice_micro_compact_result(
-            messages, exchange_start, exchange_end, supersede=_cumulative,
-        )
-        self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
-        self._sync_micro_compact_to_db(result)
         self._emit_micro_compaction_telemetry(
             outcome="absorbed",
             messages_before=_messages_before,
             messages_after=len(result),
             tokens_before=_tokens_before,
-            tokens_after=estimate_messages_tokens_rough(result),
+            tokens_after=published_tokens,
             exchange_tokens=_exchange_tokens,
             duration_ms=_elapsed_ms(),
         )
@@ -6642,6 +6810,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         messages_after: int,
         tokens_before: int | None,
         tokens_after: int | None,
+        candidate_tokens_after: int | None = None,
         exchange_tokens: int | None = None,
         duration_ms: int | None = None,
     ) -> None:
@@ -6650,15 +6819,22 @@ This compaction should PRIORITISE preserving all information related to the focu
         Mirrors ``_emit_compression_attempt_telemetry`` for the batch path.
         Message counts move by one or two even when the saving is large, so the
         token fields are the ones that actually answer "is this helping?".
-        ``tokens_delta`` is negative when the pass shrank the transcript, and
-        the ``*_total`` fields accumulate across the session so a whole run can
-        be summarised from the last line alone.
+        They estimate provider context while excluding mutable ``_row_id`` and
+        ``_db_persisted`` bookkeeping, so they remain comparable across a DB
+        rewrite; older telemetry emitted before this basis was introduced is
+        not byte-for-byte comparable. ``tokens_delta`` is negative when the
+        pass shrank the transcript, and the ``*_total`` fields accumulate
+        across the session so a whole run can be summarised from the last line
+        alone.
         """
         try:
             delta = None
             if tokens_before is not None and tokens_after is not None:
                 delta = tokens_after - tokens_before
                 self._micro_compact_tokens_saved_total -= delta
+            candidate_delta = None
+            if tokens_before is not None and candidate_tokens_after is not None:
+                candidate_delta = candidate_tokens_after - tokens_before
             self._micro_compact_passes += 1
             # Cached reads only. The ``threshold_tokens`` / ``context_length``
             # properties resolve lazily and can fire a synchronous /models
@@ -6678,6 +6854,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "tokens_before": _safe_int(tokens_before),
                 "tokens_after": _safe_int(tokens_after),
                 "tokens_delta": _safe_int(delta),
+                "candidate_tokens_after": _safe_int(candidate_tokens_after),
+                "candidate_tokens_delta": _safe_int(candidate_delta),
                 "exchange_tokens": _safe_int(exchange_tokens),
                 "rolling_summary_tokens": estimate_tokens_rough(
                     self._micro_compact_rolling_summary
@@ -6705,7 +6883,7 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _sync_micro_compact_to_db(
         self,
         compacted_messages: List[Dict[str, Any]],
-    ) -> None:
+    ) -> Optional[bool]:
         """Persist the micro-compacted message set to the session DB.
 
         Soft-archives every currently-active message row (``active = 0``)
@@ -6718,21 +6896,37 @@ This compaction should PRIORITISE preserving all information related to the focu
         Without this, the in-memory-only splice leaves old exchange rows at
         ``active=1``, and a session resume double-loads both the summary and
         the original messages — blowing past the model's context limit.
+
+        Returns ``None`` when no durable session is bound, ``True`` after a
+        successful commit, and ``False`` after a failed bound-session commit.
+        The tri-state preserves legacy in-memory callers while making durable
+        publication an explicit adoption fence.
         """
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         if not session_db or not session_id:
-            return
+            return None
+        # SessionDB stamps fresh row ids onto the dictionaries it inserts.
+        # Isolate those writes until commit succeeds so a rollback cannot leak
+        # speculative row ids into the caller's live transcript.
+        persisted_messages = [
+            dict(msg) if isinstance(msg, dict) else msg
+            for msg in compacted_messages
+        ]
         try:
-            session_db.archive_and_compact(session_id, compacted_messages)
-            for msg in compacted_messages:
+            session_db.archive_and_compact(session_id, persisted_messages)
+            for msg, persisted in zip(compacted_messages, persisted_messages):
                 if isinstance(msg, dict):
+                    if isinstance(persisted, dict) and "_row_id" in persisted:
+                        msg["_row_id"] = persisted["_row_id"]
                     msg[_DB_PERSISTED_MARKER] = True
-        except Exception:
+            return True
+        except Exception as exc:
             logger.info(
-                "Micro-compaction DB sync failed — resume will double-load "
-                "compacted messages until the next batch compression"
+                "Micro-compaction DB sync failed; keeping original messages: %s",
+                exc,
             )
+            return False
 
     def _splice_micro_compact_result(
         self,
@@ -6740,6 +6934,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         splice_start: int,
         splice_end: int,
         supersede: bool = True,
+        summary_text: Optional[str] = None,
+        previous_summary: str = "",
     ) -> List[Dict[str, Any]]:
         """Replace *messages[splice_start:splice_end]* with a summary marker.
 
@@ -6764,7 +6960,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         would apply) so the transcript is alternation-valid as returned
         rather than relying on downstream repair to fix it up.
         """
-        summary_text = self._micro_compact_rolling_summary
+        if summary_text is None:
+            summary_text = self._micro_compact_rolling_summary
         if not summary_text.strip():
             return messages
 
@@ -6806,8 +7003,15 @@ This compaction should PRIORITISE preserving all information related to the focu
             marker_idxs = [
                 i for i, m in enumerate(result)
                 if isinstance(m, dict)
-                and m.get(COMPRESSED_SUMMARY_METADATA_KEY)
-                and m.get(MICRO_COMPACT_MARKER_KEY)
+                and self._is_context_summary_message(m)
+                and (
+                    m.get(MICRO_COMPACT_MARKER_KEY)
+                    or (
+                        previous_summary.strip()
+                        and self._rolling_summary_from_marker(m.get("content"))
+                        == previous_summary.strip()
+                    )
+                )
             ]
             if len(marker_idxs) > 1:
                 superseded = set(marker_idxs[:-1])
@@ -6822,8 +7026,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         # left every previously-persisted message unstamped, and the next
         # append-only flush re-inserted them as duplicate active rows on top
         # of the still-active originals. _sync_micro_compact_to_db re-stamps
-        # everything after a SUCCESSFUL archive; on failure the old stamps
-        # keep the flush idempotent (only the new marker row is appended).
+        # everything after a SUCCESSFUL archive. Failed candidates are not
+        # adopted, so the original stamps and transcript remain untouched.
         return result
 
     @staticmethod
@@ -6864,6 +7068,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 and isinstance(prev.get("content"), str)
                 and isinstance(msg.get("content"), str)
             ):
+                # ``result`` shares untouched dictionaries with the caller.
+                # Clone the one user row this repair changes so a rejected
+                # speculative candidate cannot mutate the input transcript.
+                prev = dict(prev)
+                merged[-1] = prev
                 prev_content = prev["content"]
                 new_content = msg["content"]
                 prev["content"] = (
@@ -7736,12 +7945,14 @@ This compaction should PRIORITISE preserving all information related to the focu
         # never absorbed). Keeping the stale summary would let the next micro
         # pass supersede-drop or defrag-rewrite content it does not contain.
         # Reset instead; the next micro pass rehydrates from the batch marker
-        # via _resolve_compact_cursor, which re-tags it as micro-eligible
-        # only after absorbing its content into the rolling summary.
+        # via _resolve_compact_cursor. The candidate splice recognizes that
+        # exact recovered summary as safe to supersede without mutating the
+        # live marker before the reclaim and persistence gates pass.
         self._micro_compact_rolling_summary = ""
         self._micro_compact_cursor = 0
         self._micro_compact_consecutive_failures = 0
         self._micro_compact_last_failure_cursor = -1
+        self._micro_compact_defrag_blocked_digest = ""
         self._proactive_prune_rearm_tokens = 0
 
         return compressed
