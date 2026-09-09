@@ -498,14 +498,19 @@ class TestMicroCompaction:
 
         The original implementation spliced the whole remaining middle (user
         turns included) into the marker, silently absorbing user messages.
-        Defrag is now transcript-shape-neutral: same message list, same
-        cursor, marker content rewritten in place.
+        Defrag is transcript-shape-neutral: same message roles and cursor,
+        with the marker rewritten by copy-on-write.
         """
         cc = _compressor(summary="FRESH DEFRAGGED SUMMARY")
         messages = _conversation(exchanges=8)
         # Seed a real marker + oversized rolling summary, as after many passes.
         messages = cc._micro_compact(list(messages))
-        cc._micro_compact_rolling_summary = "x" * 40_000  # far over the threshold
+        oversized_summary = "OLD DEFRAG SUMMARY " + "x" * 400
+        cc._micro_compact_rolling_summary = oversized_summary
+        cc._micro_compact_defrag_threshold_tokens = 1
+        _summary_markers(messages)[0]["content"] = cc._render_micro_marker_content(
+            oversized_summary
+        )
         cursor_before = cc._micro_compact_cursor
         shape_before = [m.get("role") for m in messages]
 
@@ -763,10 +768,8 @@ class TestMicroCompaction:
 
 
 class TestDefragFlushCursorInvalidation:
-    """Sibling of the finalize_turn pop site (#75170): defrag pops
-    _DB_PERSISTED_MARKER from the live marker dict in place, so the bounded
-    flush-scan cursor must be invalidated or the rewritten summary is
-    identity-skipped and never re-persisted."""
+    """A copy-on-write defrag replaces the marker identity and clears its
+    persisted stamp, so the bounded flush scan must revisit that position."""
 
     def _defrag_setup(self):
         from agent.context_compressor import _DB_PERSISTED_MARKER
@@ -778,10 +781,15 @@ class TestDefragFlushCursorInvalidation:
         for m in messages:
             if m.get(COMPRESSED_SUMMARY_METADATA_KEY):
                 m[_DB_PERSISTED_MARKER] = True
-        cc._micro_compact_rolling_summary = "x" * 40_000  # force defrag
+        old_summary = "OLD DEFRAG SUMMARY " + "x" * 400
+        cc._micro_compact_rolling_summary = old_summary
+        cc._micro_compact_defrag_threshold_tokens = 1
+        _summary_markers(messages)[0]["content"] = cc._render_micro_marker_content(
+            old_summary
+        )
         return cc, messages
 
-    def test_defrag_marker_pop_raises_invalidation_flag(self):
+    def test_defrag_marker_replacement_raises_invalidation_flag(self):
         from agent.context_compressor import _DB_PERSISTED_MARKER
 
         cc, messages = self._defrag_setup()
@@ -791,9 +799,9 @@ class TestDefragFlushCursorInvalidation:
 
         markers = _summary_markers(result)
         assert len(markers) == 1
-        # The pop happened in place on the live dict...
+        # The replacement marker is intentionally unstamped...
         assert not markers[0].get(_DB_PERSISTED_MARKER)
-        # ...so the compressor must flag the flush-scan cursor stale.
+        # ...so the compressor must flag the identity-scan cursor stale.
         assert cc._flush_scan_cursor_invalidated is True
 
     def test_no_defrag_no_flag(self):
@@ -815,9 +823,9 @@ class TestDefragFlushCursorInvalidation:
         micro_block = micro_block.split("agent._persist_session", 1)[0]
         assert "_flush_scan_cursor_invalidated" in micro_block, (
             "finalize_turn must consume the compressor's cursor-invalidation "
-            "flag raised by the defrag marker pop"
+            "flag raised by the defrag marker replacement"
         )
         assert "agent._db_flush_scan_prefix = None" in micro_block, (
             "finalize_turn must invalidate the bounded flush-scan cursor "
-            "when the defrag pop stripped a live marker's stamp"
+            "when defrag publishes an unstamped replacement marker"
         )

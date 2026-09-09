@@ -450,13 +450,12 @@ def finalize_turn(
                 ):
                     _before = len(messages)
                     _compacted = _compressor._micro_compact(messages)
-                    # Micro-compaction defrag rewrites the newest MICRO
-                    # marker's content and pops _db_persisted from the live
-                    # dict in place — the sibling of the pop site above. The
-                    # compressor has no agent reference, so it raises a flag
-                    # for us to invalidate the bounded flush-scan cursor;
-                    # otherwise the rewritten marker row is identity-skipped
-                    # and the stale summary persists to state.db.
+                    # A committed micro-compaction defrag replaces the newest
+                    # marker dict with a copy whose persisted stamp is cleared.
+                    # The compressor has no agent reference, so it raises a
+                    # flag for us to invalidate the bounded identity-scan
+                    # cursor; otherwise an unbound in-memory defrag could skip
+                    # the replacement marker during the subsequent flush.
                     if getattr(
                         _compressor, "_flush_scan_cursor_invalidated", False
                     ):
