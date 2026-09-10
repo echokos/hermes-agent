@@ -56,6 +56,16 @@ press **Update now** to deploy the latest promoted Enterkey release.
 This separation makes the routine update path safe while keeping upstream code
 integration observable and reversible.
 
+## Configured fallback policy
+
+The fleet's top-level fallback chain is eligible only for classified service
+failures and rate limits: timeouts, overloads, server errors, and provider or
+upstream throttling. Authentication, billing, model/configuration errors,
+context limits, invalid responses, and provider or content-policy refusals stay
+on their native recovery or terminal path. Auxiliary tasks inherit this same
+restriction when consulting the top-level chain; explicit task-specific
+auxiliary routing remains independent.
+
 ## Verification
 
 After an update, confirm:

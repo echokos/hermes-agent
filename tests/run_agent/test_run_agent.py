@@ -2838,7 +2838,7 @@ class TestRunConversation:
             },
         ]
 
-    def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
+    def test_codex_content_filter_incomplete_is_terminal_without_fallback(self, agent):
         self._setup_agent(agent)
         agent.api_mode = "codex_responses"
         agent.provider = "openai-codex"
@@ -2859,31 +2859,14 @@ class TestRunConversation:
             model="gpt-5.5",
             usage=None,
         )
-        fallback_response = SimpleNamespace(
-            status="completed",
-            incomplete_details=None,
-            output=[
-                SimpleNamespace(
-                    type="message",
-                    status="completed",
-                    content=[SimpleNamespace(type="output_text", text="Recovered on fallback")],
-                )
-            ],
-            model="fallback/model",
-            usage=None,
-        )
         hook_events = []
         logical_completions = []
-
-        def _fake_activate(reason=None):
-            agent._fallback_index = len(agent._fallback_chain)
-            return True
 
         with (
             patch.object(agent, "_create_request_openai_client", return_value=MagicMock()),
             patch.object(agent, "_close_request_openai_client"),
-            patch.object(agent, "_run_codex_stream", side_effect=[content_filter_response, fallback_response]) as mock_run_codex_stream,
-            patch.object(agent, "_try_activate_fallback", side_effect=_fake_activate) as mock_try_activate_fallback,
+            patch.object(agent, "_run_codex_stream", return_value=content_filter_response) as mock_run_codex_stream,
+            patch.object(agent, "_try_activate_fallback") as mock_try_activate_fallback,
             patch.object(agent, "_invoke_api_request_error_hook", side_effect=lambda **kw: hook_events.append(kw)),
             patch(
                 "agent.relay_llm.complete_logical_call",
@@ -2897,16 +2880,17 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("summarize this large Slack thread")
 
-        assert result["final_response"] == "Recovered on fallback"
-        assert result["completed"] is True
-        mock_try_activate_fallback.assert_called_once_with()
-        assert mock_run_codex_stream.call_count == 2
+        assert result["failed"] is True
+        assert result["completed"] is False
+        assert result["error"].startswith("content_policy_blocked:")
+        assert "model declined to respond" in result["final_response"].lower()
+        assert "rephrasing the request" in result["final_response"].lower()
+        mock_try_activate_fallback.assert_not_called()
+        assert mock_run_codex_stream.call_count == 1
         assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
         assert hook_events[0]["retryable"] is False
         assert hook_events[0]["reason"] == FailoverReason.content_policy_blocked.value
-        assert logical_completions == [
-            (hook_events[0]["api_request_id"], "success")
-        ]
+        assert logical_completions == []
 
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)
@@ -3231,6 +3215,7 @@ class TestRunConversation:
     def test_truly_empty_response_retries_3_times_then_empty(self, agent):
         """Truly empty response (no content, no reasoning) retries 3 times then falls through to (empty)."""
         self._setup_agent(agent)
+        agent._turn_completion_explainer_enabled = lambda: True
         agent.base_url = "http://127.0.0.1:1234/v1"
         empty_resp = _mock_response(content=None, finish_reason="stop")
         # 4 responses: 1 original + 3 nudge retries, all empty
@@ -3255,6 +3240,7 @@ class TestRunConversation:
         — the loop must stop re-billing the full input after the second
         attempt instead of burning the whole retry budget."""
         self._setup_agent(agent)
+        agent._turn_completion_explainer_enabled = lambda: True
         agent.base_url = "http://127.0.0.1:1234/v1"
         zero_usage = {
             "prompt_tokens": 25_900,
@@ -3341,9 +3327,10 @@ class TestRunConversation:
         assert result["final_response"] == "Here is the actual answer."
         assert result["api_calls"] == 2  # 1 original + 1 nudge retry
 
-    def test_empty_response_triggers_fallback_provider(self, agent):
-        """After 3 empty retries, fallback provider is activated and produces content."""
+    def test_empty_response_exhaustion_does_not_trigger_fallback_provider(self, agent):
+        """Anonymous empty output has no service/rate proof for failover."""
         self._setup_agent(agent)
+        agent._turn_completion_explainer_enabled = lambda: True
         agent.base_url = "http://127.0.0.1:1234/v1"
         # Configure a fallback chain
         agent._fallback_chain = [{"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}]
@@ -3351,71 +3338,58 @@ class TestRunConversation:
         agent._fallback_activated = False
 
         empty_resp = _mock_response(content=None, finish_reason="stop")
-        content_resp = _mock_response(content="Fallback answer.", finish_reason="stop")
-        # 4 empty (1 orig + 3 retries), then fallback model answers
+        # One original attempt plus three native empty-response retries.
         agent.client.chat.completions.create.side_effect = [
-            empty_resp, empty_resp, empty_resp, empty_resp, content_resp,
+            empty_resp, empty_resp, empty_resp, empty_resp,
         ]
-
-        fallback_called = {"called": False}
-
-        def _mock_fallback():
-            fallback_called["called"] = True
-            # Simulate what _try_activate_fallback does: just advance the
-            # index and set the flag (the client is already mocked).
-            agent._fallback_index = 1
-            agent._fallback_activated = True
-            agent.model = "anthropic/claude-sonnet-4"
-            agent.provider = "openrouter"
-            return True
 
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
-            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
+            patch.object(agent, "_try_activate_fallback") as mock_try_activate_fallback,
         ):
             result = agent.run_conversation("answer me")
-        assert fallback_called["called"], "Fallback should have been triggered"
+        mock_try_activate_fallback.assert_not_called()
         assert result["completed"] is True
-        assert result["final_response"] == "Fallback answer."
+        assert result["final_response"] != "(empty)"
+        assert "No reply:" in result["final_response"]
+        assert result["api_calls"] == 4
+        assert result["messages"][-1]["content"] == "(empty)"
+        assert "_empty_terminal_sentinel" not in result["messages"][-1]
+        assert agent._fallback_index == 0
+        assert agent._fallback_activated is False
 
-    def test_empty_response_fallback_also_empty_returns_empty(self, agent):
-        """If fallback also returns empty, final response is (empty)."""
+    def test_empty_response_with_fallback_configured_stays_on_primary(self, agent):
+        """Anonymous empty output does not authorize a fallback switch."""
         self._setup_agent(agent)
+        agent._turn_completion_explainer_enabled = lambda: True
         agent.base_url = "http://127.0.0.1:1234/v1"
         agent._fallback_chain = [{"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}]
         agent._fallback_index = 0
         agent._fallback_activated = False
 
         empty_resp = _mock_response(content=None, finish_reason="stop")
-        # 4 empty from primary (1 + 3 retries), fallback activated,
-        # then 4 more empty from fallback (1 + 3 retries), no more fallbacks
+        # Four primary responses are consumed; fallback responses remain unused.
         agent.client.chat.completions.create.side_effect = [
             empty_resp, empty_resp, empty_resp, empty_resp,  # primary exhausted
-            empty_resp, empty_resp, empty_resp, empty_resp,  # fallback exhausted
         ]
-
-        def _mock_fallback():
-            if agent._fallback_index >= len(agent._fallback_chain):
-                return False
-            agent._fallback_index += 1
-            agent._fallback_activated = True
-            agent.model = "anthropic/claude-sonnet-4"
-            agent.provider = "openrouter"
-            return True
 
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
-            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
+            patch.object(agent, "_try_activate_fallback") as activate,
         ):
             result = agent.run_conversation("answer me")
+        activate.assert_not_called()
         assert result["completed"] is True
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
+        assert result["api_calls"] == 4
+        assert agent._fallback_index == 0
+        assert agent._fallback_activated is False
 
 
     def test_empty_response_retry_backoff_interrupted(self, agent, monkeypatch):
@@ -5398,7 +5372,7 @@ class TestFallbackAnthropicProvider:
             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value=None),
         ):
             mock_build.return_value = MagicMock()
-            result = agent._try_activate_fallback()
+            result = agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         assert result is True
         assert agent.api_mode == "anthropic_messages"
@@ -5420,7 +5394,7 @@ class TestFallbackAnthropicProvider:
             patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value=None),
         ):
-            agent._try_activate_fallback()
+            agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         assert agent._use_prompt_caching is True
 
@@ -6264,7 +6238,7 @@ class TestFallbackSetsOAuthFlag:
             patch("agent.anthropic_adapter.resolve_anthropic_token",
                   return_value=None),
         ):
-            result = agent._try_activate_fallback()
+            result = agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         assert result is True
         assert agent._is_anthropic_oauth is True
@@ -6287,7 +6261,7 @@ class TestFallbackSetsOAuthFlag:
             patch("agent.anthropic_adapter.resolve_anthropic_token",
                   return_value=None),
         ):
-            result = agent._try_activate_fallback()
+            result = agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         assert result is True
         assert agent._is_anthropic_oauth is False

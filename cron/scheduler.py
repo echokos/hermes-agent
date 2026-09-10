@@ -4382,9 +4382,8 @@ def _is_transient_provider_resolve_error(exc: BaseException) -> bool:
     Agent crons resolve OAuth credentials (token refresh / discovery) before the
     agent loop starts. A short DNS outage (Cloudflare WARP / macOS resolver blip)
     surfaces as httpx/httpcore ConnectError or raw OSError errno 8 ("nodename nor
-    servname provided") and must be eligible for ``fallback_providers`` the same
-    way AuthError already is — otherwise a healthy XAI_API_KEY / Anthropic rung
-    never gets tried and the whole job dies before the first model call.
+    servname provided") may use ``fallback_providers`` before the first model
+    call. Authentication failures instead remain on the native credential path.
     """
     # Walk the cause chain; scheduler wraps raw transport errors.
     seen: set[int] = set()
@@ -5507,7 +5506,7 @@ def _run_job_after_admission(
             resolve_runtime_provider,
             format_runtime_provider_error,
         )
-        from hermes_cli.auth import AuthError
+        from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
         # F8 runtime backstop: never resolve a stored provider/base_url pair that
         # would ship a named provider's stored credential to an off-host endpoint
@@ -5623,29 +5622,44 @@ def _run_job_after_admission(
             )
         except Exception as resolve_exc:
             # Primary provider resolution failed. Walk fallback_providers for:
-            #   1) AuthError (missing/expired credential)
-            #   2) Transient network/DNS failures during OAuth refresh or
+            #   Transient network/DNS failures during OAuth refresh or
             #      discovery (e.g. macOS morning DNS blip → httpx.ConnectError
             #      "[Errno 8] nodename nor servname provided").
-            # Previously only AuthError tried the chain; a ConnectError during
-            # xai-oauth token refresh killed agent crons even when XAI_API_KEY
-            # / Anthropic fallbacks were healthy (Daily Focus Kickoff 2026-08-11).
+            # A ConnectError during xai-oauth token refresh may use a healthy
+            # configured fallback without changing policy/auth semantics.
             # Keeping provider+model atomic still applies — never swap only the
             # provider while retaining a paid primary model.
-            is_auth = isinstance(resolve_exc, AuthError)
+            from agent.error_classifier import allows_configured_fallback, classify_api_error
+
+            classified = classify_api_error(
+                resolve_exc,
+                provider=primary_provider_for_drift or "",
+                model=str(model or ""),
+            )
+            is_rate_limited_auth = (
+                isinstance(resolve_exc, AuthError)
+                and is_rate_limited_auth_error(resolve_exc)
+            )
             is_transient_net = _is_transient_provider_resolve_error(resolve_exc)
-            if not (is_auth or is_transient_net):
+            if not (
+                is_rate_limited_auth
+                or is_transient_net
+                or allows_configured_fallback(classified.reason)
+            ):
                 raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
             primary_provider_for_drift = (
                 str(getattr(resolve_exc, "provider", "") or "").strip().lower()
                 or primary_provider_for_drift
             )
-            reason = "auth" if is_auth else "transient network"
             logger.warning(
-                "Job '%s': primary provider resolve failed (%s: %s), trying fallback",
+                "Job '%s': eligible primary provider resolution failure (%s: %s), trying fallback",
                 job_id,
-                reason,
+                (
+                    "rate_limit"
+                    if is_rate_limited_auth
+                    else classified.reason.value
+                ),
                 resolve_exc,
             )
             fb_list = get_fallback_chain(_cfg)

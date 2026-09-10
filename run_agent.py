@@ -3807,8 +3807,8 @@ class AIAgent:
         if reason == "empty_response_exhausted":
             return (
                 prefix
-                + "the model returned empty content after retries and any "
-                "fallback providers. Try `continue`, switch model/provider, "
+                + "the model returned empty content after native retries. "
+                "Try `continue`, switch model/provider, "
                 "or inspect the tool output above."
             )
         if reason == "all_retries_exhausted_no_response":
@@ -7010,7 +7010,7 @@ class AIAgent:
         return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
 
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
-        """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
+        """Activate an eligible service/rate fallback; see the helper."""
         from agent.chat_completion_helpers import try_activate_fallback
         return try_activate_fallback(self, reason)
 

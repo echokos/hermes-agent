@@ -15,6 +15,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.error_classifier import FailoverReason
+
 
 # ---------------------------------------------------------------------------
 # 1. CLI _resolve_turn_agent_config includes credential_pool
@@ -116,7 +118,7 @@ class TestEagerFallbackWithPool:
             pool = agent._credential_pool
             pool_may_recover = pool is not None and pool.has_available()
             if not pool_may_recover:
-                agent._try_activate_fallback()
+                agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         agent._try_activate_fallback.assert_not_called()
 
@@ -129,7 +131,7 @@ class TestEagerFallbackWithPool:
             pool = agent._credential_pool
             pool_may_recover = pool is not None and pool.has_available()
             if not pool_may_recover:
-                agent._try_activate_fallback()
+                agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         agent._try_activate_fallback.assert_called_once()
 
@@ -142,7 +144,7 @@ class TestEagerFallbackWithPool:
             pool = agent._credential_pool
             pool_may_recover = pool is not None and pool.has_available()
             if not pool_may_recover:
-                agent._try_activate_fallback()
+                agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         agent._try_activate_fallback.assert_called_once()
 
@@ -562,4 +564,3 @@ class TestFailureAttribution:
 
         failed = {e.id: e for e in pool.entries()}["cred-1"]
         assert failed.failure_reason != "billing"
-

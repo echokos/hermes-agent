@@ -1,16 +1,16 @@
-"""Test that AuthError triggers fallback provider resolution (#7230)."""
+"""Tests for eligible initial provider-resolution fallback."""
 
 from unittest.mock import patch
 
 import pytest
 
 
-class TestResolveRuntimeAgentKwargsAuthFallback:
-    """_resolve_runtime_agent_kwargs should try fallback on AuthError."""
+class TestResolveRuntimeAgentKwargsFallback:
+    """Only service/rate resolution failures may use configured fallback."""
 
-    def test_auth_error_tries_fallback(self, tmp_path, monkeypatch):
-        """When primary provider raises AuthError, fallback is attempted."""
-        from hermes_cli.auth import AuthError
+    def test_codex_usage_limit_auth_error_tries_fallback(self, tmp_path, monkeypatch):
+        """A Codex subscription usage limit with a reset remains eligible."""
+        from hermes_cli.auth import AuthError, CODEX_RATE_LIMITED_CODE
 
         # Create a config with fallback
         config_path = tmp_path / "config.yaml"
@@ -31,7 +31,11 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
             # Second call = fallback path with explicit_api_key + explicit_base_url
             # supplied by gateway from fallback_model config.
             if call_count["n"] == 1:
-                raise AuthError("Codex token refresh failed with status 401")
+                raise AuthError(
+                    "Codex usage limit reached; retry after 120s",
+                    provider="openai-codex",
+                    code=CODEX_RATE_LIMITED_CODE,
+                )
             return {
                 "api_key": "fallback-key",
                 "base_url": "https://openrouter.ai/api/v1",
@@ -54,4 +58,49 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
         # Should have been called at least twice (primary + fallback)
         assert call_count["n"] >= 2
 
+    def test_credential_auth_error_does_not_try_fallback(self, tmp_path, monkeypatch):
+        from hermes_cli.auth import AuthError
+        from gateway.run import _resolve_runtime_agent_kwargs
 
+        (tmp_path / "config.yaml").write_text(
+            "fallback_model:\n  provider: openrouter\n  model: test-model\n"
+        )
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=AuthError("Codex credentials missing", relogin_required=True),
+        ) as resolve:
+            with pytest.raises(RuntimeError, match="credentials missing"):
+                _resolve_runtime_agent_kwargs()
+
+        assert resolve.call_count == 1
+
+    def test_server_error_tries_fallback(self, tmp_path, monkeypatch):
+        from gateway.run import _resolve_runtime_agent_kwargs
+
+        (tmp_path / "config.yaml").write_text(
+            "fallback_model:\n  provider: openrouter\n  model: test-model\n"
+        )
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+
+        class _ServiceError(Exception):
+            status_code = 503
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=[
+                _ServiceError("upstream overloaded"),
+                {
+                    "api_key": "fallback-key",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                    "command": None,
+                    "args": [],
+                    "credential_pool": None,
+                },
+            ],
+        ):
+            result = _resolve_runtime_agent_kwargs()
+
+        assert result["provider"] == "openrouter"

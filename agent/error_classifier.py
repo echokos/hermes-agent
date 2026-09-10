@@ -59,7 +59,7 @@ class FailoverReason(enum.Enum):
     image_too_large = "image_too_large"   # Native image part exceeds provider's per-image limit — shrink and retry
 
     # Model / provider policy
-    model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
+    model_not_found = "model_not_found"  # 404 or invalid model — terminal configuration guidance
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator (e.g. OpenRouter) blocked the only endpoint due to account data/privacy policy
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
 
@@ -76,6 +76,22 @@ class FailoverReason(enum.Enum):
 
     # Catch-all
     unknown = "unknown"                  # Unclassifiable — retry with backoff
+
+
+# Configured provider fallback is reserved for an unavailable service or an
+# explicit rate limit. All other reasons use their native recovery or abort.
+FALLBACK_ACTIVATION_REASONS = frozenset({
+    FailoverReason.rate_limit,
+    FailoverReason.upstream_rate_limit,
+    FailoverReason.overloaded,
+    FailoverReason.server_error,
+    FailoverReason.timeout,
+})
+
+
+def allows_configured_fallback(reason: FailoverReason | None) -> bool:
+    """Whether a classified failure may switch configured providers."""
+    return reason in FALLBACK_ACTIVATION_REASONS
 
 
 # ── Classification result ───────────────────────────────────────────────
@@ -367,12 +383,9 @@ _MODEL_NOT_FOUND_PATTERNS = [
     "unsupported model",
     # OpenRouter returns 404 with this message when none of the candidate
     # endpoints for the selected model support tool/function calling.
-    # Classifying this as model_not_found triggers fallback to a different
-    # model or provider that does support tools.  Without this entry the
-    # pattern falls through to ``unknown`` with ``retryable=True``, the
-    # retry loop burns all attempts on the same deterministic rejection,
-    # and the error surfaces as a confusing "model not found" message
-    # instead of automatically failing over.  See PR #58446.
+    # This is a deterministic configuration mismatch. Without this entry the
+    # pattern falls through to ``unknown`` with ``retryable=True`` and burns
+    # attempts on the same invalid request. See PR #58446.
     "no endpoints found that support tool use",
 ]
 
@@ -487,9 +500,8 @@ _PROVIDER_POLICY_BLOCKED_PATTERNS = [
 # data/privacy guardrail) — these are *per-prompt* safety decisions made by
 # the upstream model provider. They are deterministic for the unchanged
 # request, so retrying the same prompt three times just reproduces the same
-# block and burns paid attempts on a refusal. The recovery is to switch to a
-# configured fallback model/provider immediately, or surface the block to
-# the user with actionable guidance if no fallback exists.
+# block and burns paid attempts on a refusal. Surface the block with actionable
+# guidance; configured provider fallback is reserved for service/rate failures.
 #
 # Patterns are intentionally narrow — each phrase is a verbatim string from
 # a specific provider's safety pipeline, not a generic word like "policy" or
@@ -803,6 +815,9 @@ def classify_api_error(
             "message": _extract_message(error, body),
         }
         defaults.update(overrides)
+        # Plugins and individual classifiers may nominate fallback, but the
+        # shared policy is authoritative for every recovery path.
+        defaults["should_fallback"] = allows_configured_fallback(reason)
         return ClassifiedError(**defaults)
 
     # ── 0. Plugin classifiers (first valid result wins) ─────────────

@@ -1,7 +1,7 @@
 """Regression guard for #18028: provider content-policy / safety-filter
 blocks must classify as ``content_policy_blocked``, be non-retryable, and
-trigger the ``is_client_error`` abort path so the loop jumps straight to a
-configured fallback or surfaces a clear policy-block message — instead of
+trigger the ``is_client_error`` abort path so the loop surfaces a clear
+policy-block message instead of
 burning ``api_max_retries`` paid attempts on a deterministic refusal and
 delivering "API failed after 3 retries" to Telegram/cron with no provider
 context.
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 class TestContentPolicyBlockedClassification:
     """Verify classify_api_error returns the right shape so downstream
-    recovery (fallback activation, final_response wording) fires correctly.
+    terminal recovery and final-response wording fire correctly.
     """
 
     def test_openai_codex_cybersecurity_no_status(self):
@@ -36,8 +36,8 @@ class TestContentPolicyBlockedClassification:
         # caused the 3x retry burn.
         assert result.reason == FailoverReason.content_policy_blocked
         assert result.retryable is False
-        # Recovery is fallback model, not credential rotation or compression.
-        assert result.should_fallback is True
+        # Policy refusal is terminal, not credential rotation or fallback.
+        assert result.should_fallback is False
         assert result.should_compress is False
         assert result.should_rotate_credential is False
 
@@ -47,7 +47,7 @@ class TestContentPolicyTriggersClientErrorAbort:
     """Mirror the ``is_client_error`` predicate in
     ``agent/conversation_loop.py`` and verify
     ``FailoverReason.content_policy_blocked`` resolves to True so the loop
-    aborts (after attempting fallback) instead of falling into the
+    aborts instead of falling into the
     retry-backoff path.
     """
 

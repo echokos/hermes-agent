@@ -5646,15 +5646,26 @@ def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
     reason: str = "error",
+    failure: Optional[Exception] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
-    ``provider: auto`` auxiliary tasks should respect the user's declared
-    main fallback policy before dropping into Hermes' built-in discovery
-    chain. The top-level chain is read through ``get_fallback_chain`` so
-    both modern ``fallback_providers`` and legacy ``fallback_model`` entries
-    participate in the same order as the main agent.
+    ``provider: auto`` auxiliary tasks may use the user's declared main
+    fallback policy after a classified service/rate failure. Startup
+    unavailability and request/auth/policy failures continue through the
+    auxiliary task's native routing without inheriting the main chain.
     """
+    from agent.error_classifier import allows_configured_fallback, classify_api_error
+
+    if failure is None or not allows_configured_fallback(
+        classify_api_error(failure, provider=failed_provider).reason
+    ):
+        logger.debug(
+            "Auxiliary %s: main fallback chain ineligible for %s",
+            task or "call", reason,
+        )
+        return None, None, ""
+
     try:
         from hermes_cli.config import load_config_readonly
         from hermes_cli.fallback_config import get_fallback_chain
@@ -9822,7 +9833,8 @@ def _call_llm_impl(
                     failed_model=_chain_failed_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task, resolved_provider or "auto", reason=reason,
+                        failure=first_err)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
@@ -10486,7 +10498,8 @@ async def _async_call_llm_impl(
                     failed_model=_chain_failed_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task, resolved_provider or "auto", reason=reason,
+                        failure=first_err)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)

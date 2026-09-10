@@ -32,6 +32,7 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (
     FailoverReason,
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
+    allows_configured_fallback,
 )
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
@@ -2436,6 +2437,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if not allows_configured_fallback(reason):
+        logger.info("Configured fallback suppressed for reason=%s", getattr(reason, "value", reason))
+        return False
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
