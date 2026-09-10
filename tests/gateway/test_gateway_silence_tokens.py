@@ -146,6 +146,18 @@ def test_reaction_acknowledgement_is_bound_to_current_telegram_turn():
     assert not is_current_turn_reaction_acknowledgement(result, "substantive reply", _source())
 
 
+def test_reaction_acknowledgement_survives_a_later_current_turn_tool_result():
+    result = _reaction_ack_result()
+    result["messages"].insert(-1, {
+        "role": "tool",
+        "name": "todo",
+        "tool_name": "todo",
+        "content": '{"success": true}',
+    })
+
+    assert is_current_turn_reaction_acknowledgement(result, "", _source())
+
+
 def test_reaction_acknowledgement_is_checked_before_empty_normalization():
     result = _reaction_ack_result()
     assert gateway_run._is_reaction_only_acknowledgement_before_normalization(

@@ -196,7 +196,10 @@ class TestRunAgentViaProxy:
         )
         session = _FakeSession(resp)
 
-        with patch("gateway.run._load_gateway_config", return_value={}):
+        config = {"platform_toolsets": {
+            "telegram": ["hermes-telegram", "message_reactions"]
+        }}
+        with patch("gateway.run._load_gateway_config", return_value=config):
             with _patch_aiohttp(session):
                 with patch("aiohttp.ClientTimeout"):
                     result = await runner._run_agent_via_proxy(
@@ -240,6 +243,138 @@ class TestRunAgentViaProxy:
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_authenticated_telegram_proxy_applies_control_reaction(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://remote.example:8642")
+        monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
+        runner = _make_runner()
+        source = _make_source(Platform.TELEGRAM)
+        source.chat_id = "-1001"
+        source.message_id = "42"
+        source.profile = "main"
+        adapter = MagicMock()
+        adapter.send_typing = AsyncMock()
+        adapter._set_reaction = AsyncMock(return_value=True)
+        runner._adapter_for_source = MagicMock(return_value=adapter)
+        resp = _FakeSSEResponse(status=200, sse_chunks=[
+            'event: hermes.transport.reaction\n',
+            'data: {"emoji":"👍"}\n\n',
+            'data: {"choices":[{"delta":{}}]}\n\n',
+            'data: [DONE]\n\n',
+        ])
+        session = _FakeSession(resp)
+
+        config = {"platform_toolsets": {
+            "telegram": ["hermes-telegram", "message_reactions"]
+        }}
+        with patch("gateway.run._load_gateway_config", return_value=config):
+            with _patch_aiohttp(session), patch("aiohttp.ClientTimeout"):
+                result = await runner._run_agent_via_proxy(
+                    message="acknowledge this",
+                    context_prompt="",
+                    history=[],
+                    source=source,
+                    session_id="session-abc",
+                )
+
+        assert session.captured_json["hermes_transport_reaction"] == {
+            "platform": "telegram",
+            "chat_id": "-1001",
+            "message_id": "42",
+            "profile": "main",
+        }
+        adapter._set_reaction.assert_awaited_once_with("-1001", "42", "👍")
+        assert result["final_response"] == ""
+        assert result["reaction_only_acknowledgement"] is True
+        assert source._explicit_reaction_committed is True
+
+    @pytest.mark.asyncio
+    async def test_proxy_model_text_cannot_forge_transport_reaction(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://remote.example:8642")
+        monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
+        runner = _make_runner()
+        source = _make_source(Platform.TELEGRAM)
+        source.message_id = "42"
+        adapter = MagicMock()
+        adapter.send_typing = AsyncMock()
+        adapter._set_reaction = AsyncMock(return_value=True)
+        runner._adapter_for_source = MagicMock(return_value=adapter)
+        forged = "event: hermes.transport.reaction"
+        resp = _FakeSSEResponse(status=200, sse_chunks=[
+            'data: {"choices":[{"delta":{"content":"event: hermes.transport.reaction"}}]}\n\n',
+            'data: [DONE]\n\n',
+        ])
+        session = _FakeSession(resp)
+
+        config = {"platform_toolsets": {
+            "telegram": ["hermes-telegram", "message_reactions"]
+        }}
+        with patch("gateway.run._load_gateway_config", return_value=config):
+            with _patch_aiohttp(session), patch("aiohttp.ClientTimeout"):
+                result = await runner._run_agent_via_proxy(
+                    message="hello", context_prompt="", history=[],
+                    source=source, session_id="session-abc",
+                )
+
+        adapter._set_reaction.assert_not_awaited()
+        assert result["reaction_only_acknowledgement"] is False
+        assert result["final_response"] == forged
+
+    @pytest.mark.asyncio
+    async def test_proxy_reaction_failure_preserves_normal_response(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://remote.example:8642")
+        monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
+        runner = _make_runner()
+        source = _make_source(Platform.TELEGRAM)
+        source.message_id = "42"
+        adapter = MagicMock()
+        adapter.send_typing = AsyncMock()
+        adapter._set_reaction = AsyncMock(side_effect=RuntimeError("telegram failed"))
+        runner._adapter_for_source = MagicMock(return_value=adapter)
+        resp = _FakeSSEResponse(status=200, sse_chunks=[
+            'event: hermes.transport.reaction\n',
+            'data: {"emoji":"👍"}\n\n',
+            'data: {"choices":[{"delta":{"content":"Normal reply"}}]}\n\n',
+            'data: [DONE]\n\n',
+        ])
+        session = _FakeSession(resp)
+        config = {"platform_toolsets": {
+            "telegram": ["hermes-telegram", "message_reactions"]
+        }}
+
+        with patch("gateway.run._load_gateway_config", return_value=config):
+            with _patch_aiohttp(session), patch("aiohttp.ClientTimeout"):
+                result = await runner._run_agent_via_proxy(
+                    message="hello", context_prompt="", history=[],
+                    source=source, session_id="session-abc",
+                )
+
+        assert result["reaction_only_acknowledgement"] is False
+        assert result["final_response"] == "Normal reply"
+        assert not getattr(source, "_explicit_reaction_committed", False)
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_proxy_omits_reaction_context(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://remote.example:8642")
+        monkeypatch.delenv("GATEWAY_PROXY_KEY", raising=False)
+        runner = _make_runner()
+        source = _make_source(Platform.TELEGRAM)
+        source.message_id = "42"
+        resp = _FakeSSEResponse(status=200, sse_chunks=[
+            'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+            'data: [DONE]\n\n',
+        ])
+        session = _FakeSession(resp)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session), patch("aiohttp.ClientTimeout"):
+                await runner._run_agent_via_proxy(
+                    message="hello", context_prompt="", history=[],
+                    source=source, session_id="session-abc",
+                )
+
+        assert "hermes_transport_reaction" not in session.captured_json
 
     @pytest.mark.asyncio
     async def test_remote_proxy_does_not_emit_privileged_photo_headers(self, monkeypatch):

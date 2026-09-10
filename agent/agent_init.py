@@ -917,6 +917,13 @@ def init_agent(
 
     # Store toolset filtering options.
     eager_tool_names = _pickup_eager_tool_names(eager_tool_names)
+    if enabled_toolsets and "message_reactions" in enabled_toolsets:
+        # Reaction-only replies require the model to see this schema on the
+        # first turn; deferring it behind tool_search makes the affordance
+        # undiscoverable for the lightweight acknowledgement use case.
+        eager_tool_names = frozenset(
+            set(eager_tool_names or ()) | {"react_to_message"}
+        )
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
     # A late MCP/plugin registry refresh must rebuild the same bounded schema

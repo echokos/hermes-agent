@@ -104,9 +104,6 @@ def _telegram_current_turn_reaction(emoji: str) -> str:
         from gateway.run import _gateway_runner_ref
         from model_tools import _run_async
 
-        runner = _gateway_runner_ref()
-        if runner is None:
-            return tool_error("No live Telegram gateway is available for this turn.")
         source = get_session_origin_source()
         if (
             source is None
@@ -117,12 +114,17 @@ def _telegram_current_turn_reaction(emoji: str) -> str:
             != (get_session_env("HERMES_SESSION_PROFILE", "") or "")
         ):
             return tool_error("Telegram reaction provenance is unavailable for this turn.")
-        adapter = runner._adapter_for_source(source)
-        set_reaction = getattr(adapter, "_set_reaction", None)
-        if not callable(set_reaction):
-            return tool_error("The active Telegram adapter cannot set reactions.")
-        if not _run_async(set_reaction(chat_id, message_id, emoji)):
-            return tool_error("Telegram did not accept the reaction.")
+        if not getattr(source, "_proxy_reaction_receipt", False):
+            runner = _gateway_runner_ref()
+            if runner is None:
+                return tool_error("No live Telegram gateway is available for this turn.")
+            adapter = runner._adapter_for_source(source)
+            set_reaction = getattr(adapter, "_set_reaction", None)
+            if not callable(set_reaction):
+                return tool_error("The active Telegram adapter cannot set reactions.")
+            if not _run_async(set_reaction(chat_id, message_id, emoji)):
+                return tool_error("Telegram did not accept the reaction.")
+        source._explicit_reaction_committed = True
     except Exception:
         return tool_error("Telegram reaction failed.")
 

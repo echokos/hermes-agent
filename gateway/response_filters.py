@@ -161,12 +161,17 @@ def is_current_turn_reaction_acknowledgement(
         return False
     turn_messages = messages[history_offset:]
     tool_message = next(
-        (message for message in reversed(turn_messages) if isinstance(message, dict) and message.get("role") == "tool"),
+        (
+            message
+            for message in reversed(turn_messages)
+            if isinstance(message, dict)
+            and message.get("role") == "tool"
+            and message.get("name") == "react_to_message"
+            and message.get("tool_name") == "react_to_message"
+        ),
         None,
     )
     if not isinstance(tool_message, dict):
-        return False
-    if tool_message.get("name") != "react_to_message" or tool_message.get("tool_name") != "react_to_message":
         return False
     content = tool_message.get("content")
     if not isinstance(content, str):

@@ -27633,11 +27633,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     headers[AGENT_PHOTO_REQUEST_TEXT_HEADER] = encoded_photo_request
 
+        platform_key = _platform_config_key(source.platform)
+        user_config = _load_gateway_config()
         body = {
             "model": "hermes-agent",
             "messages": api_messages,
             "stream": True,
         }
+        if proxy_key and source.platform == Platform.TELEGRAM and source.message_id:
+            from hermes_cli.tools_config import _get_platform_tools
+
+            reaction_enabled = "message_reactions" in _get_platform_tools(
+                user_config, platform_key
+            )
+        else:
+            reaction_enabled = False
+        if reaction_enabled:
+            body["hermes_transport_reaction"] = {
+                "platform": "telegram",
+                "chat_id": str(source.chat_id),
+                "message_id": str(source.message_id),
+                "profile": getattr(source, "profile", "") or "",
+            }
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
@@ -27646,8 +27663,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.config import StreamingConfig
             _scfg = StreamingConfig()
 
-        platform_key = _platform_config_key(source.platform)
-        user_config = _load_gateway_config()
         from gateway.display_config import resolve_display_setting
         _plat_streaming = resolve_display_setting(
             user_config, platform_key, "streaming"
@@ -27698,6 +27713,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Make the HTTP request with SSE streaming -----------------------
         full_response = ""
+        reaction_only_acknowledgement = False
         _start = time.time()
 
         try:
@@ -27723,6 +27739,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     # Parse SSE stream
                     buffer = ""
+                    sse_event = ""
                     async for chunk in resp.content.iter_any():
                         if not _run_still_current():
                             logger.info(
@@ -27748,12 +27765,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             line = line.strip()
                             if not line:
                                 continue
+                            if line.startswith("event: "):
+                                sse_event = line[7:].strip()
+                                continue
                             if line.startswith("data: "):
                                 data = line[6:]
                                 if data.strip() == "[DONE]":
                                     break
                                 try:
                                     obj = json.loads(data)
+                                    current_event = sse_event
+                                    sse_event = ""
+                                    if current_event == "hermes.transport.reaction":
+                                        emoji = str(obj.get("emoji") or "")
+                                        adapter = self._adapter_for_source(source)
+                                        set_reaction = getattr(adapter, "_set_reaction", None)
+                                        accepted = False
+                                        if emoji and callable(set_reaction):
+                                            try:
+                                                accepted = bool(await set_reaction(
+                                                    str(source.chat_id),
+                                                    str(source.message_id),
+                                                    emoji,
+                                                ))
+                                            except Exception:
+                                                logger.warning(
+                                                    "Proxy transport reaction failed",
+                                                    exc_info=True,
+                                                )
+                                        if accepted:
+                                            source._explicit_reaction_committed = True
+                                            reaction_only_acknowledgement = True
+                                        continue
                                     choices = obj.get("choices", [])
                                     if choices:
                                         delta = choices[0].get("delta", {})
@@ -27763,6 +27806,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             if _stream_consumer:
                                                 _stream_consumer.on_delta(content)
                                 except json.JSONDecodeError:
+                                    sse_event = ""
                                     pass
                         if len(buffer) > _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS:
                             raise ValueError(
@@ -27813,7 +27857,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         return {
-            "final_response": full_response or "(No response from remote agent)",
+            "final_response": (
+                full_response
+                if full_response or reaction_only_acknowledgement
+                else "(No response from remote agent)"
+            ),
             "messages": [
                 {"role": "user", "content": message},
                 {"role": "assistant", "content": full_response},
@@ -27823,6 +27871,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            "reaction_only_acknowledgement": reaction_only_acknowledgement,
         }
 
     # ------------------------------------------------------------------
