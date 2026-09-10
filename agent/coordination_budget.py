@@ -9,6 +9,10 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, TypeVar
+
+
+_T = TypeVar("_T")
 
 
 @dataclass
@@ -27,6 +31,26 @@ class CoordinationScope:
     uncoordinated_materialization_committed: bool = False
     closed: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
+
+
+@dataclass(frozen=True)
+class DetachedCoordinationSnapshot:
+    """Authority copied into work whose lifetime exceeds the owning turn.
+
+    Origin identifiers are present only when capture found an already accepted
+    request. An unaccepted detached worker must never discover a root accepted
+    later by an independent turn that happens to share its origin.
+    """
+
+    db_path: Path
+    request_root_id: str
+    task_id: str
+    purpose: str
+    origin_session_id: str
+    origin_message_id: str
+    coordination_acceptance_required: bool
+    unbudgeted_delegation_started: bool
+    uncoordinated_materialization_committed: bool
 
 
 _scope: ContextVar[CoordinationScope | None] = ContextVar(
@@ -217,6 +241,85 @@ def admit_delegate_spawn() -> None:
         scope.unbudgeted_delegation_started = True
 
 
+def _close_scope(scope: CoordinationScope) -> None:
+    """Settle a scope's provisional calls, then make late use fail closed."""
+    try:
+        with scope.lock:
+            if scope.provisional_model_calls > scope.settled_provisional_model_calls:
+                _resolve_request_root(scope)
+    finally:
+        scope.closed.set()
+
+
+def capture_detached_coordination_scope() -> DetachedCoordinationSnapshot | None:
+    """Snapshot authority for a worker intentionally detached from this turn.
+
+    The returned metadata never shares the owner's ``closed`` event. The worker
+    creates a new runtime scope from it, while an accepted request root still
+    points at the same durable counters and enforcement state in SQLite.
+    """
+    scope = _scope.get()
+    if scope is None:
+        return None
+    with scope.lock:
+        if scope.closed.is_set():
+            raise ValueError("coordination turn already ended")
+        _resolve_request_root(scope)
+        accepted = bool(scope.request_root_id)
+        return DetachedCoordinationSnapshot(
+            db_path=scope.db_path,
+            request_root_id=scope.request_root_id,
+            task_id=scope.task_id,
+            purpose=scope.purpose,
+            origin_session_id=scope.origin_session_id if accepted else "",
+            origin_message_id=scope.origin_message_id if accepted else "",
+            coordination_acceptance_required=scope.coordination_acceptance_required,
+            unbudgeted_delegation_started=scope.unbudgeted_delegation_started,
+            uncoordinated_materialization_committed=(
+                scope.uncoordinated_materialization_committed
+            ),
+        )
+
+
+def bind_detached_coordination_scope(target: Callable[..., _T]) -> Callable[..., _T]:
+    """Capture now and give ``target`` an independently closable scope later.
+
+    Use only for work explicitly designed to outlive the current turn. Normal
+    tool and provider worker threads must continue sharing the owner's exact
+    scope so they cannot escape its lifetime boundary.
+    """
+    snapshot = capture_detached_coordination_scope()
+
+    def _runner(*args, **kwargs):
+        if snapshot is None:
+            return target(*args, **kwargs)
+        scope = CoordinationScope(
+            db_path=snapshot.db_path,
+            request_root_id=snapshot.request_root_id,
+            task_id=snapshot.task_id,
+            purpose=snapshot.purpose,
+            origin_session_id=snapshot.origin_session_id,
+            origin_message_id=snapshot.origin_message_id,
+            coordination_acceptance_required=(
+                snapshot.coordination_acceptance_required
+            ),
+            unbudgeted_delegation_started=snapshot.unbudgeted_delegation_started,
+            uncoordinated_materialization_committed=(
+                snapshot.uncoordinated_materialization_committed
+            ),
+        )
+        token = _scope.set(scope)
+        try:
+            return target(*args, **kwargs)
+        finally:
+            try:
+                _close_scope(scope)
+            finally:
+                _scope.reset(token)
+
+    return _runner
+
+
 @contextmanager
 def scoped_coordination_budget(
     *, session_id: str = "", request_root_id: str | None = None,
@@ -245,12 +348,8 @@ def scoped_coordination_budget(
         yield scope
     finally:
         try:
-            # Another turn may accept the origin while this turn is finishing.
-            with scope.lock:
-                if scope.provisional_model_calls > scope.settled_provisional_model_calls:
-                    _resolve_request_root(scope)
+            _close_scope(scope)
         finally:
-            scope.closed.set()
             _scope.reset(token)
 
 

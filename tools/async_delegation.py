@@ -876,9 +876,14 @@ def dispatch_async_delegation(
             _finalize(delegation_id, result, status)
 
     try:
-        # Propagate the dispatching profile so the detached child resolves
-        # get_hermes_home() under the right profile.
-        executor.submit(propagate_context_to_thread(_worker))
+        # Keep profile/session routing context, but give intentionally detached
+        # work its own coordination lifetime. It retains the same durable root
+        # and limits without sharing the parent turn's closed event.
+        from agent.coordination_budget import bind_detached_coordination_scope
+
+        executor.submit(
+            propagate_context_to_thread(bind_detached_coordination_scope(_worker))
+        )
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
@@ -1125,8 +1130,13 @@ def dispatch_async_delegation_batch(
             _finalize_batch(delegation_id, combined, status)
 
     try:
-        # Propagate the dispatching profile to the detached batch children.
-        executor.submit(propagate_context_to_thread(_worker))
+        # As above, a detached batch retains authority but not the parent's
+        # in-memory lifetime sentinel.
+        from agent.coordination_budget import bind_detached_coordination_scope
+
+        executor.submit(
+            propagate_context_to_thread(bind_detached_coordination_scope(_worker))
+        )
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)

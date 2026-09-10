@@ -1361,7 +1361,12 @@ def spawn_background_review_thread(
     def _target() -> None:
         _run_review_in_thread(agent, messages_snapshot, prompt, task_cfg)
 
-    return _target, prompt
+    # Reviews intentionally start after the main response and may outlive the
+    # turn that spawned them. Preserve its durable request authority without
+    # retaining the owner's soon-to-close in-memory scope object.
+    from agent.coordination_budget import bind_detached_coordination_scope
+
+    return bind_detached_coordination_scope(_target), prompt
 
 
 __all__ = [
