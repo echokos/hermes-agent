@@ -8,6 +8,7 @@ conversation history.
 from __future__ import annotations
 
 import unicodedata
+import json
 from typing import Any
 
 # Canonical model-emitted control token for intentional silence.
@@ -132,6 +133,57 @@ def is_intentional_silence_agent_result(agent_result: dict | None, response: Any
     if agent_result.get("failed"):
         return False
     return is_intentional_silence_response(response)
+
+
+def is_current_turn_reaction_acknowledgement(
+    agent_result: dict | None,
+    response: Any,
+    source: Any,
+) -> bool:
+    """Accept a blank reply only after a successful current-turn Telegram reaction.
+
+    This is a delivery exception, not a general model silence token.  Every
+    provenance field is supplied by the gateway, and the matching tool result
+    must appear after this turn's history boundary.
+    """
+    if response != "" or not isinstance(agent_result, dict):
+        return False
+    if agent_result.get("failed") or agent_result.get("interrupted") or agent_result.get("partial"):
+        return False
+    platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    message_id = str(getattr(source, "message_id", "") or "")
+    if platform != "telegram" or not chat_id or not message_id:
+        return False
+    history_offset = agent_result.get("history_offset")
+    messages = agent_result.get("messages")
+    if not isinstance(history_offset, int) or history_offset < 0 or not isinstance(messages, list):
+        return False
+    turn_messages = messages[history_offset:]
+    tool_message = next(
+        (message for message in reversed(turn_messages) if isinstance(message, dict) and message.get("role") == "tool"),
+        None,
+    )
+    if not isinstance(tool_message, dict):
+        return False
+    if tool_message.get("name") != "react_to_message" or tool_message.get("tool_name") != "react_to_message":
+        return False
+    content = tool_message.get("content")
+    if not isinstance(content, str):
+        return False
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return False
+    expected = {
+        "success": True,
+        "reaction_acknowledgement": True,
+        "operation": "telegram_current_turn_reaction",
+        "platform": "telegram",
+        "chat_id": chat_id,
+        "message_id": message_id,
+    }
+    return payload == expected
 
 
 def is_partial_silence_marker(text: Any) -> bool:

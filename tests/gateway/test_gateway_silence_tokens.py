@@ -1,5 +1,6 @@
 """Gateway intentional-silence token behavior."""
 
+import json
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,6 +11,7 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource
 from gateway.response_filters import (
+    is_current_turn_reaction_acknowledgement,
     is_intentional_silence_agent_result,
     is_intentional_silence_response,
 )
@@ -21,6 +23,7 @@ def _source():
         chat_id="-1001",
         chat_type="group",
         user_id="12345",
+        message_id="msg-42",
     )
 
 
@@ -94,6 +97,69 @@ def test_blank_and_prose_mentions_are_not_silence():
 def test_failed_agent_result_never_counts_as_intentional_silence():
     assert is_intentional_silence_agent_result({"failed": False}, "NO_REPLY")
     assert not is_intentional_silence_agent_result({"failed": True}, "NO_REPLY")
+
+
+def _reaction_ack_result(*, content=None, history_offset=0, **extra):
+    if content is None:
+        content = json.dumps({
+            "success": True,
+            "reaction_acknowledgement": True,
+            "operation": "telegram_current_turn_reaction",
+            "platform": "telegram",
+            "chat_id": "-1001",
+            "message_id": "msg-42",
+        })
+    return {
+        "failed": False,
+        "history_offset": history_offset,
+        "messages": [
+            {"role": "user", "content": "acknowledge this"},
+            {
+                "role": "tool",
+                "name": "react_to_message",
+                "tool_name": "react_to_message",
+                "content": content,
+            },
+            {"role": "assistant", "content": ""},
+        ],
+        **extra,
+    }
+
+
+def test_reaction_acknowledgement_is_bound_to_current_telegram_turn():
+    result = _reaction_ack_result()
+    assert is_current_turn_reaction_acknowledgement(result, "", _source())
+    assert not is_current_turn_reaction_acknowledgement(
+        _reaction_ack_result(content="{}"), "", _source()
+    )
+    assert not is_current_turn_reaction_acknowledgement(
+        _reaction_ack_result(interrupted=True), "", _source()
+    )
+    assert not is_current_turn_reaction_acknowledgement(
+        _reaction_ack_result(history_offset=2), "", _source()
+    )
+    other_source = _source()
+    other_source.message_id = "other-message"
+    assert not is_current_turn_reaction_acknowledgement(result, "", other_source)
+    assert not is_current_turn_reaction_acknowledgement(result, "substantive reply", _source())
+
+
+@pytest.mark.asyncio
+async def test_reaction_acknowledgement_suppresses_only_blank_delivery(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "",
+        "tools": [],
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        **_reaction_ack_result(),
+    })
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == ""
 
 
 @pytest.mark.asyncio

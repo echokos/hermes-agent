@@ -20071,10 +20071,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
                 response = ""
             try:
-                from gateway.response_filters import is_intentional_silence_agent_result
+                from gateway.response_filters import (
+                    is_current_turn_reaction_acknowledgement,
+                    is_intentional_silence_agent_result,
+                )
                 _intentional_silence = is_intentional_silence_agent_result(
                     agent_result, response,
                 )
+                _reaction_only_acknowledgement = is_current_turn_reaction_acknowledgement(
+                    agent_result, response, source,
+                )
+                _intentional_silence = _intentional_silence or _reaction_only_acknowledgement
             except Exception:
                 _intentional_silence = False
 

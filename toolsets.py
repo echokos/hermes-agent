@@ -306,6 +306,12 @@ TOOLSETS = {
         ],
         "includes": []
     },
+
+    "message_reactions": {
+        "description": "React to the current Telegram message (Telegram gateway only)",
+        "tools": ["react_to_message"],
+        "includes": [],
+    },
     
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",

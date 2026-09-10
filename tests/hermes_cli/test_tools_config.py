@@ -134,6 +134,21 @@ def test_discord_toolsets_do_not_leak_to_other_platforms():
     assert "discord_admin" not in enabled
 
 
+def test_message_reactions_are_telegram_only_and_require_explicit_opt_in():
+    """Reaction acknowledgements stay absent until Telegram enables them."""
+    assert "message_reactions" not in _get_platform_tools({}, "telegram")
+    enabled = _get_platform_tools(
+        {"platform_toolsets": {"telegram": ["hermes-telegram", "message_reactions"]}},
+        "telegram",
+    )
+    assert "message_reactions" in enabled
+    leaked = _get_platform_tools(
+        {"platform_toolsets": {"discord": ["hermes-discord", "message_reactions"]}},
+        "discord",
+    )
+    assert "message_reactions" not in leaked
+
+
 
 
 
