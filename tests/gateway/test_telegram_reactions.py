@@ -120,6 +120,18 @@ async def test_on_processing_complete_cancelled_clears_reaction(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_on_processing_complete_preserves_explicit_agent_reaction(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+    event.source._explicit_reaction_committed = True
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter._bot.set_message_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_clear_reactions_handles_api_error_gracefully(monkeypatch):
     """API errors during clear should not propagate."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
@@ -152,5 +164,4 @@ def test_config_bridges_telegram_reactions(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("TELEGRAM_REACTIONS") == "true"
-
 

@@ -10655,6 +10655,8 @@ class TelegramAdapter(BasePlatformAdapter):
         message_id = getattr(event, "message_id", None)
         if not (chat_id and message_id):
             return
+        if getattr(event.source, "_explicit_reaction_committed", False):
+            return
         if outcome == ProcessingOutcome.CANCELLED:
             await self._clear_reactions(chat_id, message_id)
         else:

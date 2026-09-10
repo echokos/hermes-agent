@@ -73,6 +73,10 @@ def session_context_engaged() -> bool:
 
 _SESSION_PLATFORM: ContextVar = ContextVar("HERMES_SESSION_PLATFORM", default=_UNSET)
 _SESSION_SOURCE: ContextVar = ContextVar("HERMES_SESSION_SOURCE", default=_UNSET)
+# The full gateway-owned SessionSource is intentionally not mirrored into the
+# environment. It retains in-process transport provenance (including the
+# adapter weakref) needed by current-turn capabilities such as reactions.
+_SESSION_ORIGIN: ContextVar = ContextVar("HERMES_SESSION_ORIGIN", default=_UNSET)
 _SESSION_CHAT_ID: ContextVar = ContextVar("HERMES_SESSION_CHAT_ID", default=_UNSET)
 _SESSION_CHAT_TYPE: ContextVar = ContextVar("HERMES_SESSION_CHAT_TYPE", default=_UNSET)
 _SESSION_CHAT_NAME: ContextVar = ContextVar("HERMES_SESSION_CHAT_NAME", default=_UNSET)
@@ -232,6 +236,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
+    origin_source: Any = _UNSET,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -251,6 +256,9 @@ def set_session_vars(
     ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
     ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
     and ``""`` explicitly marks a non-cron session while masking leaked env.
+
+    ``origin_source`` is the gateway-owned inbound source object. It is
+    task-local only and must never be populated from model tool arguments.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -260,6 +268,7 @@ def set_session_vars(
     tokens = [
         _SESSION_PLATFORM.set(platform),
         _SESSION_SOURCE.set(source),
+        _SESSION_ORIGIN.set(origin_source),
         _SESSION_CHAT_ID.set(chat_id),
         _SESSION_CHAT_TYPE.set(chat_type),
         _SESSION_CHAT_NAME.set(chat_name),
@@ -299,6 +308,7 @@ def clear_session_vars(tokens: list) -> None:
     for var in (
         _SESSION_PLATFORM,
         _SESSION_SOURCE,
+        _SESSION_ORIGIN,
         _SESSION_CHAT_ID,
         _SESSION_CHAT_TYPE,
         _SESSION_CHAT_NAME,
@@ -364,6 +374,7 @@ def reset_session_vars() -> None:
     """
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    _SESSION_ORIGIN.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
@@ -400,6 +411,12 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def get_session_origin_source() -> Any | None:
+    """Return this task's gateway-owned inbound source, if one was bound."""
+    value = _SESSION_ORIGIN.get()
+    return None if value is _UNSET or value == "" else value
 
 
 # Surfaces that are not a human chat channel. The gateway binds a platform

@@ -2818,6 +2818,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        extra_enabled_toolsets: Optional[List[str]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3083,6 +3084,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if extra_enabled_toolsets:
+            enabled_toolsets = sorted(set(enabled_toolsets) | set(extra_enabled_toolsets))
 
         max_iterations = _current_max_iterations()
 
@@ -4335,6 +4338,38 @@ class APIServerAdapter(BasePlatformAdapter):
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
+        proxy_reaction_context = None
+        raw_proxy_context = body.get("hermes_transport_reaction")
+        if raw_proxy_context is not None:
+            # Private authenticated proxy protocol. It carries routing
+            # provenance only; the transport gateway retains the Telegram
+            # credential and performs the actual mutation.
+            if not self._api_key or not isinstance(raw_proxy_context, dict):
+                return web.json_response(
+                    _openai_error("Invalid transport reaction context"), status=403
+                )
+            platform = str(raw_proxy_context.get("platform") or "")
+            chat_id = str(raw_proxy_context.get("chat_id") or "")
+            message_id = str(raw_proxy_context.get("message_id") or "")
+            profile = str(raw_proxy_context.get("profile") or "")
+            values = (chat_id, message_id, profile)
+            if (
+                platform != "telegram"
+                or not chat_id
+                or not message_id
+                or any(len(value) > self._MAX_SESSION_HEADER_LEN for value in values)
+                or any(re.search(r'[\r\n\x00]', value) for value in values)
+            ):
+                return web.json_response(
+                    _openai_error("Invalid transport reaction context"), status=400
+                )
+            proxy_reaction_context = {
+                "platform": platform,
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "profile": profile,
+            }
+
         final_return_context, final_return_claim_token, context_error = self._parse_internal_final_return_context(
             request
         )
@@ -4374,6 +4409,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        if proxy_reaction_context is not None and not stream:
+            return web.json_response(
+                _openai_error("Transport reactions require streaming"), status=400
+            )
         if final_return_context is not None and stream:
             # Final returns cannot expose an SSE delta before the complete
             # response has a durable transcript receipt and outbox claim.
@@ -4592,6 +4631,30 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
+                if function_name == "react_to_message" and proxy_reaction_context is not None:
+                    try:
+                        receipt = json.loads(function_result)
+                        args = (
+                            json.loads(function_args)
+                            if isinstance(function_args, str)
+                            else (function_args or {})
+                        )
+                    except (TypeError, ValueError):
+                        receipt = None
+                        args = {}
+                    expected = {
+                        "success": True,
+                        "reaction_acknowledgement": True,
+                        "operation": "telegram_current_turn_reaction",
+                        "platform": "telegram",
+                        "chat_id": proxy_reaction_context["chat_id"],
+                        "message_id": proxy_reaction_context["message_id"],
+                    }
+                    emoji = str(args.get("emoji") or "") if isinstance(args, dict) else ""
+                    if receipt == expected and emoji:
+                        _stream_q.put_threadsafe(
+                            ("__transport_reaction__", {"emoji": emoji})
+                        )
                 _stream_q.put_threadsafe(("__tool_progress__", {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
@@ -4620,6 +4683,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 final_return_context=final_return_context,
                 final_return_claim_token=final_return_claim_token,
                 direct_agent_photo_request_text=direct_agent_photo_request_text,
+                proxy_reaction_context=proxy_reaction_context,
                 **agent_overrides,
                 route=route,
             ))
@@ -4862,6 +4926,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__transport_reaction__":
+                    await response.write(
+                        _sse_frame(item[1], event="hermes.transport.reaction")
+                    )
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -6629,6 +6697,7 @@ class APIServerAdapter(BasePlatformAdapter):
         final_return_context: Optional[dict[str, str]] = None,
         final_return_claim_token: str = "",
         direct_agent_photo_request_text: Optional[str] = None,
+        proxy_reaction_context: Optional[Dict[str, str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6669,11 +6738,35 @@ class APIServerAdapter(BasePlatformAdapter):
             from gateway.session_context import clear_session_vars
 
             with self._profile_scope(request_profile):
-                tokens = self._bind_api_server_session(
-                    chat_id=session_id or "",
-                    session_key=gateway_session_key or session_id or "",
-                    session_id=session_id or "",
-                )
+                if proxy_reaction_context is None:
+                    tokens = self._bind_api_server_session(
+                        chat_id=session_id or "",
+                        session_key=gateway_session_key or session_id or "",
+                        session_id=session_id or "",
+                    )
+                else:
+                    from gateway.config import Platform
+                    from gateway.session import SessionSource
+                    from gateway.session_context import set_session_vars
+
+                    proxy_source = SessionSource(
+                        platform=Platform.TELEGRAM,
+                        chat_id=proxy_reaction_context["chat_id"],
+                        message_id=proxy_reaction_context["message_id"],
+                        profile=proxy_reaction_context.get("profile") or None,
+                    )
+                    proxy_source._proxy_reaction_receipt = True
+                    tokens = set_session_vars(
+                        platform="telegram",
+                        chat_id=proxy_source.chat_id,
+                        message_id=proxy_source.message_id or "",
+                        profile=proxy_source.profile or "",
+                        session_key=gateway_session_key or session_id or "",
+                        session_id=session_id or "",
+                        async_delivery=False,
+                        cron_session="",
+                        origin_source=proxy_source,
+                    )
                 agent = None
                 try:
                     agent = self._create_agent(
@@ -6690,6 +6783,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        extra_enabled_toolsets=(
+                            ["message_reactions"]
+                            if proxy_reaction_context is not None
+                            else None
+                        ),
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent

@@ -7605,6 +7605,19 @@ def run_conversation(
                 
                 # Check if response only has think block with no actual content after it
                 if not agent._has_content_after_think_block(final_response):
+                    # A successful current-turn reaction is a complete reply.
+                    # Stop before generic post-tool empty recovery injects a
+                    # nudge and spends another model call.
+                    try:
+                        from gateway.session_context import get_session_origin_source
+
+                        _reaction_source = get_session_origin_source()
+                    except Exception:
+                        _reaction_source = None
+                    if getattr(_reaction_source, "_explicit_reaction_committed", False):
+                        _turn_exit_reason = "current_turn_reaction_acknowledgement"
+                        break
+
                     # ── Partial stream recovery ─────────────────────
                     # If content was already streamed to the user before
                     # the connection died, use it as the final response

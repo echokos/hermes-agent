@@ -1234,6 +1234,79 @@ class TestToolsetsEndpoint:
 
 class TestChatCompletionsEndpoint:
     @pytest.mark.asyncio
+    async def test_transport_reaction_context_requires_authenticated_server(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "acknowledge"}],
+                    "hermes_transport_reaction": {
+                        "platform": "telegram",
+                        "chat_id": "-1001",
+                        "message_id": "42",
+                        "profile": "main",
+                    },
+                },
+            )
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("receipt_message_id,event_expected", [("42", True), ("41", False)])
+    async def test_transport_reaction_event_requires_exact_host_receipt(
+        self, receipt_message_id, event_expected
+    ):
+        adapter = _make_adapter(api_key="test-api-key")
+        captured = {}
+
+        async def _mock_run_agent(**kwargs):
+            captured["context"] = kwargs.get("proxy_reaction_context")
+            kwargs["tool_start_callback"](
+                "call-react", "react_to_message", {"emoji": "👍"}
+            )
+            kwargs["tool_complete_callback"](
+                "call-react",
+                "react_to_message",
+                {"emoji": "👍"},
+                json.dumps({
+                    "success": True,
+                    "reaction_acknowledgement": True,
+                    "operation": "telegram_current_turn_reaction",
+                    "platform": "telegram",
+                    "chat_id": "-1001",
+                    "message_id": receipt_message_id,
+                }),
+            )
+            return (
+                {"final_response": "", "messages": [], "api_calls": 2},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        context = {
+            "platform": "telegram",
+            "chat_id": "-1001",
+            "message_id": "42",
+            "profile": "main",
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer test-api-key"},
+                    json={
+                        "messages": [{"role": "user", "content": "acknowledge"}],
+                        "stream": True,
+                        "hermes_transport_reaction": context,
+                    },
+                )
+                body = await resp.text()
+
+        assert resp.status == 200
+        assert captured["context"] == context
+        assert ("event: hermes.transport.reaction" in body) is event_expected
+
+    @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:

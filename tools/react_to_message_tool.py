@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Let the agent react to a message with an emoji in the Hermes desktop app.
+"""Let the agent react to the current message on a supported Hermes surface.
 
 The conversational counterpart to the user's tapback: the same reaction store,
 the same one-per-author semantics, just written with ``author="agent"``.
@@ -15,7 +15,7 @@ model shouldn't have to thread row ids through tool calls), and emits
 
 import json
 
-from gateway.session_context import get_session_env
+from gateway.session_context import get_session_env, get_session_origin_source
 from tools import desktop_ui
 from tools.registry import registry, tool_error
 from utils import env_var_enabled
@@ -87,9 +87,70 @@ def _react_to_message_with_db(
     )
 
 
+def _telegram_current_turn_reaction(emoji: str) -> str:
+    """React only to the inbound Telegram message bound to this turn."""
+    if get_session_env("HERMES_SESSION_PLATFORM", "") != "telegram":
+        return tool_error("Telegram reactions require an active Telegram gateway turn.")
+    if get_session_env("HERMES_CRON_SESSION", "") == "1":
+        return tool_error("Telegram reactions are unavailable in cron sessions.")
+
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+    if not chat_id or not message_id:
+        return tool_error("Telegram reactions require the current message provenance.")
+
+    try:
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+        from model_tools import _run_async
+
+        source = get_session_origin_source()
+        if (
+            source is None
+            or getattr(source, "platform", None) != Platform.TELEGRAM
+            or str(getattr(source, "chat_id", "") or "") != chat_id
+            or str(getattr(source, "message_id", "") or "") != message_id
+            or (getattr(source, "profile", "") or "")
+            != (get_session_env("HERMES_SESSION_PROFILE", "") or "")
+        ):
+            return tool_error("Telegram reaction provenance is unavailable for this turn.")
+        if not getattr(source, "_proxy_reaction_receipt", False):
+            runner = _gateway_runner_ref()
+            if runner is None:
+                return tool_error("No live Telegram gateway is available for this turn.")
+            adapter = runner._adapter_for_source(source)
+            set_reaction = getattr(adapter, "_set_reaction", None)
+            if not callable(set_reaction):
+                return tool_error("The active Telegram adapter cannot set reactions.")
+            if not _run_async(set_reaction(chat_id, message_id, emoji)):
+                return tool_error("Telegram did not accept the reaction.")
+        source._explicit_reaction_committed = True
+    except Exception:
+        return tool_error("Telegram reaction failed.")
+
+    return json.dumps(
+        {
+            "success": True,
+            "reaction_acknowledgement": True,
+            "operation": "telegram_current_turn_reaction",
+            "platform": "telegram",
+            "chat_id": chat_id,
+            "message_id": message_id,
+        },
+        ensure_ascii=False,
+    )
+
+
 def react_to_message_tool(emoji: str, message_row_id=None, messages_back=None) -> str:
     """Attach (or with an empty ``emoji`` retract) the agent's reaction."""
     emoji = (emoji or "").strip()
+    if get_session_env("HERMES_SESSION_PLATFORM", "") == "telegram":
+        if message_row_id is not None or messages_back is not None:
+            return tool_error("Telegram reactions accept only an emoji for the current message.")
+        if not emoji:
+            return tool_error("Telegram reactions require a non-empty emoji.")
+        return _telegram_current_turn_reaction(emoji)
+
     session_key = get_session_env("HERMES_SESSION_KEY", "") or get_session_env(
         "HERMES_SESSION_ID", ""
     )
@@ -117,13 +178,14 @@ def react_to_message_tool(emoji: str, message_row_id=None, messages_back=None) -
 
 
 def check_react_requirements() -> bool:
-    """Opt-in feature flag — surface eligibility is the toolset's job.
+    """Session-scoped opt-in gate; never cache this across client surfaces.
 
-    ``desktop_ui`` already restricts this to GUI sessions. What's left is the
-    user's own toggle (Settings → Appearance), which the desktop mirrors into
-    ``display.message_reactions`` on the CONNECTED gateway's config — so this
-    reads the right config whether that gateway is local, SSH, URL, or cloud.
+    Telegram is gated by its default-off ``message_reactions`` toolset. Desktop
+    retains its existing Settings -> Appearance toggle, mirrored into the
+    connected gateway's config.
     """
+    if get_session_env("HERMES_SESSION_PLATFORM", "") == "telegram":
+        return True
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -154,23 +216,22 @@ REACT_TO_MESSAGE_SCHEMA = {
             "emoji": {
                 "type": "string",
                 "description": (
-                    "The emoji to react with (e.g. '❤️', '😂', '👍'). Pass an empty "
-                    "string to remove your reaction."
+                    "The emoji to react with (e.g. '❤️', '😂', '👍'). On Telegram it "
+                    "always applies to the current inbound message."
                 ),
             },
             "message_row_id": {
                 "type": "integer",
                 "description": (
-                    "Optional. The specific message to react to. Omit to react to the "
-                    "user's latest message, which is almost always what you want."
+                    "Desktop only: the specific message to react to. Omit to react to "
+                    "the user's latest message. Telegram accepts only `emoji`."
                 ),
             },
             "messages_back": {
                 "type": "integer",
                 "description": (
-                    "Optional. React to an EARLIER user message: 1 = the one before "
-                    "the latest, 2 = two before, and so on. For when something lands "
-                    "late — the joke you only got after answering."
+                    "Desktop only: react to an earlier user message, where 1 is the one "
+                    "before the latest. Telegram accepts only `emoji`."
                 ),
             },
         },
@@ -188,6 +249,6 @@ registry.register(
         message_row_id=args.get("message_row_id"),
         messages_back=args.get("messages_back"),
     ),
-    check_fn=check_react_requirements,
+    session_check_fn=check_react_requirements,
     emoji="💛",
 )
