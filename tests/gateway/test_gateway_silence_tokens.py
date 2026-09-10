@@ -11,7 +11,7 @@ import pytest
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionEntry, SessionSource
+from gateway.session import SessionContext, SessionEntry, SessionSource
 from gateway.response_filters import (
     is_current_turn_reaction_acknowledgement,
     is_intentional_silence_agent_result,
@@ -210,10 +210,19 @@ async def test_registered_reaction_receipt_crosses_real_turn_lifecycle(
         raw_result = None
 
         def __init__(self, **kwargs):
-            self.tools = []
+            from model_tools import get_tool_definitions
+
+            self.tools = get_tool_definitions(
+                enabled_toolsets=kwargs.get("enabled_toolsets"),
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
             self.model = kwargs.get("model")
             self.session_id = kwargs.get("session_id")
             assert "message_reactions" in kwargs.get("enabled_toolsets", [])
+            assert "react_to_message" in {
+                tool["function"]["name"] for tool in self.tools
+            }
 
         def run_conversation(self, message, conversation_history=None, task_id=None, **_kwargs):
             tool_call_id = "call-reaction"
@@ -276,14 +285,31 @@ async def test_registered_reaction_receipt_crosses_real_turn_lifecycle(
     )
     adapter = ReactionAdapter()
     runner.adapters = {Platform.TELEGRAM: adapter}
+    # Gateway startup owns this weak reference; the handler resolves its
+    # transport through that production seam rather than a test-only global.
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: runner)
     runner._set_session_env = gateway_run.GatewayRunner._set_session_env.__get__(runner)
     runner._clear_session_env = gateway_run.GatewayRunner._clear_session_env.__get__(runner)
     source = _source()
     event = MessageEvent(text="acknowledge this", source=source, message_id="msg-42")
 
-    response = await runner._handle_message_with_agent(
-        event, source, "agent:main:telegram:group:-1001:12345", 1
+    # The registered handler is session-bound. Install the same task-local
+    # provenance the outer gateway path sets before it dispatches the agent.
+    tokens = runner._set_session_env(
+        SessionContext(
+            source=source,
+            connected_platforms=[Platform.TELEGRAM],
+            home_channels={},
+            session_key="agent:main:telegram:group:-1001:12345",
+            session_id="sess-silent",
+        )
     )
+    try:
+        response = await runner._handle_message_with_agent(
+            event, source, "agent:main:telegram:group:-1001:12345", 1
+        )
+    finally:
+        runner._clear_session_env(tokens)
 
     assert adapter.calls == [("-1001", "msg-42", "👍")]
     assert RegisteredReactionAgent.last_tool_message["name"] == "react_to_message"
