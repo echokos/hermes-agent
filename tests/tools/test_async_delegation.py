@@ -15,6 +15,8 @@ import time
 
 import pytest
 
+from agent import coordination_budget as budget
+from hermes_cli import kanban_db as kb
 from tools import async_delegation as ad
 from tools.process_registry import process_registry, format_process_notification
 
@@ -122,6 +124,88 @@ def test_dispatch_returns_immediately_without_blocking():
     assert ad.active_count() == 1
     assert elapsed < 4.0, f"dispatch blocked {elapsed:.2f}s (gate is 5s)"
     gate.set()
+
+
+def test_batch_dispatch_keeps_unaccepted_detached_scope_unbound(
+    tmp_path, monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from gateway import session_context
+
+    origin = {
+        "HERMES_SESSION_ID": "batch-origin",
+        "HERMES_SESSION_MESSAGE_ID": "message",
+    }
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.setattr(
+        session_context,
+        "get_session_env",
+        lambda key, default="": origin.get(key, default),
+    )
+    started = threading.Event()
+    release = threading.Event()
+    observed = {}
+
+    def runner():
+        started.set()
+        assert release.wait(timeout=5)
+        observed["execution"] = budget.current_coordination_execution()
+        observed["calls"] = [budget.charge_provider_attempt() for _ in range(2)]
+        return {"results": [{"status": "completed", "summary": "done"}]}
+
+    with budget.scoped_coordination_budget():
+        result = ad.dispatch_async_delegation_batch(
+            goals=["held batch"],
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="",
+            runner=runner,
+        )
+        assert result["status"] == "dispatched"
+        assert started.wait(timeout=5)
+
+    organization = SimpleNamespace(
+        validate_execution_profile=lambda _: SimpleNamespace(agent="coordinator")
+    )
+    with budget.scoped_coordination_budget():
+        with (
+            budget.coordination_acceptance_binding() as binding,
+            kb.connect_closing(tmp_path / "kanban.db") as conn,
+            kb.write_txn(conn),
+        ):
+            task_id = kb.create_task(
+                conn,
+                title="Later independent batch request",
+                assignee="coordinator",
+                session_id=origin["HERMES_SESSION_ID"],
+            )
+            kb.add_notify_sub(
+                conn, task_id=task_id, platform="buzz", chat_id="origin",
+                delivery_mode="wake",
+            )
+            accepted = kb.create_coordination_request(
+                conn,
+                root_task_id=task_id,
+                origin_session_id=origin["HERMES_SESSION_ID"],
+                origin_message_id=origin["HERMES_SESSION_MESSAGE_ID"],
+                organization=organization,
+                max_model_calls=2,
+                final_model_call_reserve=1,
+                accepting_model_calls=binding.model_calls,
+                acceptance_scope_id=binding.scope_id,
+            )
+            binding.accept(accepted)
+        release.set()
+        event = _drain_for(result["delegation_id"])
+
+    assert event is not None
+    assert observed == {"execution": None, "calls": [None, None]}
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        assert kb.get_coordination_request(conn, accepted.id).model_calls_used == 0
 
 
 def test_async_executor_workers_are_daemon_threads():
@@ -824,4 +908,3 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     banner_pos = text.index("TRUNCATED")
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
-

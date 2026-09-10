@@ -35,7 +35,12 @@ class CoordinationScope:
 
 @dataclass(frozen=True)
 class DetachedCoordinationSnapshot:
-    """Authority copied into work whose lifetime exceeds the owning turn."""
+    """Authority copied into work whose lifetime exceeds the owning turn.
+
+    Origin identifiers are present only when capture found an already accepted
+    request. An unaccepted detached worker must never discover a root accepted
+    later by an independent turn that happens to share its origin.
+    """
 
     db_path: Path
     request_root_id: str
@@ -260,13 +265,14 @@ def capture_detached_coordination_scope() -> DetachedCoordinationSnapshot | None
         if scope.closed.is_set():
             raise ValueError("coordination turn already ended")
         _resolve_request_root(scope)
+        accepted = bool(scope.request_root_id)
         return DetachedCoordinationSnapshot(
             db_path=scope.db_path,
             request_root_id=scope.request_root_id,
             task_id=scope.task_id,
             purpose=scope.purpose,
-            origin_session_id=scope.origin_session_id,
-            origin_message_id=scope.origin_message_id,
+            origin_session_id=scope.origin_session_id if accepted else "",
+            origin_message_id=scope.origin_message_id if accepted else "",
             coordination_acceptance_required=scope.coordination_acceptance_required,
             unbudgeted_delegation_started=scope.unbudgeted_delegation_started,
             uncoordinated_materialization_committed=(

@@ -512,6 +512,76 @@ def test_detached_scope_observes_request_cancellation(budget_request):
     assert used(budget_request) == 0
 
 
+def test_unaccepted_detached_scope_never_binds_later_same_origin_root(
+    budget_request, monkeypatch,
+):
+    from gateway import session_context
+
+    origin = {
+        "HERMES_SESSION_ID": "detached-origin",
+        "HERMES_SESSION_MESSAGE_ID": "message",
+    }
+    monkeypatch.setattr(
+        session_context,
+        "get_session_env",
+        lambda key, default="": origin.get(key, default),
+    )
+    started = threading.Event()
+    release = threading.Event()
+    observed = {}
+
+    def detached_attempts():
+        started.set()
+        assert release.wait(timeout=5)
+        observed["execution"] = budget.current_coordination_execution()
+        observed["calls"] = [budget.charge_provider_attempt() for _ in range(3)]
+
+    with budget.scoped_coordination_budget():
+        detached = budget.bind_detached_coordination_scope(detached_attempts)
+        worker = threading.Thread(target=detached)
+        worker.start()
+        assert started.wait(timeout=5)
+
+    organization = SimpleNamespace(
+        validate_execution_profile=lambda _: SimpleNamespace(agent="coordinator")
+    )
+    with budget.scoped_coordination_budget():
+        with (
+            budget.coordination_acceptance_binding() as binding,
+            kb.connect_closing(budget_request.db) as conn,
+            kb.write_txn(conn),
+        ):
+            task_id = kb.create_task(
+                conn,
+                title="Independent accepted request",
+                assignee="coordinator",
+                session_id=origin["HERMES_SESSION_ID"],
+            )
+            kb.add_notify_sub(
+                conn, task_id=task_id, platform="buzz", chat_id="origin",
+                delivery_mode="wake",
+            )
+            accepted = kb.create_coordination_request(
+                conn,
+                root_task_id=task_id,
+                origin_session_id=origin["HERMES_SESSION_ID"],
+                origin_message_id=origin["HERMES_SESSION_MESSAGE_ID"],
+                organization=organization,
+                max_model_calls=2,
+                final_model_call_reserve=1,
+                accepting_model_calls=binding.model_calls,
+                acceptance_scope_id=binding.scope_id,
+            )
+            binding.accept(accepted)
+        release.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert observed == {"execution": None, "calls": [None, None, None]}
+    with kb.connect_closing(budget_request.db) as conn:
+        assert kb.get_coordination_request(conn, accepted.id).model_calls_used == 0
+
+
 def test_background_review_gets_detached_budget_lifetime(budget_request, monkeypatch):
     from agent import background_review
 
