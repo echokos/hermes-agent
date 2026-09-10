@@ -259,7 +259,7 @@ def test_classify_api_error_stream_event_grok_subscription_is_auth():
     result = classify_api_error(err, provider="xai-oauth", model="grok-4.3")
     assert result.reason == FailoverReason.auth
     assert result.retryable is False
-    assert result.should_fallback is True
+    assert result.should_fallback is False
 
 
 

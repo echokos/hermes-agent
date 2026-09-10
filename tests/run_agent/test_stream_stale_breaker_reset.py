@@ -18,11 +18,12 @@ quiet-mode / subagent sessions take that path and had the identical
 infinite stale-retry class.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from run_agent import AIAgent
+from run_agent import AIAgent, FailoverReason
 
 
 def _make_agent_openrouter():
@@ -140,7 +141,7 @@ def test_fallback_activation_resets_stale_streak():
         "agent.auxiliary_client.resolve_provider_client",
         return_value=(_mock_client(), "resolved"),
     ):
-        assert agent._try_activate_fallback() is True
+        assert agent._try_activate_fallback(reason=FailoverReason.timeout) is True
 
     assert agent._consecutive_stale_streams == 0
 
@@ -151,8 +152,59 @@ def test_fallback_exhaustion_keeps_stale_streak():
     agent = _make_fallback_agent(fallback_model=[])
     agent._consecutive_stale_streams = 7
 
-    assert agent._try_activate_fallback() is False
+    assert agent._try_activate_fallback(reason=FailoverReason.timeout) is False
     assert agent._consecutive_stale_streams == 7
+
+
+def test_run_conversation_stale_breaker_uses_fallback_without_primary_retry(
+    monkeypatch,
+):
+    """The native stale guard fails over before the non-retryable return."""
+    monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "3")
+    agent = _make_fallback_agent(
+        fallback_model=[{"provider": "openai", "model": "gpt-4o"}]
+    )
+    agent._consecutive_stale_streams = 3
+
+    fallback_client = _mock_client()
+    request_client = MagicMock()
+    request_client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="fallback recovered", tool_calls=None),
+                finish_reason="stop",
+            )
+        ],
+        model="gpt-4o",
+        usage=None,
+    )
+
+    with (
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "gpt-4o"),
+        ) as resolve_fallback,
+        patch.object(
+            agent, "_create_request_openai_client", return_value=request_client
+        ) as create_request_client,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("recover this turn")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "fallback recovered"
+    # The circuit opens before a physical primary request, so only the healthy
+    # fallback request is charged to the API-call counter.
+    assert result["api_calls"] == 1
+    assert resolve_fallback.call_count == 1
+    assert create_request_client.call_count == 1
+    assert request_client.chat.completions.create.call_count == 1
+    assert agent._fallback_activated is True
+    assert agent.provider == "openai"
+    assert agent.model == "gpt-4o"
+    assert agent._consecutive_stale_streams == 0
 
 
 

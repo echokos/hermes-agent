@@ -192,13 +192,13 @@ class TestClassifyApiError:
         # 401 is non-retryable on its own — credential rotation runs
         # before the retryability check in the agent loop.
         assert result.retryable is False
-        assert result.should_fallback is True
+        assert result.should_fallback is False
 
     def test_403_classified_as_auth(self):
         e = MockAPIError("Forbidden", status_code=403)
         result = classify_api_error(e, provider="anthropic")
         assert result.reason == FailoverReason.auth
-        assert result.should_fallback is True
+        assert result.should_fallback is False
 
 
 
@@ -230,7 +230,7 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="nous", model="gpt-5")
         assert result.reason == FailoverReason.billing
         assert result.retryable is False
-        assert result.should_fallback is True
+        assert result.should_fallback is False
 
     def test_404_requires_available_credits_is_billing(self):
         e = MockAPIError(
@@ -248,7 +248,7 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="nous", model="openai/gpt-5.5-pro")
         assert result.reason == FailoverReason.billing
         assert result.retryable is False
-        assert result.should_fallback is True
+        assert result.should_fallback is False
 
     def test_wrapped_402_uses_nested_body_message(self):
         inner = MockAPIError(
@@ -391,7 +391,7 @@ class TestClassifyApiError:
         assert result.status_code is None
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
-        assert result.should_fallback is True
+        assert result.should_fallback is False
 
     def test_non_json_stream_unknown_error_remains_retryable(self):
         e = MockAPIError(
@@ -427,7 +427,7 @@ class TestClassifyApiError:
         e = MockAPIError("model not found", status_code=404)
         result = classify_api_error(e)
         assert result.reason == FailoverReason.model_not_found
-        assert result.should_fallback is True
+        assert result.should_fallback is False
         assert result.retryable is False
 
     def test_404_generic(self):
@@ -483,14 +483,14 @@ class TestClassifyApiError:
     #
     # Distinct from ``provider_policy_blocked`` above — these are upstream
     # model-provider safety refusals for THIS prompt, not OpenRouter
-    # account-level data policy. Recovery is fallback model, not config fix.
+    # account-level data policy. Recovery is terminal guidance, not fallback.
     # See issue #18028 — OpenAI Codex was burning 3 retries on identical
     # refusals before users saw "API failed after 3 retries" on Telegram.
 
     def test_message_only_cyber_content_policy_blocked(self):
         # OpenAI Codex returns this without an HTTP status. Retrying the
         # same prompt three times only repeats the same policy decision, so
-        # the classifier must jump straight to fallback / abort instead of
+        # the classifier must abort instead of
         # leaving it in the retryable ``unknown`` bucket.
         e = Exception(
             "This content was flagged for possible cybersecurity risk. If this "
@@ -500,7 +500,7 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="openai-codex", model="gpt-5.5")
         assert result.reason == FailoverReason.content_policy_blocked
         assert result.retryable is False
-        assert result.should_fallback is True
+        assert result.should_fallback is False
         assert result.should_compress is False
 
 
@@ -590,7 +590,7 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
         assert result.should_compress is False
-        assert result.should_fallback is True
+        assert result.should_fallback is False
 
     def test_bare_no_user_query_found_is_format_error_even_on_large_session(self):
         e = MockAPIError("No user query found in messages", status_code=400)
@@ -810,9 +810,8 @@ class TestAdversarialEdgeCases:
 
     def test_400_anthropic_extra_usage_exhausted(self):
         """Anthropic returns 400 with 'out of extra usage' when the user's
-        extra-usage allowance is depleted. Must classify as billing so the
-        fallback chain engages (with credential rotation) instead of the
-        generic format_error path, which never rotates. (#11736, #13170)
+        extra-usage allowance is depleted. Must classify as billing so native
+        credential handling can surface it instead of generic format_error.
 
         #82154: the identical body is ALSO returned when Anthropic's content
         filter rejects part of the request on a subscription OAuth token, so
@@ -829,7 +828,7 @@ class TestAdversarialEdgeCases:
         )
         result = classify_api_error(e, provider="anthropic")
         assert result.reason == FailoverReason.billing
-        assert result.should_fallback is True
+        assert result.should_fallback is False
         assert result.retryable is False
         assert result.should_rotate_credential is True
         assert result.billing_unverified is True
@@ -1290,5 +1289,3 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
-
-

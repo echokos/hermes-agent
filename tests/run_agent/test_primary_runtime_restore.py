@@ -13,7 +13,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 
-from run_agent import AIAgent
+from run_agent import AIAgent, FailoverReason
 
 
 def _make_tool_defs(*names: str) -> list:
@@ -140,7 +140,7 @@ class TestRestorePrimaryRuntime:
         # Simulate fallback activation
         mock_client = _mock_resolve()
         with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            agent._try_activate_fallback()
+            agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         assert agent._fallback_activated is True
         assert agent.model == "anthropic/claude-sonnet-4"
@@ -166,7 +166,7 @@ class TestRestorePrimaryRuntime:
         # Advance through the chain
         mock_client = _mock_resolve()
         with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            agent._try_activate_fallback()
+            agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         assert agent._fallback_index == 1  # consumed one entry
 
@@ -185,7 +185,7 @@ class TestRestorePrimaryRuntime:
         # Simulate fallback modifying compressor
         mock_client = _mock_resolve()
         with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            agent._try_activate_fallback()
+            agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         # Manually simulate compressor being changed (as _try_activate_fallback does)
         agent.context_compressor.context_length = 32000
@@ -238,7 +238,7 @@ class TestRestorePrimaryRuntime:
         original_base_url = agent.base_url
         mock_client = _mock_resolve()
         with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            agent._try_activate_fallback()
+            agent._try_activate_fallback(reason=FailoverReason.server_error)
         agent._credential_pool = _Pool()
         agent._swap_credential = MagicMock()
 
@@ -290,7 +290,7 @@ class TestRestorePrimaryRuntime:
             "agent.auxiliary_client.resolve_provider_client",
             return_value=(mock_client, None),
         ):
-            agent._try_activate_fallback()
+            agent._try_activate_fallback(reason=FailoverReason.server_error)
         # Fallback attached deepseek's pool; simulate it surviving into the next turn.
         agent._credential_pool = _DeepseekPool()
         agent._swap_credential = MagicMock()
@@ -520,7 +520,7 @@ class TestRestoreInRunConversation:
         # Turn 1: activate fallback
         mock_client = _mock_resolve()
         with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(reason=FailoverReason.server_error) is True
 
         assert agent._fallback_activated is True
         assert agent.model == "anthropic/claude-sonnet-4"
@@ -551,7 +551,7 @@ class TestRateLimitCooldown:
         )
         mock_client = _mock_resolve()
         with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
-            agent._try_activate_fallback()
+            agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         assert agent._fallback_activated is True
 

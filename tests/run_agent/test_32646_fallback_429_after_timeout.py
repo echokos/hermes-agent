@@ -27,7 +27,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from agent.turn_retry_state import TurnRetryState
-from run_agent import AIAgent
+from run_agent import AIAgent, FailoverReason
 
 
 def _make_tool_defs():
@@ -151,7 +151,7 @@ class TestFallbackChainResetOnTransportRecovery:
                 side_effect=lambda m, p: m,
             ),
         ):
-            ok = agent._try_activate_fallback()
+            ok = agent._try_activate_fallback(reason=FailoverReason.timeout)
 
         assert ok is True, "fallback chain must be re-attemptable after reset"
         assert agent._fallback_activated is True

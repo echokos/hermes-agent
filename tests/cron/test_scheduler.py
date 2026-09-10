@@ -764,9 +764,9 @@ class TestRunJobConfigEnvVarExpansion:
         )
 
 
-    def test_auth_fallback_switches_provider_and_model_together(self, tmp_path):
-        """Codex auth failure must produce OpenRouter+GLM, never OpenRouter+GPT."""
-        from hermes_cli.auth import AuthError
+    def test_rate_limit_fallback_switches_provider_and_model_together(self, tmp_path):
+        """Codex quota recovery must produce OpenRouter+GLM, never OpenRouter+GPT."""
+        from hermes_cli.auth import AuthError, CODEX_RATE_LIMITED_CODE
 
         (tmp_path / "config.yaml").write_text(
             "model:\n"
@@ -779,8 +779,8 @@ class TestRunJobConfigEnvVarExpansion:
             encoding="utf-8",
         )
         job = {
-            "id": "auth-fallback",
-            "name": "auth fallback",
+            "id": "rate-limit-fallback",
+            "name": "rate limit fallback",
             "prompt": "hi",
             "provider_snapshot": "openai-codex",
             "model_snapshot": "gpt-5.6-sol",
@@ -791,9 +791,11 @@ class TestRunJobConfigEnvVarExpansion:
         def resolve_runtime(**kwargs):
             requested.append(kwargs.get("requested"))
             if kwargs.get("requested") in (None, "openai-codex"):
-                # Cron must retain the configured primary provider for drift
-                # comparison even when older/custom AuthError sites omit it.
-                raise AuthError("No Codex credentials stored")
+                raise AuthError(
+                    "Codex usage limit reached; retry after 120s",
+                    provider="openai-codex",
+                    code=CODEX_RATE_LIMITED_CODE,
+                )
             assert kwargs["requested"] == "openrouter"
             assert kwargs["target_model"] == "z-ai/glm-5.2"
             return {**self._RUNTIME, "provider": "openrouter"}
@@ -814,7 +816,9 @@ class TestRunJobConfigEnvVarExpansion:
 
         assert success is True
         assert error is None
-        assert requested == [None, "openrouter"]
+        # Read-only preflight resolves the primary once, then the runtime path
+        # repeats primary resolution before selecting the eligible fallback.
+        assert requested == [None, None, "openrouter"]
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["provider"] == "openrouter"
         assert kwargs["model"] == "z-ai/glm-5.2"

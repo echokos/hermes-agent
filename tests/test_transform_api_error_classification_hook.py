@@ -74,7 +74,7 @@ def test_plugin_classification_wins(monkeypatch):
     result = _classify_unclaimed_error()
     assert result.reason == FailoverReason.model_not_found
     assert result.retryable is False
-    assert result.should_fallback is True
+    assert result.should_fallback is False
     # Extracted context is preserved on the ClassifiedError.
     assert result.provider == "acmecloud"
     assert result.status_code is None
@@ -163,6 +163,23 @@ def test_message_override_and_error_context_sanitized(monkeypatch):
     result = _classify_unclaimed_error()
     assert result.message == "custom guidance"
     assert result.error_context == {"upstream_provider": "AcmeCloud"}
+
+
+def test_plugin_cannot_enable_fallback_for_content_policy(monkeypatch):
+    """The shared recovery boundary normalizes unsafe plugin hints."""
+    monkeypatch.setattr(
+        plugins_mod, "invoke_hook",
+        lambda name, **kw: [{
+            "reason": "content_policy_blocked",
+            "retryable": False,
+            "should_fallback": True,
+        }],
+    )
+
+    result = _classify_unclaimed_error()
+
+    assert result.reason == FailoverReason.content_policy_blocked
+    assert result.should_fallback is False
 
 
 # ── Plugin register() end-to-end (synthetic, written at test time) ──────

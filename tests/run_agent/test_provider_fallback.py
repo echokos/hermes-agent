@@ -7,7 +7,9 @@ advancement through multiple providers.
 
 from unittest.mock import MagicMock, patch
 
-from run_agent import AIAgent, _pool_may_recover_from_rate_limit
+import pytest
+
+from run_agent import AIAgent, FailoverReason, _pool_may_recover_from_rate_limit
 
 
 def _make_agent(fallback_model=None):
@@ -64,6 +66,89 @@ class TestFallbackChainInit:
         agent = _make_agent(fallback_model={"model": "gpt-4o"})
         assert agent._fallback_chain == []
 
+    def test_constructor_missing_credentials_does_not_activate_fallback(self):
+        """Construction has no classified service/rate failure to authorize it."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)) as resolve,
+        ):
+            with pytest.raises(RuntimeError, match="no API key was found"):
+                AIAgent(
+                    provider="deepseek",
+                    model="deepseek-chat",
+                    quiet_mode=True,
+                    skip_context_files=True,
+                    skip_memory=True,
+                    fallback_model={"provider": "openrouter", "model": "test-model"},
+                )
+
+        assert resolve.call_count == 1
+
+
+class TestAuxiliaryInheritedFallbackPolicy:
+    @staticmethod
+    def _error(status_code, message):
+        error = Exception(message)
+        error.status_code = status_code
+        return error
+
+    def test_startup_unavailability_does_not_inherit_main_chain(self):
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            side_effect=AssertionError("main chain must not be loaded"),
+        ):
+            assert _try_main_fallback_chain(
+                "compression", "openai-codex", reason="main provider unavailable"
+            ) == (None, None, "")
+
+    @pytest.mark.parametrize(
+        ("error", "reason"),
+        [
+            (_error.__func__(401, "unauthorized"), "auth error"),
+            (_error.__func__(402, "payment required"), "payment error"),
+            (_error.__func__(400, "invalid model"), "model incompatible with route"),
+        ],
+    )
+    def test_request_failures_do_not_inherit_main_chain(self, error, reason):
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            side_effect=AssertionError("main chain must not be loaded"),
+        ):
+            assert _try_main_fallback_chain(
+                "compression", "openai-codex", reason=reason, failure=error
+            ) == (None, None, "")
+
+    def test_rate_limit_may_inherit_main_chain(self):
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        fallback_client = MagicMock()
+        entry = {"provider": "openrouter", "model": "fallback-model"}
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value={}),
+            patch("hermes_cli.fallback_config.get_fallback_chain", return_value=[entry]),
+            patch("agent.auxiliary_client._read_main_provider", return_value="primary"),
+            patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False),
+            patch(
+                "agent.auxiliary_client._resolve_fallback_entry",
+                return_value=(fallback_client, "fallback-model"),
+            ),
+        ):
+            client, model, provider = _try_main_fallback_chain(
+                "compression",
+                "primary",
+                reason="rate limit",
+                failure=self._error(429, "rate limit exceeded"),
+            )
+
+        assert client is fallback_client
+        assert model == "fallback-model"
+        assert provider == "openrouter"
+
 
 # ── Chain advancement ─────────────────────────────────────────────────────
 
@@ -71,7 +156,7 @@ class TestFallbackChainInit:
 class TestFallbackChainAdvancement:
     def test_exhausted_returns_false(self):
         agent = _make_agent(fallback_model=None)
-        assert agent._try_activate_fallback() is False
+        assert agent._try_activate_fallback(reason=FailoverReason.server_error) is False
 
     def test_advances_index(self):
         fbs = [
@@ -81,7 +166,7 @@ class TestFallbackChainAdvancement:
         agent = _make_agent(fallback_model=fbs)
         with patch("agent.auxiliary_client.resolve_provider_client",
                     return_value=(_mock_client(), "gpt-4o")):
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(reason=FailoverReason.server_error) is True
             assert agent._fallback_index == 1
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
@@ -100,7 +185,7 @@ class TestFallbackChainAdvancement:
                 (None, None),                    # broken provider
                 (_mock_client(), "gpt-4o"),       # fallback succeeds
             ]
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(reason=FailoverReason.server_error) is True
             assert agent.model == "gpt-4o"
             assert agent._fallback_index == 2
 
@@ -116,7 +201,7 @@ class TestFallbackChainAdvancement:
                 RuntimeError("auth failed"),
                 (_mock_client(), "gpt-4o"),
             ]
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(reason=FailoverReason.server_error) is True
             assert agent.model == "gpt-4o"
 
     def test_resolves_key_env_for_fallback_provider(self):
@@ -142,7 +227,7 @@ class TestFallbackChainAdvancement:
                 ),
             ) as mock_rpc,
         ):
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(reason=FailoverReason.server_error) is True
             assert mock_rpc.call_args.kwargs["explicit_api_key"] == "env-secret"
 
 
@@ -190,7 +275,7 @@ class TestFallbackChainAdvancement:
                 side_effect=_fake_build,
             ),
         ):
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(reason=FailoverReason.server_error) is True
 
         assert agent.api_mode == "anthropic_messages"
         assert agent.provider == "nous"
@@ -226,7 +311,7 @@ class TestFallbackChainAdvancement:
                 side_effect=AssertionError("must not build Anthropic client"),
             ),
         ):
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(reason=FailoverReason.server_error) is True
 
         assert agent.api_mode == "chat_completions"
         assert agent.client is not None
@@ -284,7 +369,7 @@ class TestFallbackChainDedup:
             return _mock_client(), model
         with patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve):
             with patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m):
-                ok = agent._try_activate_fallback()
+                ok = agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         assert ok is True
         # The first entry was skipped — only the second reached resolve.
@@ -304,7 +389,7 @@ class TestFallbackChainDedup:
         agent.base_url = "https://openrouter.ai/api/v1"
 
         with patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
-            ok = agent._try_activate_fallback()
+            ok = agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         assert ok is False
         mock_resolve.assert_not_called()
@@ -339,7 +424,7 @@ class TestFallbackChainDedup:
                 "hermes_cli.model_normalize.normalize_model_for_provider",
                 side_effect=lambda m, p: m,
             ):
-                ok = agent._try_activate_fallback()
+                ok = agent._try_activate_fallback(reason=FailoverReason.server_error)
 
         assert ok is True
         assert called == [("xai", "grok-4.5")]

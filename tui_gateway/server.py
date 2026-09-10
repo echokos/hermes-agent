@@ -6776,14 +6776,13 @@ class _RuntimeFallbackResolution(NamedTuple):
 def _resolve_runtime_with_fallback(
     resolve_kwargs: dict | None = None,
 ) -> _RuntimeFallbackResolution:
-    """Resolve the primary runtime or one complete provider/model fallback.
+    """Resolve the primary runtime or one eligible provider/model fallback.
 
-    Setup-time auth fallback only accepts entries with both fields. Provider-
-    only entries are skipped so the unavailable primary model can never leak
-    into a different runtime. ``used_fallback`` remains explicit rather than
-    overloading a nullable model as control flow.
+    Setup-time fallback is limited to classified service/rate failures and
+    accepts only entries with both fields, so a primary model never leaks into
+    a different provider runtime.
     """
-    from hermes_cli.auth import AuthError
+    from agent.error_classifier import allows_configured_fallback_for_error
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     kwargs = resolve_kwargs or {}
@@ -6793,7 +6792,15 @@ def _resolve_runtime_with_fallback(
             None,
             False,
         )
-    except AuthError as primary_exc:
+    except Exception as primary_exc:
+        eligible = allows_configured_fallback_for_error(
+            primary_exc,
+            provider=str(kwargs.get("requested") or ""),
+            model=str(kwargs.get("target_model") or ""),
+        )
+        if not eligible:
+            raise
+
         fb_chain = _load_fallback_model() or []
         for entry in fb_chain:
             if not isinstance(entry, dict):
@@ -6815,10 +6822,9 @@ def _resolve_runtime_with_fallback(
                 if fb_api_key:
                     fb_kwargs["explicit_api_key"] = fb_api_key
                 runtime = resolve_runtime_provider(**fb_kwargs)
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "Primary auth failed (%s), falling back to %s model %s",
+                logger.warning(
+                    "Eligible primary provider resolution failure (%s); "
+                    "falling back to %s model %s",
                     primary_exc,
                     fb_provider,
                     fb_model,

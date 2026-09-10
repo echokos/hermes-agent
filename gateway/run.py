@@ -2774,9 +2774,8 @@ def _resolve_runtime_agent_kwargs(
     not consult environment variables for behavioral config — config.yaml
     is authoritative.
 
-    If the primary provider fails with an authentication error, attempt to
-    resolve credentials using the fallback provider chain from config.yaml
-    before giving up.
+    Only a service/rate provider-resolution failure may use the configured
+    fallback chain. Credential failures remain terminal after native refresh.
     """
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
@@ -2791,19 +2790,43 @@ def _resolve_runtime_agent_kwargs(
             target_model=target_model,
         )
     except AuthError as auth_exc:
-        # Distinguish a transient rate-limit/quota cap (credentials are fine,
-        # re-auth cannot help) from a genuine auth failure (expired/revoked
-        # token). Both fall through to the fallback chain, but the log message
-        # must not mislabel a quota exhaustion as an auth failure (#32790).
-        if is_rate_limited_auth_error(auth_exc):
-            logger.warning("Primary provider rate-limited (429): %s — trying fallback", auth_exc)
-        else:
-            logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
-        fb_config = _try_resolve_fallback_provider()
-        if fb_config is not None:
-            return fb_config
+        # A transient service/rate failure may recover through the configured
+        # fallback chain. A genuine auth failure must surface after native
+        # credential refresh rather than silently changing providers.
+        from agent.error_classifier import allows_configured_fallback_for_error
+
+        if allows_configured_fallback_for_error(
+            auth_exc,
+            provider=requested_provider or "",
+            model=target_model or "",
+        ):
+            label = (
+                "rate-limited (429)"
+                if is_rate_limited_auth_error(auth_exc)
+                else "unavailable"
+            )
+            logger.warning("Primary provider %s: %s — trying fallback", label, auth_exc)
+            fb_config = _try_resolve_fallback_provider()
+            if fb_config is not None:
+                return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
     except Exception as exc:
+        from agent.error_classifier import allows_configured_fallback, classify_api_error
+
+        classified = classify_api_error(
+            exc,
+            provider=requested_provider or "",
+            model=target_model or "",
+        )
+        if allows_configured_fallback(classified.reason):
+            logger.warning(
+                "Primary provider resolution failed (%s): %s — trying fallback",
+                classified.reason.value,
+                exc,
+            )
+            fb_config = _try_resolve_fallback_provider()
+            if fb_config is not None:
+                return fb_config
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
     model_cfg = _get_model_config()

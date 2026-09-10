@@ -400,8 +400,8 @@ class TestContentFilterStallActivatesFallback:
          ``content_policy_blocked``.
       2. interruptible_streaming_api_call runs the swallowed error through
          that classifier and stamps the stub ``_content_filter_terminated``.
-      3. the conversation loop reads the tag and activates fallback BEFORE
-         burning any continuation retries.
+      3. the conversation loop reads the tag and terminates without a
+         continuation retry or configured provider fallback.
     """
 
     @patch("run_agent.AIAgent._create_request_openai_client")
@@ -438,15 +438,13 @@ class TestContentFilterStallActivatesFallback:
         assert response.id == PARTIAL_STREAM_STUB_ID
         assert getattr(response, "_content_filter_terminated", False) is True, (
             "MiniMax new_sensitive stream stall must tag the stub so the loop "
-            "can route to fallback (#32421)."
+            "can terminate as a policy refusal (#32421)."
         )
 
 
-    def test_tagged_stub_activates_fallback_first_pass(self, loop_agent):
-        """Layer 3: a tagged stub activates fallback on the FIRST pass, with
-        zero continuation retries burned, and the fallback provider then
-        completes the turn."""
-        from tests.run_agent.test_run_agent import _mock_assistant_msg, _mock_response
+    def test_tagged_stub_returns_policy_terminal_without_fallback(self, loop_agent):
+        """Layer 3: a tagged stub ends immediately without retry or fallback."""
+        from tests.run_agent.test_run_agent import _mock_assistant_msg
 
         def _filter_stub():
             return SimpleNamespace(
@@ -462,38 +460,26 @@ class TestContentFilterStallActivatesFallback:
                 _content_filter_terminated=True,
             )
 
-        recovery = _mock_response(
-            content="Done on the fallback provider.", finish_reason="stop",
-        )
-        loop_agent.client.chat.completions.create.side_effect = [
-            _filter_stub(), recovery,
-        ]
+        loop_agent.client.chat.completions.create.side_effect = [_filter_stub()]
         loop_agent._fallback_chain = [
             {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.7"},
         ]
         loop_agent._fallback_index = 0
         fb_calls = {"n": 0}
 
-        def _fake_activate(reason=None):
-            fb_calls["n"] += 1
-            loop_agent._fallback_index = len(loop_agent._fallback_chain)
-            return True
-
         with (
             patch.object(loop_agent, "_persist_session"),
             patch.object(loop_agent, "_save_trajectory"),
             patch.object(loop_agent, "_cleanup_task_resources"),
-            patch.object(loop_agent, "_try_activate_fallback",
-                         side_effect=_fake_activate),
+            patch.object(loop_agent, "_try_activate_fallback") as activate,
         ):
             result = loop_agent.run_conversation("write me a long file")
 
-        assert fb_calls["n"] == 1, (
-            "Content-filter-tagged stub must activate fallback exactly once, "
-            "on the first pass — not after exhausting continuation retries."
-        )
-        assert result["final_response"] == "Done on the fallback provider."
-        assert result["completed"] is True
+        activate.assert_not_called()
+        assert fb_calls["n"] == 0
+        assert result["failed"] is True
+        assert result["error"].startswith("content_policy_blocked:")
+        assert result["completed"] is False
 
 
 

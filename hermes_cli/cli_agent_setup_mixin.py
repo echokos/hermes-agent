@@ -48,10 +48,17 @@ class CLIAgentSetupMixin:
         except Exception as exc:
             _primary_exc = exc
 
-        # Primary provider auth failed — try fallback providers before giving up.
+        # A service/rate resolution failure may use the configured
+        # fallback chain. Native auth refresh/repair failures stay terminal.
         if runtime is None and _primary_exc is not None:
-            from hermes_cli.auth import AuthError
-            if isinstance(_primary_exc, AuthError):
+            from agent.error_classifier import allows_configured_fallback_for_error
+
+            _eligible_resolution_failure = allows_configured_fallback_for_error(
+                _primary_exc,
+                provider=self.requested_provider or "",
+                model=self.model or "",
+            )
+            if _eligible_resolution_failure:
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
                 for _fb in _fb_chain:
                     _fb_provider = (_fb.get("provider") or "").strip().lower()
@@ -69,10 +76,10 @@ class CLIAgentSetupMixin:
                             _fb_kwargs["explicit_api_key"] = _fb_api_key
                         runtime = resolve_runtime_provider(**_fb_kwargs)
                         logger.warning(
-                            "Primary provider auth failed (%s). Falling through to fallback: %s/%s",
+                            "Eligible primary provider resolution failure (%s). Falling through to fallback: %s/%s",
                             _primary_exc, _fb_provider, _fb_model,
                         )
-                        _cprint(f"⚠️  Primary auth failed — switching to fallback: {_fb_provider} / {_fb_model}")
+                        _cprint(f"⚠️  Primary provider unavailable — switching to fallback: {_fb_provider} / {_fb_model}")
                         self.requested_provider = _fb_provider
                         self.model = _fb_model
                         _primary_exc = None

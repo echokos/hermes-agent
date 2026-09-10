@@ -5,6 +5,7 @@ import time
 import base64
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -562,6 +563,121 @@ def test_refresh_429_without_retry_after_header(monkeypatch):
     assert "quota exhausted" in str(err).lower()
 
 
+def test_refresh_503_preserves_status_for_fallback_classification(monkeypatch):
+    """A token-endpoint outage stays a service failure after AuthError wrapping."""
+    from agent.error_classifier import (
+        FailoverReason,
+        allows_configured_fallback,
+        allows_configured_fallback_for_error,
+        classify_api_error,
+    )
+
+    response = _StubHTTPResponse(
+        503,
+        {"error": {"message": "temporarily unavailable", "code": "server_error"}},
+    )
+    _patch_httpx(monkeypatch, response)
+
+    with pytest.raises(AuthError) as exc_info:
+        refresh_codex_oauth_pure("a-tok", "r-tok")
+
+    err = exc_info.value
+    assert err.status_code == 503
+    assert err.relogin_required is False
+    classified = classify_api_error(
+        err, provider="openai-codex", model="gpt-5.5"
+    )
+    assert classified.reason == FailoverReason.overloaded
+    assert allows_configured_fallback(classified.reason) is True
+    assert allows_configured_fallback_for_error(
+        err, provider="openai-codex", model="gpt-5.5"
+    ) is True
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_refresh_auth_status_remains_terminal(monkeypatch, status_code):
+    """Credential rejection remains auth/relogin, never service fallback."""
+    from agent.error_classifier import (
+        FailoverReason,
+        allows_configured_fallback_for_error,
+        classify_api_error,
+    )
+
+    response = _StubHTTPResponse(
+        status_code,
+        {"error": {"message": "refresh token rejected", "code": "invalid_grant"}},
+    )
+    _patch_httpx(monkeypatch, response)
+
+    with pytest.raises(AuthError) as exc_info:
+        refresh_codex_oauth_pure("a-tok", "r-tok")
+
+    err = exc_info.value
+    assert err.status_code == status_code
+    assert err.relogin_required is True
+    classified = classify_api_error(
+        err, provider="openai-codex", model="gpt-5.5"
+    )
+    assert classified.reason == FailoverReason.auth
+    assert classified.should_fallback is False
+    assert allows_configured_fallback_for_error(
+        err, provider="openai-codex", model="gpt-5.5"
+    ) is False
+
+
+def test_refresh_explicit_invalid_grant_remains_terminal_even_on_503(monkeypatch):
+    """Credential-invalid metadata outranks a contradictory service status."""
+    from agent.error_classifier import allows_configured_fallback_for_error
+
+    response = _StubHTTPResponse(
+        503,
+        {"error": {"message": "refresh token rejected", "code": "invalid_grant"}},
+    )
+    _patch_httpx(monkeypatch, response)
+
+    with pytest.raises(AuthError) as exc_info:
+        refresh_codex_oauth_pure("a-tok", "r-tok")
+
+    err = exc_info.value
+    assert err.status_code == 503
+    assert err.relogin_required is True
+    assert allows_configured_fallback_for_error(
+        err, provider="openai-codex", model="gpt-5.5"
+    ) is False
+
+
+@pytest.mark.parametrize("payload", [{}, None])
+def test_nous_refresh_generic_503_remains_service_failure(payload):
+    """A generic Nous token 5xx must not be invented into invalid_grant."""
+    from agent.error_classifier import (
+        FailoverReason,
+        allows_configured_fallback_for_error,
+        classify_api_error,
+    )
+    from hermes_cli.auth import _refresh_access_token
+
+    response = MagicMock()
+    response.status_code = 503
+    response.json.return_value = payload
+    client = MagicMock()
+    client.post.return_value = response
+
+    with pytest.raises(AuthError) as exc_info:
+        _refresh_access_token(
+            client=client,
+            portal_base_url="https://portal.nousresearch.com",
+            client_id="test-client",
+            refresh_token="test-refresh",
+        )
+
+    err = exc_info.value
+    assert err.status_code == 503
+    assert err.code == "nous_refresh_failed"
+    assert err.relogin_required is False
+    assert classify_api_error(err, provider="nous").reason == FailoverReason.overloaded
+    assert allows_configured_fallback_for_error(err, provider="nous") is True
+
+
 def test_is_rate_limited_auth_error_distinguishes_credential_errors():
     """Missing/expired credentials must NOT be treated as rate-limit errors."""
     from hermes_cli.auth import CODEX_RATE_LIMITED_CODE, is_rate_limited_auth_error
@@ -607,7 +723,3 @@ def _patch_httpx_post(monkeypatch, responses):
             return next(seq)
 
     monkeypatch.setattr("hermes_cli.auth.httpx.Client", lambda *a, **k: _FakeClient())
-
-
-
-
