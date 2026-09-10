@@ -816,7 +816,9 @@ class TestRunJobConfigEnvVarExpansion:
 
         assert success is True
         assert error is None
-        assert requested == [None, "openrouter"]
+        # Read-only preflight resolves the primary once, then the runtime path
+        # repeats primary resolution before selecting the eligible fallback.
+        assert requested == [None, None, "openrouter"]
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["provider"] == "openrouter"
         assert kwargs["model"] == "z-ai/glm-5.2"

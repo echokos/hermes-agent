@@ -4486,18 +4486,10 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     """READ-ONLY probe: would provider resolution fail for lack of a key?
 
     Mirrors the effective requested-provider computation from run_job's
-    resolution block without any side effects on the run. When a fallback
-    chain is configured the check is skipped entirely — the existing
-    auth-fallback path may legitimately rescue a missing primary key, so
-    blocking here would break that contract (and burning zero LLM calls is
-    already guaranteed by the fallback resolution being config-local).
+    resolution block without any side effects on the run. A configured
+    fallback chain does not rescue a missing primary credential because no
+    classified service/rate failure occurred.
     """
-    try:
-        if get_fallback_chain(cfg):
-            return None
-    except Exception:
-        return None  # fail-open: never block on a preflight-internal error
-
     _cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
     requested = (
         job.get("provider")
@@ -4506,7 +4498,7 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     )
     model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
-    from hermes_cli.auth import AuthError
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -4516,6 +4508,10 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
             kwargs["explicit_base_url"] = job.get("base_url")
         resolve_runtime_provider(**kwargs)
     except AuthError as exc:
+        if is_rate_limited_auth_error(exc):
+            # A reset-aware provider quota is not a missing credential. Let
+            # the runtime resolver apply the service/rate fallback policy.
+            return None
         return (
             f"provider credential missing: {exc}. "
             "Set the provider API key in .env (or `hermes setup`), or pin a "

@@ -17530,12 +17530,17 @@ def test_persist_model_switch_clears_stale_base_url(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _resolve_runtime_with_fallback — init-time provider fallback
+# _resolve_runtime_with_fallback — eligible init-time provider fallback
 # ---------------------------------------------------------------------------
 
+def _rate_limited_auth_error(message="Codex usage limit reached"):
+    from hermes_cli.auth import AuthError, CODEX_RATE_LIMITED_CODE
+
+    return AuthError(message, code=CODEX_RATE_LIMITED_CODE)
+
+
 class TestResolveRuntimeWithFallback:
-    """Tests for _resolve_runtime_with_fallback(): init-time provider
-    fallback when the primary provider raises AuthError."""
+    """Tests for service/rate-only init-time provider fallback."""
 
     def test_primary_success_returns_runtime(self, monkeypatch):
         """When primary resolve succeeds, return its result directly."""
@@ -17551,36 +17556,86 @@ class TestResolveRuntimeWithFallback:
         assert resolution.selected_model is None
         assert resolution.used_fallback is False
 
-    def test_auth_error_tries_fallback_chain(self, monkeypatch):
-        """On AuthError from primary, walk fallback_providers chain."""
+    def test_auth_error_is_terminal_with_fallback_chain(self, monkeypatch):
+        """Missing credentials do not authorize a provider switch."""
         from hermes_cli.auth import AuthError
+        import pytest
 
-        fallback_runtime = {"provider": "deepseek", "api_key": "fb-tok"}
+        requested = []
 
         def fake_resolve(**kwargs):
-            if kwargs.get("requested") == "openai-codex":
-                raise AuthError("No Codex credentials stored")
-            return fallback_runtime
+            requested.append(kwargs.get("requested"))
+            raise AuthError("No Codex credentials stored")
 
         monkeypatch.setattr(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
             fake_resolve,
+        )
+        load_fallback = Mock(
+            return_value=[{"provider": "deepseek", "model": "deepseek-v4-pro"}]
+        )
+        monkeypatch.setattr(server, "_load_fallback_model", load_fallback)
+
+        with pytest.raises(AuthError, match="No Codex credentials stored"):
+            server._resolve_runtime_with_fallback({"requested": "openai-codex"})
+
+        assert requested == ["openai-codex"]
+        load_fallback.assert_not_called()
+
+    def test_rate_limited_auth_error_tries_fallback_chain(self, monkeypatch):
+        fallback_runtime = {"provider": "deepseek", "api_key": "fb-tok"}
+
+        def fake_resolve(**kwargs):
+            if kwargs.get("requested") == "openai-codex":
+                raise _rate_limited_auth_error()
+            return fallback_runtime
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve
         )
         monkeypatch.setattr(
             server,
             "_load_fallback_model",
             lambda: [{"provider": "deepseek", "model": "deepseek-v4-pro"}],
         )
+
         resolution = server._resolve_runtime_with_fallback(
-            {"requested": "openai-codex"},
+            {"requested": "openai-codex"}
         )
+
         assert resolution.runtime == fallback_runtime
         assert resolution.selected_model == "deepseek-v4-pro"
         assert resolution.used_fallback is True
 
-    def test_auth_error_skips_provider_only_fallback(self, monkeypatch):
-        """Auth fallback requires one complete provider/model pair."""
-        from hermes_cli.auth import AuthError
+    def test_service_error_tries_fallback_chain(self, monkeypatch):
+        fallback_runtime = {"provider": "deepseek", "api_key": "fb-tok"}
+        service_error = Exception("service unavailable")
+        service_error.status_code = 503
+
+        def fake_resolve(**kwargs):
+            if kwargs.get("requested") == "openai-codex":
+                raise service_error
+            return fallback_runtime
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve
+        )
+        monkeypatch.setattr(
+            server,
+            "_load_fallback_model",
+            lambda: [{"provider": "deepseek", "model": "deepseek-v4-pro"}],
+        )
+
+        resolution = server._resolve_runtime_with_fallback(
+            {"requested": "openai-codex", "target_model": "gpt-5.5"}
+        )
+
+        assert resolution.runtime == fallback_runtime
+        assert resolution.selected_model == "deepseek-v4-pro"
+        assert resolution.used_fallback is True
+
+    def test_eligible_failure_skips_provider_only_fallback(self, monkeypatch):
+        """Eligible fallback still requires a complete provider/model pair."""
 
         requested = []
         fallback_runtime = {"provider": "openrouter", "api_key": "fb-tok"}
@@ -17588,7 +17643,7 @@ class TestResolveRuntimeWithFallback:
         def fake_resolve(**kwargs):
             requested.append(kwargs.get("requested"))
             if kwargs.get("requested") == "openai-codex":
-                raise AuthError("No Codex credentials stored")
+                raise _rate_limited_auth_error()
             return fallback_runtime
 
         monkeypatch.setattr(
@@ -17616,15 +17671,13 @@ class TestResolveRuntimeWithFallback:
     def test_fallback_entry_key_env_resolves_api_key(self, monkeypatch):
         """A fallback entry naming its key via key_env passes the resolved
         env value as explicit_api_key (#43861, @VrtxOmega)."""
-        from hermes_cli.auth import AuthError
-
         monkeypatch.setenv("FB_TEST_KEY", "env-resolved-key")
         captured = {}
         fallback_runtime = {"provider": "openrouter", "api_key": "x"}
 
         def fake_resolve(**kwargs):
             if kwargs.get("requested") == "openai-codex":
-                raise AuthError("No Codex credentials stored")
+                raise _rate_limited_auth_error()
             captured.update(kwargs)
             return fallback_runtime
 
@@ -17649,12 +17702,12 @@ class TestResolveRuntimeWithFallback:
         assert resolution.used_fallback is True
         assert captured.get("explicit_api_key") == "env-resolved-key"
 
-    def test_auth_error_all_fallbacks_fail_raises(self, monkeypatch):
-        """When all fallbacks also fail, re-raise the original AuthError."""
-        from hermes_cli.auth import AuthError
-
+    def test_rate_limited_auth_all_fallbacks_fail_raises(self, monkeypatch):
+        """When eligible fallbacks fail, re-raise the original error."""
         def fake_resolve(**kwargs):
-            raise AuthError("No credentials for " + str(kwargs.get("requested")))
+            raise _rate_limited_auth_error(
+                "No capacity for " + str(kwargs.get("requested"))
+            )
 
         monkeypatch.setattr(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -17667,20 +17720,20 @@ class TestResolveRuntimeWithFallback:
         )
         import pytest
 
-        with pytest.raises(AuthError, match="No credentials for openai-codex"):
+        from hermes_cli.auth import AuthError
+
+        with pytest.raises(AuthError, match="No capacity for openai-codex"):
             server._resolve_runtime_with_fallback(
                 {"requested": "openai-codex"},
             )
 
-    def test_auth_error_skips_non_dict_entries(self, monkeypatch):
-        """Fallback chain entries that are not dicts are skipped."""
-        from hermes_cli.auth import AuthError
-
+    def test_eligible_failure_skips_non_dict_entries(self, monkeypatch):
+        """Eligible fallback skips entries that are not dictionaries."""
         fallback_runtime = {"provider": "anthropic", "api_key": "ant-tok"}
 
         def fake_resolve(**kwargs):
             if kwargs.get("requested") == "openai-codex":
-                raise AuthError("No Codex credentials stored")
+                raise _rate_limited_auth_error()
             return fallback_runtime
 
         monkeypatch.setattr(
@@ -17702,12 +17755,9 @@ class TestResolveRuntimeWithFallback:
         assert resolution.selected_model == "claude-sonnet-4-6"
         assert resolution.used_fallback is True
 
-    def test_make_agent_uses_fallback_on_auth_error(self, monkeypatch):
-        """Integration: _make_agent falls back to configured fallback
-        provider when the primary provider raises AuthError."""
+    def test_make_agent_uses_fallback_on_rate_limited_auth(self, monkeypatch):
+        """Integration: eligible rate-limited auth preserves the pair."""
         import types
-
-        from hermes_cli.auth import AuthError
 
         captured = {}
         fallback_runtime = {
@@ -17718,7 +17768,7 @@ class TestResolveRuntimeWithFallback:
 
         def fake_resolve(**kwargs):
             if kwargs.get("requested") in (None, "openai-codex"):
-                raise AuthError("No Codex credentials stored")
+                raise _rate_limited_auth_error()
             return fallback_runtime
 
         def fake_agent(**kwargs):
