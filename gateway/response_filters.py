@@ -7,8 +7,8 @@ conversation history.
 
 from __future__ import annotations
 
-import unicodedata
 import json
+import unicodedata
 from typing import Any
 
 # Canonical model-emitted control token for intentional silence.

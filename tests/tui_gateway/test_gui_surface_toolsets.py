@@ -27,6 +27,7 @@ GUI_TOOLS = {
     "react_to_message",
     "setup_mcp",
 }
+TELEGRAM_REACTION_TOOLS = {"react_to_message"}
 
 
 @pytest.fixture
@@ -53,7 +54,14 @@ class TestDesktopUiToolset:
         for name, spec in TOOLSETS.items():
             if name == "desktop_ui":
                 continue
+            if name == "message_reactions":
+                assert set(spec.get("tools") or ()) == TELEGRAM_REACTION_TOOLS
+                continue
             assert GUI_TOOLS.isdisjoint(set(spec.get("tools") or ())), name
+
+    def test_reaction_is_the_explicit_dual_surface_exception(self):
+        """Telegram exposes only the reaction, never a GUI tool bundle."""
+        assert set(resolve_toolset("message_reactions")) == TELEGRAM_REACTION_TOOLS
 
 
 class TestSurfaceResolution:

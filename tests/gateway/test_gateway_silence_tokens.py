@@ -144,6 +144,16 @@ def test_reaction_acknowledgement_is_bound_to_current_telegram_turn():
     assert not is_current_turn_reaction_acknowledgement(result, "substantive reply", _source())
 
 
+def test_reaction_acknowledgement_is_checked_before_empty_normalization():
+    result = _reaction_ack_result()
+    assert gateway_run._is_reaction_only_acknowledgement_before_normalization(
+        result, "", _source(), history_offset=0
+    )
+    assert not gateway_run._is_reaction_only_acknowledgement_before_normalization(
+        result, "", _source(), history_offset=2
+    )
+
+
 @pytest.mark.asyncio
 async def test_reaction_acknowledgement_suppresses_only_blank_delivery(monkeypatch, tmp_path):
     runner = _runner(monkeypatch, tmp_path)
@@ -152,6 +162,7 @@ async def test_reaction_acknowledgement_suppresses_only_blank_delivery(monkeypat
         "tools": [],
         "last_prompt_tokens": 0,
         "api_calls": 1,
+        "reaction_only_acknowledgement": True,
         **_reaction_ack_result(),
     })
 

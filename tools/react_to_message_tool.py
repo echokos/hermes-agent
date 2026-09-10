@@ -15,7 +15,7 @@ model shouldn't have to thread row ids through tool calls), and emits
 
 import json
 
-from gateway.session_context import get_session_env
+from gateway.session_context import get_session_env, get_session_origin_source
 from tools import desktop_ui
 from tools.registry import registry, tool_error
 from utils import env_var_enabled
@@ -102,18 +102,21 @@ def _telegram_current_turn_reaction(emoji: str) -> str:
     try:
         from gateway.config import Platform
         from gateway.run import _gateway_runner_ref
-        from gateway.session import SessionSource
         from model_tools import _run_async
 
         runner = _gateway_runner_ref()
         if runner is None:
             return tool_error("No live Telegram gateway is available for this turn.")
-        source = SessionSource(
-            platform=Platform.TELEGRAM,
-            chat_id=chat_id,
-            message_id=message_id,
-            profile=get_session_env("HERMES_SESSION_PROFILE", "") or None,
-        )
+        source = get_session_origin_source()
+        if (
+            source is None
+            or getattr(source, "platform", None) != Platform.TELEGRAM
+            or str(getattr(source, "chat_id", "") or "") != chat_id
+            or str(getattr(source, "message_id", "") or "") != message_id
+            or (getattr(source, "profile", "") or "")
+            != (get_session_env("HERMES_SESSION_PROFILE", "") or "")
+        ):
+            return tool_error("Telegram reaction provenance is unavailable for this turn.")
         adapter = runner._adapter_for_source(source)
         set_reaction = getattr(adapter, "_set_reaction", None)
         if not callable(set_reaction):
@@ -214,6 +217,20 @@ REACT_TO_MESSAGE_SCHEMA = {
                 "description": (
                     "The emoji to react with (e.g. '❤️', '😂', '👍'). On Telegram it "
                     "always applies to the current inbound message."
+                ),
+            },
+            "message_row_id": {
+                "type": "integer",
+                "description": (
+                    "Desktop only: the specific message to react to. Omit to react to "
+                    "the user's latest message. Telegram accepts only `emoji`."
+                ),
+            },
+            "messages_back": {
+                "type": "integer",
+                "description": (
+                    "Desktop only: react to an earlier user message, where 1 is the one "
+                    "before the latest. Telegram accepts only `emoji`."
                 ),
             },
         },

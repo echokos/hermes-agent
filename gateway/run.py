@@ -3983,6 +3983,30 @@ def _normalize_empty_agent_response(
     return response
 
 
+def _is_reaction_only_acknowledgement_before_normalization(
+    result: dict,
+    response: str,
+    source: SessionSource,
+    *,
+    history_offset: int,
+) -> bool:
+    """Check the host-produced reaction receipt before blank fallback text.
+
+    ``_normalize_empty_agent_response`` intentionally turns ordinary empty
+    turns into visible recovery text. A reaction-only acknowledgement is the
+    narrow exception and has to be recognized while the raw blank response and
+    current turn boundary are still available.
+    """
+    try:
+        from gateway.response_filters import is_current_turn_reaction_acknowledgement
+
+        return is_current_turn_reaction_acknowledgement(
+            {**result, "history_offset": history_offset}, response, source
+        )
+    except Exception:
+        return False
+
+
 def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
     """Detect retry-exhausted turns with hidden reasoning but no visible answer.
 
@@ -6416,7 +6440,15 @@ class TurnRunner:
             0 if (_session_was_split or _compacted_in_place) else len(agent_history)
         )
 
+        _reaction_only_acknowledgement = False
         if not final_response:
+            _reaction_only_acknowledgement = _is_reaction_only_acknowledgement_before_normalization(
+                result,
+                final_response or "",
+                ctx.source,
+                history_offset=_effective_history_offset,
+            )
+        if not final_response and not _reaction_only_acknowledgement:
             final_response = _normalize_empty_agent_response(
                 result, final_response or "", history_len=len(agent_history),
             )
@@ -6451,6 +6483,7 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "reaction_only_acknowledgement": _reaction_only_acknowledgement,
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -20071,17 +20104,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
                 response = ""
             try:
-                from gateway.response_filters import (
-                    is_current_turn_reaction_acknowledgement,
-                    is_intentional_silence_agent_result,
-                )
+                from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
                     agent_result, response,
                 )
-                _reaction_only_acknowledgement = is_current_turn_reaction_acknowledgement(
-                    agent_result, response, source,
+                _intentional_silence = _intentional_silence or bool(
+                    agent_result.get("reaction_only_acknowledgement")
                 )
-                _intentional_silence = _intentional_silence or _reaction_only_acknowledgement
             except Exception:
                 _intentional_silence = False
 
@@ -24318,6 +24347,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            origin_source=context.source,
             async_delivery=_async_delivery,
             cron_session="",
         )
