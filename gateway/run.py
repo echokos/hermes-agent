@@ -6568,6 +6568,7 @@ class TurnRunner:
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
+            "reaction_only_acknowledgement": _reaction_only_acknowledgement,
             # Pass through the agent_persisted flag so the persistence block
             # above can correctly determine whether the codex app-server path
             # self-persisted (it didn't — see codex_runtime.py).  Default

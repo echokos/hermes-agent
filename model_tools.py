@@ -392,6 +392,7 @@ def get_tool_definitions(
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                registry.session_check_fingerprint(),
                 _execution_context_fingerprint(execution_context, execution_owner),
             )
         with _tool_defs_cache_lock:

@@ -4,6 +4,8 @@ import json
 import weakref
 from unittest.mock import MagicMock
 
+import pytest
+
 from gateway.session_context import clear_session_vars, set_session_vars
 from tools import react_to_message_tool as reactions
 
@@ -256,3 +258,40 @@ def test_telegram_reaction_handles_missing_adapter_false_and_error(monkeypatch):
             assert expected in reactions.react_to_message_tool("👍")
     finally:
         clear_session_vars(tokens)
+
+
+@pytest.mark.parametrize("first_surface", ["telegram", "desktop"])
+def test_reaction_availability_isolated_between_same_profile_surfaces(
+    monkeypatch, first_surface
+):
+    import hermes_cli.config as config_module
+    import model_tools
+
+    monkeypatch.setattr(
+        config_module,
+        "load_config_readonly",
+        lambda: {"display": {"message_reactions": False}},
+    )
+    model_tools._clear_tool_defs_cache()
+
+    def exposed(surface):
+        toolset = "message_reactions" if surface == "telegram" else "desktop_ui"
+        tokens = set_session_vars(platform=surface, profile="main")
+        try:
+            definitions = model_tools.get_tool_definitions(
+                enabled_toolsets=[toolset],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+        finally:
+            clear_session_vars(tokens)
+        names = {item["function"]["name"] for item in definitions}
+        return "react_to_message" in names
+
+    second_surface = "desktop" if first_surface == "telegram" else "telegram"
+    observed = {
+        first_surface: exposed(first_surface),
+        second_surface: exposed(second_surface),
+    }
+
+    assert observed == {"telegram": True, "desktop": False}

@@ -332,7 +332,7 @@ class ToolEntry:
     """Metadata for a single registered tool."""
 
     __slots__ = (
-        "name", "toolset", "schema", "handler", "check_fn",
+        "name", "toolset", "schema", "handler", "check_fn", "session_check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
         "execution_capability", "registration_owner",
@@ -340,7 +340,7 @@ class ToolEntry:
         "attempt_observer",
     )
 
-    def __init__(self, name, toolset, schema, handler, check_fn,
+    def __init__(self, name, toolset, schema, handler, check_fn, session_check_fn,
                  requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None,
                  execution_capability=None, registration_owner=None,
@@ -351,6 +351,7 @@ class ToolEntry:
         self.schema = schema
         self.handler = handler
         self.check_fn = check_fn
+        self.session_check_fn = session_check_fn
         self.requires_env = requires_env
         self.is_async = is_async
         self.description = description
@@ -638,13 +639,37 @@ class ToolRegistry:
         for entry in entries:
             if entry.toolset != toolset:
                 continue
-            if not entry.check_fn:
-                return True
-            if entry.check_fn not in check_results:
-                check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
-            if check_results[entry.check_fn]:
+            available = True
+            if entry.check_fn:
+                if entry.check_fn not in check_results:
+                    check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
+                available = check_results[entry.check_fn]
+            if available and entry.session_check_fn:
+                try:
+                    available = bool(entry.session_check_fn())
+                except Exception:
+                    logger.warning(
+                        "session_check_fn %s raised; tool unavailable this turn",
+                        getattr(entry.session_check_fn, "__name__", repr(entry.session_check_fn)),
+                        exc_info=True,
+                    )
+                    available = False
+            if available:
                 return True
         return False
+
+    def session_check_fingerprint(self) -> tuple[tuple[str, bool], ...]:
+        """Evaluate cheap per-session gates for tool-definition cache isolation."""
+        results = []
+        for entry in self._snapshot_entries():
+            if entry.session_check_fn is None:
+                continue
+            try:
+                available = bool(entry.session_check_fn())
+            except Exception:
+                available = False
+            results.append((entry.name, available))
+        return tuple(sorted(results))
 
     def get_entry(
         self,
@@ -990,6 +1015,7 @@ class ToolRegistry:
         schema: dict,
         handler: Callable,
         check_fn: Callable = None,
+        session_check_fn: Callable = None,
         requires_env: list = None,
         is_async: bool = False,
         description: str = "",
@@ -1159,6 +1185,7 @@ class ToolRegistry:
                 schema=schema,
                 handler=handler,
                 check_fn=check_fn,
+                session_check_fn=session_check_fn,
                 requires_env=requires_env or [],
                 is_async=is_async,
                 description=description or schema.get("description", ""),
@@ -1392,6 +1419,19 @@ class ToolRegistry:
                 if not check_results[entry.check_fn]:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)
+                    continue
+            if entry.session_check_fn:
+                try:
+                    if not entry.session_check_fn():
+                        if not quiet:
+                            logger.debug("Tool %s unavailable for this session", name)
+                        continue
+                except Exception:
+                    logger.warning(
+                        "session_check_fn %s raised; tool unavailable this turn",
+                        getattr(entry.session_check_fn, "__name__", repr(entry.session_check_fn)),
+                        exc_info=True,
+                    )
                     continue
             # Ensure schema always has a "name" field — use entry.name as fallback
             schema_with_name = {**entry.schema, "name": entry.name}

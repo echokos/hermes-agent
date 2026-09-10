@@ -176,12 +176,11 @@ def react_to_message_tool(emoji: str, message_row_id=None, messages_back=None) -
 
 
 def check_react_requirements() -> bool:
-    """Opt-in feature flag — surface eligibility is the toolset's job.
+    """Session-scoped opt-in gate; never cache this across client surfaces.
 
-    ``desktop_ui`` already restricts this to GUI sessions. What's left is the
-    user's own toggle (Settings → Appearance), which the desktop mirrors into
-    ``display.message_reactions`` on the CONNECTED gateway's config — so this
-    reads the right config whether that gateway is local, SSH, URL, or cloud.
+    Telegram is gated by its default-off ``message_reactions`` toolset. Desktop
+    retains its existing Settings -> Appearance toggle, mirrored into the
+    connected gateway's config.
     """
     if get_session_env("HERMES_SESSION_PLATFORM", "") == "telegram":
         return True
@@ -248,6 +247,6 @@ registry.register(
         message_row_id=args.get("message_row_id"),
         messages_back=args.get("messages_back"),
     ),
-    check_fn=check_react_requirements,
+    session_check_fn=check_react_requirements,
     emoji="💛",
 )

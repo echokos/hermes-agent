@@ -1,6 +1,8 @@
 """Gateway intentional-silence token behavior."""
 
 import json
+import sys
+import types
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -171,6 +173,126 @@ async def test_reaction_acknowledgement_suppresses_only_blank_delivery(monkeypat
     )
 
     assert response == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter_outcome", [True, False, RuntimeError("telegram failed")])
+async def test_registered_reaction_receipt_crosses_real_turn_lifecycle(
+    monkeypatch, tmp_path, adapter_outcome
+):
+    """Exercise dispatch, host receipt stamping, normalization, and delivery."""
+    from agent.tool_dispatch_helpers import make_tool_result_message
+    from tools.registry import registry
+
+    class ReactionAdapter:
+        supports_async_delivery = True
+
+        def __init__(self):
+            self.calls = []
+
+        def toolsets_for_source(self, _source):
+            return None
+
+        def get_pending_message(self, _session_key):
+            return None
+
+        async def _set_reaction(self, chat_id, message_id, emoji):
+            self.calls.append((chat_id, message_id, emoji))
+            if isinstance(adapter_outcome, Exception):
+                raise adapter_outcome
+            return adapter_outcome
+
+        async def stop_typing(self, _chat_id):
+            return None
+
+    class RegisteredReactionAgent:
+        last_tool_message = None
+        raw_result = None
+
+        def __init__(self, **kwargs):
+            self.tools = []
+            self.model = kwargs.get("model")
+            self.session_id = kwargs.get("session_id")
+            assert "message_reactions" in kwargs.get("enabled_toolsets", [])
+
+        def run_conversation(self, message, conversation_history=None, task_id=None, **_kwargs):
+            tool_call_id = "call-reaction"
+            tool_result = registry.dispatch("react_to_message", {"emoji": "👍"})
+            tool_message = make_tool_result_message(
+                "react_to_message", tool_result, tool_call_id
+            )
+            self.__class__.last_tool_message = tool_message
+            messages = list(conversation_history or []) + [
+                {"role": "user", "content": message},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "react_to_message",
+                            "arguments": json.dumps({"emoji": "👍"}),
+                        },
+                    }],
+                },
+                tool_message,
+                {"role": "assistant", "content": ""},
+            ]
+            raw_result = {
+                "final_response": "",
+                "messages": messages,
+                "api_calls": 1,
+                "failed": False,
+                "partial": False,
+                "interrupted": False,
+                "completed": True,
+            }
+            self.__class__.raw_result = raw_result
+            return raw_result
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = RegisteredReactionAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "platform_toolsets": {
+                "telegram": ["hermes-telegram", "message_reactions"]
+            },
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+            },
+        },
+    )
+
+    runner = _runner(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        runner.config,
+        "get_home_channel",
+        lambda platform: "-1001" if platform == Platform.TELEGRAM else None,
+    )
+    adapter = ReactionAdapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._set_session_env = gateway_run.GatewayRunner._set_session_env.__get__(runner)
+    runner._clear_session_env = gateway_run.GatewayRunner._clear_session_env.__get__(runner)
+    source = _source()
+    event = MessageEvent(text="acknowledge this", source=source, message_id="msg-42")
+
+    response = await runner._handle_message_with_agent(
+        event, source, "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert adapter.calls == [("-1001", "msg-42", "👍")]
+    assert RegisteredReactionAgent.last_tool_message["name"] == "react_to_message"
+    assert RegisteredReactionAgent.last_tool_message["tool_name"] == "react_to_message"
+    assert "reaction_only_acknowledgement" not in RegisteredReactionAgent.raw_result
+    if adapter_outcome is True:
+        assert response == ""
+    else:
+        assert "no response was generated" in response
 
 
 @pytest.mark.asyncio
