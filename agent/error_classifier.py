@@ -94,6 +94,31 @@ def allows_configured_fallback(reason: FailoverReason | None) -> bool:
     return reason in FALLBACK_ACTIVATION_REASONS
 
 
+def allows_configured_fallback_for_error(
+    error: Exception,
+    *,
+    provider: str = "",
+    model: str = "",
+) -> bool:
+    """Whether a concrete failure may switch configured providers.
+
+    Auth resolvers sometimes wrap a token endpoint's HTTP failure in
+    :class:`AuthError`. Preserve explicit credential-invalid/relogin metadata as
+    terminal even if contradictory status metadata looks service-shaped, while
+    letting the normal classifier recover genuine rate and service failures.
+    """
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+
+    if isinstance(error, AuthError):
+        if error.relogin_required:
+            return False
+        if is_rate_limited_auth_error(error):
+            return True
+    return allows_configured_fallback(
+        classify_api_error(error, provider=provider, model=model).reason
+    )
+
+
 # ── Classification result ───────────────────────────────────────────────
 
 @dataclass

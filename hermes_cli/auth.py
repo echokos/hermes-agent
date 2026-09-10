@@ -928,11 +928,13 @@ class AuthError(RuntimeError):
         provider: str = "",
         code: Optional[str] = None,
         relogin_required: bool = False,
+        status_code: Optional[int] = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
         self.code = code
         self.relogin_required = relogin_required
+        self.status_code = status_code
 
 
 def is_rate_limited_auth_error(error: Exception) -> bool:
@@ -2773,6 +2775,7 @@ def _refresh_qwen_cli_tokens(tokens: Dict[str, Any], timeout_seconds: float = 20
             + (f" Response: {body}" if body else ""),
             provider="qwen-oauth",
             code="qwen_refresh_failed",
+            status_code=response.status_code,
         )
 
     try:
@@ -3950,6 +3953,7 @@ def refresh_codex_oauth_pure(
             provider="openai-codex",
             code=CODEX_RATE_LIMITED_CODE,
             relogin_required=False,
+            status_code=response.status_code,
         )
 
     if response.status_code != 200:
@@ -3996,6 +4000,7 @@ def refresh_codex_oauth_pure(
             provider="openai-codex",
             code=code,
             relogin_required=relogin_required,
+            status_code=response.status_code,
         )
 
     try:
@@ -4958,6 +4963,7 @@ def _xai_oauth_discovery(timeout_seconds: float = 15.0) -> Dict[str, str]:
             f"xAI OIDC discovery returned status {response.status_code}.",
             provider="xai-oauth",
             code="xai_discovery_failed",
+            status_code=response.status_code,
         )
     try:
         payload = response.json()
@@ -5045,6 +5051,7 @@ def refresh_xai_oauth_pure(
                 provider="xai-oauth",
                 code="xai_oauth_tier_denied",
                 relogin_required=False,
+                status_code=response.status_code,
             )
         raise AuthError(
             "xAI token refresh failed."
@@ -5052,6 +5059,7 @@ def refresh_xai_oauth_pure(
             provider="xai-oauth",
             code="xai_refresh_failed",
             relogin_required=(response.status_code in {400, 401}),
+            status_code=response.status_code,
         )
     try:
         payload = response.json()
@@ -5896,9 +5904,18 @@ def _refresh_access_token(
         error_payload = response.json()
     except Exception as exc:
         raise AuthError("Refresh token exchange failed",
-                        provider="nous", relogin_required=True) from exc
+                        provider="nous",
+                        relogin_required=response.status_code in {400, 401, 403},
+                        status_code=response.status_code) from exc
+    if not isinstance(error_payload, dict):
+        error_payload = {}
 
-    code = str(error_payload.get("error", "invalid_grant"))
+    default_code = (
+        "invalid_grant"
+        if response.status_code in {400, 401, 403}
+        else "nous_refresh_failed"
+    )
+    code = str(error_payload.get("error") or default_code)
     description = str(error_payload.get("error_description") or "Refresh token exchange failed")
     relogin = code in {"invalid_grant", "invalid_token", "refresh_token_reused"}
 
@@ -5924,7 +5941,13 @@ def _refresh_access_token(
         )
         relogin = True
 
-    raise AuthError(description, provider="nous", code=code, relogin_required=relogin)
+    raise AuthError(
+        description,
+        provider="nous",
+        code=code,
+        relogin_required=relogin,
+        status_code=response.status_code,
+    )
 
 
 def fetch_nous_models(
@@ -8785,6 +8808,7 @@ def _refresh_minimax_oauth_state(
                 f"MiniMax OAuth refresh failed: {body or response.reason_phrase}",
                 provider="minimax-oauth", code="refresh_failed",
                 relogin_required=relogin,
+                status_code=response.status_code,
             )
     payload = response.json()
     if payload.get("status") != "success":

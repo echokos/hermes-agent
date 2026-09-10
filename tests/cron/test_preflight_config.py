@@ -21,6 +21,8 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import cron.jobs as cron_jobs
@@ -60,6 +62,27 @@ class _AuthErrorFactory:
         from hermes_cli.auth import AuthError
 
         raise AuthError("No API key configured for provider 'openrouter'")
+
+
+def _native_codex_refresh_error(monkeypatch, status_code):
+    """Return the real AuthError emitted by the Codex token refresh path."""
+    from hermes_cli.auth import AuthError, refresh_codex_oauth_pure
+
+    response = MagicMock()
+    response.status_code = status_code
+    response.headers = {}
+    response.json.return_value = {
+        "error": {"message": "temporarily unavailable", "code": "server_error"}
+    }
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.__exit__.return_value = False
+    client.post.return_value = response
+    monkeypatch.setattr("hermes_cli.auth.httpx.Client", lambda *a, **k: client)
+
+    with pytest.raises(AuthError) as exc_info:
+        refresh_codex_oauth_pure("access", "refresh")
+    return exc_info.value
 
 
 def _run_job_patched(job, tmp_path, *, resolve=None, skill_view=None):
@@ -194,6 +217,40 @@ class TestMissingProviderKeyBlocks:
 
 
 class TestHealthyJobUnaffected:
+    def test_oauth_service_failure_passes_preflight_then_runtime_falls_back(
+        self, tmp_path, monkeypatch
+    ):
+        """A native wrapped 503 is runnable and reaches the fallback runtime."""
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  provider: openai-codex\n"
+            "fallback_providers:\n"
+            "  - provider: ollama-cloud\n"
+            "    model: glm-5.3:cloud\n",
+            encoding="utf-8",
+        )
+        service_error = _native_codex_refresh_error(monkeypatch, 503)
+        calls = []
+
+        def resolve(**kwargs):
+            requested = kwargs.get("requested")
+            calls.append(requested)
+            if requested in (None, "openai-codex"):
+                raise service_error
+            return {**_RUNTIME, "provider": requested}
+
+        job = _job()
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            success, output, final_response, error, agent_constructed = \
+                _run_job_patched(job, tmp_path, resolve=resolve)
+
+        assert calls == [None, None, "ollama-cloud"]
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert agent_constructed is True
+
     def test_healthy_job_runs_normally(self, tmp_path):
         job = _job()
         with cron_jobs.use_cron_store(tmp_path):

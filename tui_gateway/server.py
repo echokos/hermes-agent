@@ -6782,8 +6782,7 @@ def _resolve_runtime_with_fallback(
     accepts only entries with both fields, so a primary model never leaks into
     a different provider runtime.
     """
-    from agent.error_classifier import allows_configured_fallback, classify_api_error
-    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from agent.error_classifier import allows_configured_fallback_for_error
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     kwargs = resolve_kwargs or {}
@@ -6794,15 +6793,10 @@ def _resolve_runtime_with_fallback(
             False,
         )
     except Exception as primary_exc:
-        eligible = (
-            isinstance(primary_exc, AuthError)
-            and is_rate_limited_auth_error(primary_exc)
-        ) or allows_configured_fallback(
-            classify_api_error(
-                primary_exc,
-                provider=str(kwargs.get("requested") or ""),
-                model=str(kwargs.get("target_model") or ""),
-            ).reason
+        eligible = allows_configured_fallback_for_error(
+            primary_exc,
+            provider=str(kwargs.get("requested") or ""),
+            model=str(kwargs.get("target_model") or ""),
         )
         if not eligible:
             raise

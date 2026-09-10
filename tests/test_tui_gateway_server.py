@@ -17634,6 +17634,68 @@ class TestResolveRuntimeWithFallback:
         assert resolution.selected_model == "deepseek-v4-pro"
         assert resolution.used_fallback is True
 
+    def test_wrapped_oauth_503_tries_fallback_chain(self, monkeypatch):
+        from hermes_cli.auth import AuthError
+
+        fallback_runtime = {"provider": "deepseek", "api_key": "fb-tok"}
+        service_error = AuthError(
+            "Codex token refresh failed: temporarily unavailable",
+            provider="openai-codex",
+            code="server_error",
+            status_code=503,
+        )
+
+        def fake_resolve(**kwargs):
+            if kwargs.get("requested") == "openai-codex":
+                raise service_error
+            return fallback_runtime
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve
+        )
+        monkeypatch.setattr(
+            server,
+            "_load_fallback_model",
+            lambda: [{"provider": "deepseek", "model": "deepseek-v4-pro"}],
+        )
+
+        resolution = server._resolve_runtime_with_fallback(
+            {"requested": "openai-codex", "target_model": "gpt-5.5"}
+        )
+
+        assert resolution.runtime == fallback_runtime
+        assert resolution.selected_model == "deepseek-v4-pro"
+        assert resolution.used_fallback is True
+
+    def test_relogin_error_with_service_status_is_terminal(self, monkeypatch):
+        from hermes_cli.auth import AuthError
+        import pytest
+
+        resolve = Mock(
+            side_effect=AuthError(
+                "invalid_grant",
+                provider="openai-codex",
+                code="invalid_grant",
+                relogin_required=True,
+                status_code=503,
+            )
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", resolve
+        )
+        load_fallback = Mock(
+            return_value=[{"provider": "deepseek", "model": "deepseek-v4-pro"}]
+        )
+        monkeypatch.setattr(server, "_load_fallback_model", load_fallback)
+
+        with pytest.raises(AuthError, match="invalid_grant"):
+            server._resolve_runtime_with_fallback(
+                {"requested": "openai-codex", "target_model": "gpt-5.5"}
+            )
+
+        assert resolve.call_count == 1
+        load_fallback.assert_not_called()
+
     def test_eligible_failure_skips_provider_only_fallback(self, monkeypatch):
         """Eligible fallback still requires a complete provider/model pair."""
 

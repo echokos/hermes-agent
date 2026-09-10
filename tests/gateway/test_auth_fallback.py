@@ -104,3 +104,62 @@ class TestResolveRuntimeAgentKwargsFallback:
             result = _resolve_runtime_agent_kwargs()
 
         assert result["provider"] == "openrouter"
+
+    def test_wrapped_oauth_503_tries_fallback(self, tmp_path, monkeypatch):
+        from gateway.run import _resolve_runtime_agent_kwargs
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "fallback_model:\n  provider: openrouter\n  model: test-model\n"
+        )
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=[
+                AuthError(
+                    "Codex token refresh failed: temporarily unavailable",
+                    provider="openai-codex",
+                    code="server_error",
+                    status_code=503,
+                ),
+                {
+                    "api_key": "fallback-key",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                    "command": None,
+                    "args": [],
+                    "credential_pool": None,
+                },
+            ],
+        ) as resolve:
+            result = _resolve_runtime_agent_kwargs()
+
+        assert result["provider"] == "openrouter"
+        assert resolve.call_count == 2
+
+    def test_relogin_error_with_service_status_does_not_try_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.run import _resolve_runtime_agent_kwargs
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "fallback_model:\n  provider: openrouter\n  model: test-model\n"
+        )
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=AuthError(
+                "invalid_grant",
+                provider="openai-codex",
+                code="invalid_grant",
+                relogin_required=True,
+                status_code=503,
+            ),
+        ) as resolve:
+            with pytest.raises(RuntimeError, match="invalid_grant"):
+                _resolve_runtime_agent_kwargs()
+
+        assert resolve.call_count == 1

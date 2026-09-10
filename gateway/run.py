@@ -2774,7 +2774,7 @@ def _resolve_runtime_agent_kwargs(
     not consult environment variables for behavioral config — config.yaml
     is authoritative.
 
-    Only a rate-limit-shaped provider-resolution failure may use the configured
+    Only a service/rate provider-resolution failure may use the configured
     fallback chain. Credential failures remain terminal after native refresh.
     """
     from hermes_cli.runtime_provider import (
@@ -2790,11 +2790,22 @@ def _resolve_runtime_agent_kwargs(
             target_model=target_model,
         )
     except AuthError as auth_exc:
-        # A transient rate-limit/quota cap may recover through the configured
+        # A transient service/rate failure may recover through the configured
         # fallback chain. A genuine auth failure must surface after native
         # credential refresh rather than silently changing providers.
-        if is_rate_limited_auth_error(auth_exc):
-            logger.warning("Primary provider rate-limited (429): %s — trying fallback", auth_exc)
+        from agent.error_classifier import allows_configured_fallback_for_error
+
+        if allows_configured_fallback_for_error(
+            auth_exc,
+            provider=requested_provider or "",
+            model=target_model or "",
+        ):
+            label = (
+                "rate-limited (429)"
+                if is_rate_limited_auth_error(auth_exc)
+                else "unavailable"
+            )
+            logger.warning("Primary provider %s: %s — trying fallback", label, auth_exc)
             fb_config = _try_resolve_fallback_provider()
             if fb_config is not None:
                 return fb_config

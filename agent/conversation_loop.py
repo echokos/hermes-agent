@@ -5897,6 +5897,25 @@ def run_conversation(
                     )
                 ) and not is_context_length_error
 
+                # A non-retryable service failure (notably the cross-turn stale
+                # circuit breaker) must switch providers before the generic
+                # client-error return below. It is terminal for this primary,
+                # so there is deliberately no same-provider retry.
+                if is_client_error and classified.should_fallback:
+                    if agent._has_pending_fallback():
+                        agent._buffer_status(
+                            "⚠️ Primary provider unavailable — trying fallback..."
+                        )
+                    if agent._try_activate_fallback(reason=classified.reason):
+                        active_system_prompt = _sync_failover_system_message(
+                            agent, api_messages, active_system_prompt
+                        )
+                        retry_count = 0
+                        compression_attempts = 0
+                        _retry.primary_recovery_attempted = False
+                        _retry.restart_with_rebuilt_messages = True
+                        break
+
                 if is_client_error:
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400

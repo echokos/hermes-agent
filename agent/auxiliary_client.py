@@ -5655,10 +5655,11 @@ def _try_main_fallback_chain(
     unavailability and request/auth/policy failures continue through the
     auxiliary task's native routing without inheriting the main chain.
     """
-    from agent.error_classifier import allows_configured_fallback, classify_api_error
+    from agent.error_classifier import allows_configured_fallback_for_error
 
-    if failure is None or not allows_configured_fallback(
-        classify_api_error(failure, provider=failed_provider).reason
+    if failure is None or not allows_configured_fallback_for_error(
+        failure,
+        provider=failed_provider,
     ):
         logger.debug(
             "Auxiliary %s: main fallback chain ineligible for %s",

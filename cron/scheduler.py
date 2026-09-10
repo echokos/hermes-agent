@@ -4487,8 +4487,8 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
 
     Mirrors the effective requested-provider computation from run_job's
     resolution block without any side effects on the run. A configured
-    fallback chain does not rescue a missing primary credential because no
-    classified service/rate failure occurred.
+    fallback chain does not rescue a missing primary credential, but a
+    classified service/rate failure passes through to runtime fallback.
     """
     _cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
     requested = (
@@ -4498,7 +4498,7 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     )
     model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
-    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli.auth import AuthError
 
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -4508,9 +4508,15 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
             kwargs["explicit_base_url"] = job.get("base_url")
         resolve_runtime_provider(**kwargs)
     except AuthError as exc:
-        if is_rate_limited_auth_error(exc):
-            # A reset-aware provider quota is not a missing credential. Let
-            # the runtime resolver apply the service/rate fallback policy.
+        from agent.error_classifier import allows_configured_fallback_for_error
+
+        if allows_configured_fallback_for_error(
+            exc,
+            provider=str(requested or ""),
+            model=str(model or ""),
+        ):
+            # A service/rate failure is not a missing credential. Let the
+            # runtime resolver apply the same fallback policy.
             return None
         return (
             f"provider credential missing: {exc}. "
@@ -5625,7 +5631,10 @@ def _run_job_after_admission(
             # configured fallback without changing policy/auth semantics.
             # Keeping provider+model atomic still applies — never swap only the
             # provider while retaining a paid primary model.
-            from agent.error_classifier import allows_configured_fallback, classify_api_error
+            from agent.error_classifier import (
+                allows_configured_fallback_for_error,
+                classify_api_error,
+            )
 
             classified = classify_api_error(
                 resolve_exc,
@@ -5638,9 +5647,12 @@ def _run_job_after_admission(
             )
             is_transient_net = _is_transient_provider_resolve_error(resolve_exc)
             if not (
-                is_rate_limited_auth
+                allows_configured_fallback_for_error(
+                    resolve_exc,
+                    provider=primary_provider_for_drift or "",
+                    model=str(model or ""),
+                )
                 or is_transient_net
-                or allows_configured_fallback(classified.reason)
             ):
                 raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 

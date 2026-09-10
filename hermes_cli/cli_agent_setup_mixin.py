@@ -48,21 +48,15 @@ class CLIAgentSetupMixin:
         except Exception as exc:
             _primary_exc = exc
 
-        # A rate-limit-shaped resolution failure may use the configured
+        # A service/rate resolution failure may use the configured
         # fallback chain. Native auth refresh/repair failures stay terminal.
         if runtime is None and _primary_exc is not None:
-            from hermes_cli.auth import AuthError, is_rate_limited_auth_error
-            from agent.error_classifier import allows_configured_fallback, classify_api_error
+            from agent.error_classifier import allows_configured_fallback_for_error
 
-            _eligible_resolution_failure = (
-                isinstance(_primary_exc, AuthError)
-                and is_rate_limited_auth_error(_primary_exc)
-            ) or allows_configured_fallback(
-                classify_api_error(
-                    _primary_exc,
-                    provider=self.requested_provider or "",
-                    model=self.model or "",
-                ).reason
+            _eligible_resolution_failure = allows_configured_fallback_for_error(
+                _primary_exc,
+                provider=self.requested_provider or "",
+                model=self.model or "",
             )
             if _eligible_resolution_failure:
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
