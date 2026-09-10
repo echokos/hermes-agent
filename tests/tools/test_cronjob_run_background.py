@@ -12,9 +12,14 @@ Sync fallbacks preserved:
   - async delivery unsupported (one-shot runners, cron child sessions)
   - dispatch pool at capacity (claim already taken — must not strand it)
 """
+import contextvars
 import json
 import threading
+import time
+from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from tools.cronjob_tools import (
     _try_dispatch_background_run,
@@ -55,7 +60,140 @@ def _bound_session_key(key="agent:main:telegram:dm:123"):
     return _cm()
 
 
+def _completion_for(delegation_id: str):
+    from tools.process_registry import process_registry
+
+    deferred = []
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline:
+            try:
+                event = process_registry.completion_queue.get_nowait()
+            except Exception:
+                time.sleep(0.01)
+                continue
+            if event.get("delegation_id") == delegation_id:
+                return event
+            deferred.append(event)
+        return None
+    finally:
+        for event in deferred:
+            process_registry.completion_queue.put(event)
+
+
 class TestBackgroundDispatch:
+    @pytest.mark.parametrize("accepted_root", [False, True])
+    def test_detached_cron_run_survives_parent_scope_exit_and_keeps_budget(
+        self, monkeypatch, tmp_path, accepted_root,
+    ):
+        """A fresh cron agent must not inherit its caller's closed scope object."""
+        from agent import coordination_budget as budget
+        from agent import relay_llm, relay_runtime
+        from gateway import session_context
+        from hermes_cli import kanban_db as kb
+
+        db = tmp_path / "kanban.db"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+        monkeypatch.setattr(
+            session_context,
+            "get_session_env",
+            lambda key, default="": {
+                "HERMES_SESSION_ID": "parent-session",
+                "HERMES_SESSION_MESSAGE_ID": "parent-message",
+            }.get(key, default),
+        )
+        monkeypatch.setattr(
+            relay_runtime, "resolve_execution_context", lambda _: (None, None, None)
+        )
+        monkeypatch.setattr(relay_runtime, "active_turn", lambda: None)
+
+        request_root_id = task_id = ""
+        if accepted_root:
+            organization = SimpleNamespace(
+                validate_execution_profile=lambda _: SimpleNamespace(agent="coordinator")
+            )
+            with kb.connect_closing(db) as conn:
+                task_id = kb.create_task(
+                    conn,
+                    title="Return detached result",
+                    assignee="coordinator",
+                    session_id="parent-session",
+                )
+                kb.add_notify_sub(
+                    conn,
+                    task_id=task_id,
+                    platform="buzz",
+                    chat_id="origin",
+                    delivery_mode="wake",
+                )
+                request_root_id = kb.create_coordination_request(
+                    conn,
+                    root_task_id=task_id,
+                    origin_session_id="parent-session",
+                    origin_message_id="parent-message",
+                    organization=organization,
+                    max_model_calls=3,
+                    final_model_call_reserve=1,
+                ).id
+
+        run_started = threading.Event()
+        release_run = threading.Event()
+        observed = {}
+
+        def run_fresh_cron_agent(_job, **_kwargs):
+            run_started.set()
+            assert release_run.wait(timeout=5)
+            try:
+                with budget.scoped_coordination_budget(session_id="fresh-cron-session"):
+                    observed["execution"] = budget.current_coordination_execution()
+                    observed["provider_result"] = relay_llm.execute_current(
+                        {}, lambda _: "provider-ok", name="openai", model_name="test"
+                    )
+            except Exception as exc:  # captured for a useful assertion in the parent
+                observed["error"] = exc
+            return True
+
+        parent_scope = (
+            budget.scoped_coordination_budget(
+                request_root_id=request_root_id,
+                task_id=task_id,
+                db_path=db,
+            )
+            if accepted_root
+            else budget.scoped_coordination_budget(session_id="parent-session")
+        )
+        claimed = {**_job("job-bg-detached"), "fire_claim": {"by": "bg-owner"}}
+        with _bound_session_key(), patch(
+            "tools.cronjob_tools.claim_job_for_fire", return_value=claimed
+        ), patch(
+            "cron.scheduler.run_one_job", side_effect=run_fresh_cron_agent
+        ), patch(
+            "tools.cronjob_tools.get_job",
+            return_value={"last_status": "ok", "last_error": None},
+        ):
+            with parent_scope:
+                result = _try_dispatch_background_run(_job("job-bg-detached"))
+                assert result is not None and result["dispatched"] is True
+                assert run_started.wait(timeout=5)
+                retained_parent = contextvars.copy_context()
+
+            with pytest.raises(kb.CoordinationBudgetExceeded, match="owning turn ended"):
+                retained_parent.run(budget.charge_provider_attempt)
+
+            release_run.set()
+            completion = _completion_for(result["delegation_id"])
+
+        assert completion is not None
+        assert observed.get("error") is None
+        assert observed["provider_result"] == "provider-ok"
+        if accepted_root:
+            assert observed["execution"] == (request_root_id, task_id, "work")
+            with kb.connect_closing(db) as conn:
+                assert kb.get_coordination_request(conn, request_root_id).model_calls_used == 1
+        else:
+            assert observed["execution"] is None
+
     def test_dispatches_and_returns_handle_immediately(self):
         """With a routable session, run claims sync then dispatches async."""
         run_started = threading.Event()
@@ -72,6 +210,10 @@ class TestBackgroundDispatch:
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}):
                 res = _try_dispatch_background_run(_job('job-bg-01'))
+                # Keep the patches alive until the daemon has imported and
+                # entered the mocked runner; dispatch intentionally returns
+                # before completion, not necessarily before worker startup.
+                assert run_started.wait(timeout=5.0), "job never started in background"
 
         try:
             # Returned BEFORE the job finished — that's the whole point.
@@ -80,8 +222,6 @@ class TestBackgroundDispatch:
             assert res["dispatched"] is True
             assert res["delegation_id"]
             m_claim.assert_called_once_with("job-bg-01", return_job=True)
-            # The job actually starts on the daemon executor.
-            assert run_started.wait(timeout=5.0), "job never started in background"
         finally:
             run_release.set()
 

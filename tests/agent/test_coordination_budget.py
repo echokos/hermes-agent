@@ -481,6 +481,63 @@ def test_closed_unaccepted_turn_cannot_make_late_provider_attempt(budget_request
         retained.run(budget.charge_provider_attempt)
 
 
+def test_detached_scope_keeps_root_limits_after_parent_closes(budget_request):
+    def exhaust_work_budget():
+        assert [budget.charge_provider_attempt() for _ in range(4)] == [1, 2, 3, 4]
+        budget.charge_provider_attempt()
+
+    with scope(budget_request):
+        detached = budget.bind_detached_coordination_scope(exhaust_work_budget)
+
+    with pytest.raises(kb.CoordinationBudgetExceeded, match="reserve preserved"):
+        detached()
+    assert used(budget_request) == 4
+
+
+def test_detached_scope_observes_request_cancellation(budget_request):
+    with scope(budget_request):
+        detached = budget.bind_detached_coordination_scope(
+            budget.charge_provider_attempt
+        )
+
+    with kb.connect_closing(budget_request.db) as conn:
+        conn.execute(
+            "UPDATE coordination_requests SET status='cancelled' WHERE id=?",
+            (budget_request.root,),
+        )
+        conn.commit()
+
+    with pytest.raises(kb.CoordinationBudgetExceeded, match="request is cancelled"):
+        detached()
+    assert used(budget_request) == 0
+
+
+def test_background_review_gets_detached_budget_lifetime(budget_request, monkeypatch):
+    from agent import background_review
+
+    observed = {}
+
+    def review_attempt(*_args):
+        observed["execution"] = budget.current_coordination_execution()
+        observed["charged"] = budget.charge_provider_attempt()
+
+    monkeypatch.setattr(background_review, "_run_review_in_thread", review_attempt)
+    with scope(budget_request):
+        target, _prompt = background_review.spawn_background_review_thread(
+            SimpleNamespace(),
+            messages_snapshot=[],
+            review_memory=True,
+            task_cfg={},
+        )
+
+    target()
+    assert observed == {
+        "execution": (budget_request.root, budget_request.task, "work"),
+        "charged": 1,
+    }
+    assert used(budget_request) == 1
+
+
 @pytest.mark.parametrize("remaining", [1, 2])
 def test_auxiliary_stream_fallback_charges_second_physical_attempt(budget_request, monkeypatch, remaining):
     from agent import auxiliary_client as aux
